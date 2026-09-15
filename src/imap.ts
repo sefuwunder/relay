@@ -574,6 +574,47 @@ export async function harvestRecentSms(cfg0: ImapConfig, days = 14): Promise<Sms
   }
 }
 
+export interface GvThreadHead {
+  messageId: string;
+  from: string;    // composite forward address, original case
+  subject: string;
+}
+
+/**
+ * Newest Google Voice forward for one 10-digit number in the last `days`.
+ * Read-only (ENVELOPE fetches never set \\Seen). Used at SMS send time so the
+ * outbound message is always a reply to the previous thread — the GV gateway
+ * drops fresh mail to the bare gateway address.
+ */
+export async function latestGvForward(cfg0: ImapConfig, digits: string, days = 30): Promise<GvThreadHead | null> {
+  if (!/^\d{10}$/.test(digits)) return null;
+  const conn = await login(cfg0); // SELECTs INBOX
+  try {
+    const d = new Date(Date.now() - days * 86400_000);
+    const mon = Object.keys(MONTHS)[d.getMonth()];
+    const since = `${String(d.getDate()).padStart(2, "0")}-${mon}-${d.getFullYear()}`;
+    const uids = parseSearchUids(await conn.cmd("t001", `UID SEARCH SINCE ${since}`));
+    if (!uids.length) return null;
+    const picked = uids.slice(-500);
+    const envs = await fetchEnvelopes(conn, "t002", picked);
+    const rps = await fetchReturnPaths(conn, "t003", picked);
+    let best: GvThreadHead | null = null;
+    let bestDate = "";
+    for (const uid of picked) {
+      const e = envs.get(uid);
+      if (!e || !e.messageId || !e.from) continue;
+      if (gvNumberFrom(e.from, e.subject || "", rps.get(uid) || "") !== digits) continue;
+      if (!best || e.date >= bestDate) {
+        best = { messageId: e.messageId, from: e.from, subject: e.subject || "" };
+        bestDate = e.date;
+      }
+    }
+    return best;
+  } finally {
+    conn.close();
+  }
+}
+
 /** Find the sent mailbox: "Sent", "[Gmail]/Sent Mail", "Sent Items", … */
 async function findSentMailbox(conn: Conn): Promise<string | null> {
   const lines = await conn.cmd("h002", 'LIST "" "*"');

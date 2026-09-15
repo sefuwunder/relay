@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -245,7 +245,19 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
     let subj = "sms"; // gateway ignores subject; keep it inert
     let inReplyTo: string | undefined;
     if (members.length === 1) {
-      const rec = gvReplyFor(members[0].gv_number);
+      const digits = normDigits(members[0].gv_number);
+      let rec = gvReplyFor(members[0].gv_number);
+      if (!rec && imapReady()) {
+        // No recorded forward (it was likely already \Seen before Relay polled):
+        // find the previous thread live so the send is still a reply to it.
+        try {
+          const live = await latestGvForward(settings.imap, digits);
+          if (live) {
+            kvSet("gv:reply:" + digits, JSON.stringify(live));
+            rec = live;
+          }
+        } catch { /* fall through to the plain gateway */ }
+      }
       // Keep the gateway token's original case — extractEmail() lowercases,
       // which is right for contact matching but not for the reply address.
       const m = rec ? rec.from.match(/<([^<>]+)>/) : null;
