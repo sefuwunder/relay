@@ -5,6 +5,9 @@ const $ = (s, r) => (r || document).querySelector(s);
 const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtPhone = (d) => { const s = String(d || "").replace(/\D/g, ""); return s.length === 10 ? `(${s.slice(0, 3)}) ${s.slice(3, 6)}-${s.slice(6)}` : s; };
+const MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const fmtDay = (iso) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ""); return m ? `${MON3[Number(m[2]) - 1]} ${Number(m[3])}` : (iso || ""); };
 
 const CHAN_META = {
   email: { label: "Email", glyph: "✉️" },
@@ -323,7 +326,7 @@ function openImportSheet() {
     <div class="sheet" role="dialog" aria-modal="true">
       <div class="grabber"></div><h3>Add people</h3>
       <div class="seg" id="imp-tabs" style="margin-bottom:12px">
-        <button data-tab="sent" class="on">\u2709\uFE0F Sent mail</button><button data-tab="google">\uD83D\uDD35 Google</button>
+        <button data-tab="sent" class="on">\u2709\uFE0F Sent mail</button><button data-tab="sms">\uD83D\uDCAC SMS</button><button data-tab="google">\uD83D\uDD35 Google</button>
       </div>
       <div id="imp-body"></div>
     </div>`;
@@ -333,7 +336,7 @@ function openImportSheet() {
   const body = $("#imp-body", scrim);
   const setTab = (t) => {
     $$("#imp-tabs button", scrim).forEach((b) => b.classList.toggle("on", b.dataset.tab === t));
-    if (t === "sent") drawSentTab(body, close); else drawGoogleTab(body, close);
+    if (t === "sent") drawSentTab(body, close); else if (t === "sms") drawSmsTab(body, close); else drawGoogleTab(body, close);
   };
   $$("#imp-tabs button", scrim).forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
   setTab("sent");
@@ -347,7 +350,7 @@ function contactPicker(body, close, items, importHint) {
   let q = "";
   const draw = () => {
     const list = items.filter((c) =>
-      !q || c.name.toLowerCase().includes(q) || (c.email || "").toLowerCase().includes(q));
+      !q || c.name.toLowerCase().includes(q) || (c.email || "").toLowerCase().includes(q) || (c.gv_number || "").includes(q));
     body.innerHTML = `
       <div class="search-field" style="margin-bottom:10px">\uD83D\uDD0D<input id="imp-q" placeholder="Search" value="${esc(q)}"></div>
       <div class="hint" style="margin-bottom:8px">${remaining} of ${state.maxPeople || 8} spots left \u2014 Relay stays small on purpose.</div>
@@ -384,6 +387,33 @@ function contactPicker(body, close, items, importHint) {
     });
   };
   draw();
+}
+
+async function drawSmsTab(body, close) {
+  body.innerHTML = `<div class="empty"><div class="glyph">\u23F3</div><p>Reading recent text conversations\u2026</p></div>`;
+  try {
+    const r = await api("/api/recent-sms");
+    const items = (r.conversations || []).map((c) => ({
+      name: fmtPhone(c.number), email: "", gv_number: c.number,
+      sub: `\u00D7${c.count} message${c.count === 1 ? "" : "s"} \u00B7 last ${fmtDay(c.lastDate)}`,
+    }));
+    if (!items.length) {
+      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCAC</div><h3>No recent texts</h3><p>No Google Voice messages in your inbox from the last 14 days.</p></div>`;
+      return;
+    }
+    contactPicker(body, close, items, "Creates contacts with the Google Voice number filled in \u2014 ready for SMS.");
+  } catch (e) {
+    const needSettings = /Settings/.test(e.message || "");
+    body.innerHTML = `<div class="empty"><div class="glyph">${needSettings ? "\uD83D\uDD0C" : "\u26A0\uFE0F"}</div>
+      <h3>${needSettings ? "Mail isn't connected" : "Couldn't read inbox"}</h3><p>${esc(e.message)}</p>
+      <div style="margin-top:14px">${needSettings
+        ? `<button class="btn" id="imp-settings">Open Settings</button>`
+        : `<button class="btn secondary" id="imp-retry">Try again</button>`}</div></div>`;
+    const s = $("#imp-settings", body);
+    if (s) s.addEventListener("click", () => { close(); location.hash = "#/settings"; });
+    const rt = $("#imp-retry", body);
+    if (rt) rt.addEventListener("click", () => drawSmsTab(body, close));
+  }
 }
 
 async function drawSentTab(body, close) {

@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -81,24 +81,30 @@ function googleReady(): boolean {
   return !!(settings.google.clientId && settings.google.refreshToken);
 }
 
-/** Import picked contacts (from Google or sent-mail harvesting). Shared by both. */
+/** Import picked contacts (from Google, sent mail, or recent SMS). Shared by all. */
 async function handleImportContacts(req: Request): Promise<Response> {
   const b = await readBody(req);
   const items = (Array.isArray(b.contacts) ? b.contacts : [])
-    .map((c: any) => ({ name: String(c.name || "").trim(), email: String(c.email || "").trim().toLowerCase() }))
-    .filter((c: any) => c.name || c.email);
+    .map((c: any) => ({
+      name: String(c.name || "").trim(),
+      email: String(c.email || "").trim().toLowerCase(),
+      gv: String(c.gv_number || "").replace(/\D/g, ""),
+    }))
+    .filter((c: any) => c.name || c.email || c.gv);
   const haveEmail = new Set(listContacts().map((c) => c.email.toLowerCase()).filter(Boolean));
+  const haveGv = new Set(listContacts().map((c) => (c.gv_number || "").replace(/\D/g, "")).filter(Boolean));
   const haveName = new Set(listContacts().map((c) => c.name.toLowerCase()));
   let imported = 0, skipped = 0;
   for (const it of items) {
     if (countContacts() >= MAX_PEOPLE) break;
-    if ((it.email && haveEmail.has(it.email)) || haveName.has(it.name.toLowerCase())) { skipped++; continue; }
+    if ((it.email && haveEmail.has(it.email)) || (it.gv && haveGv.has(it.gv)) || haveName.has(it.name.toLowerCase())) { skipped++; continue; }
     const c = createContact({
-      name: it.name || it.email, email: it.email, gv_number: "", matrix_id: "",
-      matrix_room_id: "", color: pickColor(it.name || it.email), notes: "",
+      name: it.name || it.email || it.gv, email: it.email, gv_number: it.gv,
+      matrix_id: "", matrix_room_id: "", color: pickColor(it.name || it.email || it.gv), notes: "",
     });
     dmFor(c.id);
     if (it.email) haveEmail.add(it.email);
+    if (it.gv) haveGv.add(it.gv);
     haveName.add(c.name.toLowerCase());
     imported++;
   }
@@ -107,6 +113,8 @@ async function handleImportContacts(req: Request): Promise<Response> {
 
 // Harvested sent-mail contacts, cached briefly (sent mail barely changes).
 let sentCache: { at: number; contacts: { name: string; email: string; count: number }[] } | null = null;
+// Recent GV SMS conversations, cached briefly too.
+let smsCache: { at: number; conversations: { number: string; count: number; lastDate: string }[] } | null = null;
 
 /** A live Google access token, refreshing it when expired. */
 async function googleToken(): Promise<string> {
@@ -365,7 +373,7 @@ const server = (Bun as any).serve({
         if (section === "matrix" && vals.token === "__KEEP__") delete vals.token;
         if (section === "google" && vals.clientSecret === "__KEEP__") delete vals.clientSecret;
         (settings as any)[section] = { ...(settings as any)[section], ...vals };
-        if (section === "imap") sentCache = null; // harvested contacts came from the old mailbox
+        if (section === "imap") { sentCache = null; smsCache = null; } // harvests came from the old mailbox
         await saveSettings();
         return json({ ok: true });
       }
@@ -446,6 +454,21 @@ const server = (Bun as any).serve({
         settings.google.email = "";
         await saveSettings();
         return json({ ok: true });
+      }
+
+      // ----- Recent Google Voice SMS conversations (INBOX, last 14 days) -----
+      if (path === "/api/recent-sms" && method === "GET") {
+        if (!imapReady()) return json({ error: "Add your mail account in Settings first." }, 400);
+        try {
+          const now = Date.now();
+          if (!smsCache || now - smsCache.at > 5 * 60 * 1000) {
+            smsCache = { at: now, conversations: await harvestRecentSms(settings.imap, 14) };
+          }
+          return json({ conversations: smsCache.conversations });
+        } catch (e) {
+          smsCache = null;
+          return json({ error: errMsg(e) }, 502);
+        }
       }
 
       // ----- Sent-mail contact harvesting -----

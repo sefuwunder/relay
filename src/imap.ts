@@ -481,6 +481,47 @@ export interface HarvestedContact {
   count: number; // how many of the scanned sent mails went to them
 }
 
+export interface HarvestedSms {
+  number: string;   // 10 digits
+  count: number;    // messages in the window
+  lastDate: string; // YYYY-MM-DD of the most recent one
+}
+
+/**
+ * Most-recent Google Voice SMS conversations in INBOX over the last `days`.
+ * GV forwards arrive as mail from {10digits}@txt.voice.google.com; ENVELOPE
+ * fetches never set \Seen, so this is read-only and non-destructive.
+ */
+export async function harvestRecentSms(cfg0: ImapConfig, days = 14): Promise<HarvestedSms[]> {
+  const conn = await login(cfg0); // SELECTs INBOX
+  try {
+    const d = new Date(Date.now() - days * 86400_000);
+    const mon = Object.keys(MONTHS)[d.getMonth()];
+    const since = `${String(d.getDate()).padStart(2, "0")}-${mon}-${d.getFullYear()}`;
+    const uids = parseSearchUids(await conn.cmd("s001", `UID SEARCH SINCE ${since}`));
+    if (!uids.length) return [];
+    const picked = uids.slice(-500);
+    const envs = await fetchEnvelopes(conn, "s002", picked);
+    const agg = new Map<string, { count: number; last: string }>();
+    for (const uid of picked) {
+      const e = envs.get(uid);
+      if (!e) continue;
+      const num = gvNumberOf(extractEmail(e.from));
+      if (!num) continue;
+      const cur = agg.get(num);
+      if (cur) {
+        cur.count++;
+        if (e.date > cur.last) cur.last = e.date;
+      } else agg.set(num, { count: 1, last: e.date });
+    }
+    return [...agg.entries()]
+      .map(([number, v]) => ({ number, count: v.count, lastDate: v.last }))
+      .sort((a, b) => b.lastDate.localeCompare(a.lastDate) || b.count - a.count);
+  } finally {
+    conn.close();
+  }
+}
+
 /** Find the sent mailbox: "Sent", "[Gmail]/Sent Mail", "Sent Items", … */
 async function findSentMailbox(conn: Conn): Promise<string | null> {
   const lines = await conn.cmd("h002", 'LIST "" "*"');
@@ -529,6 +570,13 @@ function envelopeAddrs(env: any[]): { name: string; email: string }[] {
 }
 
 const SKIP_SENDERS = /^(noreply|no-reply|donotreply|mailer-daemon|postmaster)@/i;
+const GV_HOST = "txt.voice.google.com";
+
+/** Pull the 10-digit number out of a Google Voice gateway address. "" when not one. */
+export function gvNumberOf(email: string): string {
+  const m = email.toLowerCase().match(/^(\d{10})@txt\.voice\.google\.com$/);
+  return m ? m[1] : "";
+}
 
 /**
  * Scan the last `limit` messages in the sent folder and aggregate the
@@ -567,6 +615,7 @@ export async function harvestSentContacts(
       if (!Array.isArray(env)) continue;
       for (const a of envelopeAddrs(env)) {
         if (self.has(a.email) || SKIP_SENDERS.test(a.email)) continue;
+        if (a.email.toLowerCase().endsWith("@" + GV_HOST)) continue; // phone numbers live in the SMS tab
         const cur = agg.get(a.email);
         if (cur) { cur.count++; }
         else agg.set(a.email, { name: a.name, count: 1, order: order++ });

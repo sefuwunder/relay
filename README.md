@@ -30,9 +30,10 @@ For Matrix DMs: create the DM room in Element first, then paste the room ID on t
 
 ### Adding people
 
-On the **People** tab, tap **⤓ Import** to pick from two sources:
+On the **People** tab, tap **⤓ Import** to pick from three sources:
 
 - **✉️ Sent mail** (no extra setup) — Relay scans the last 40 emails in your Sent folder over IMAP and lists everyone you've written to, most-emailed first. Your own address and automated senders (noreply@…) are skipped.
+- **💬 SMS** (no extra setup) — your most recent Google Voice text conversations from the last 14 days, read from the inbox (GV forwards arrive as mail). Importing one creates the contact with the GV number already filled in, ready for SMS.
 - **🔵 Google** — import from Google Contacts via OAuth (one-time setup below).
 
 Picks respect the 8-person cap, duplicates are skipped, and names + email addresses are imported. Add a Google Voice number afterwards (Edit person) to enable SMS for someone.
