@@ -12,6 +12,10 @@ import {
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
 import { fetchUnseen, validateImap, extractEmail, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
+import {
+  googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
+  type GoogleSettings,
+} from "./google";
 
 const PORT = Number(process.env.PORT || 3006);
 const DATA_DIR = "./data";
@@ -20,12 +24,14 @@ interface Settings {
   smtp: SmtpConfig;
   imap: ImapConfig;
   matrix: MatrixConfig;
+  google: GoogleSettings;
 }
 
 const DEFAULT_SETTINGS: Settings = {
   smtp: { host: "", port: 465, secure: "ssl", user: "", pass: "", from: "", fromName: "" },
   imap: { host: "", port: 993, user: "", pass: "" },
   matrix: { homeserver: "", token: "", userId: "" },
+  google: { clientId: "", clientSecret: "", accessToken: "", refreshToken: "", expiresAt: 0, email: "" },
 };
 
 let settings: Settings = structuredClone(DEFAULT_SETTINGS);
@@ -39,6 +45,7 @@ async function bootSettings() {
         smtp: { ...DEFAULT_SETTINGS.smtp, ...(j.smtp || {}) },
         imap: { ...DEFAULT_SETTINGS.imap, ...(j.imap || {}) },
         matrix: { ...DEFAULT_SETTINGS.matrix, ...(j.matrix || {}) },
+        google: { ...DEFAULT_SETTINGS.google, ...(j.google || {}) },
       };
     }
   } catch { /* keep defaults */ }
@@ -69,6 +76,22 @@ function imapReady(): boolean {
 }
 function matrixReady(): boolean {
   return !!(settings.matrix.homeserver && settings.matrix.token);
+}
+function googleReady(): boolean {
+  return !!(settings.google.clientId && settings.google.refreshToken);
+}
+
+/** A live Google access token, refreshing it when expired. */
+async function googleToken(): Promise<string> {
+  const g = settings.google;
+  if (!g.clientId || !g.clientSecret) throw new Error("Add your Google OAuth client in Settings first.");
+  if (!g.refreshToken) throw new Error("Connect Google in Settings first.");
+  if (g.accessToken && g.expiresAt > Date.now() + 60000) return g.accessToken;
+  const t = await refreshAccessToken(g.clientId, g.clientSecret, g.refreshToken);
+  g.accessToken = t.access_token;
+  g.expiresAt = Date.now() + t.expires_in * 1000;
+  await saveSettings();
+  return g.accessToken;
 }
 
 function errMsg(e: unknown): string {
@@ -284,7 +307,7 @@ const server = (Bun as any).serve({
       // ----- status -----
       if (path === "/api/status" && method === "GET") {
         return json({
-          smtp: smtpReady(), imap: imapReady(), matrix: matrixReady(),
+          smtp: smtpReady(), imap: imapReady(), matrix: matrixReady(), google: googleReady(),
           contacts: listContacts().length, maxPeople: MAX_PEOPLE,
           lastPoll,
         });
@@ -296,17 +319,24 @@ const server = (Bun as any).serve({
           smtp: { ...settings.smtp, pass: undefined, hasPass: !!settings.smtp.pass },
           imap: { ...settings.imap, pass: undefined, hasPass: !!settings.imap.pass },
           matrix: { ...settings.matrix, token: undefined, hasToken: !!settings.matrix.token },
+          google: {
+            clientId: settings.google.clientId,
+            hasClientSecret: !!settings.google.clientSecret,
+            connected: googleReady(),
+            email: settings.google.email,
+          },
         });
       }
       if (path === "/api/settings" && method === "POST") {
         const b = await readBody(req);
-        const section = b.section as "smtp" | "imap" | "matrix";
-        if (!["smtp", "imap", "matrix"].includes(section)) return json({ error: "unknown settings section" }, 400);
+        const section = b.section as "smtp" | "imap" | "matrix" | "google";
+        if (!["smtp", "imap", "matrix", "google"].includes(section)) return json({ error: "unknown settings section" }, 400);
         const vals = b.values || {};
         // Keep existing secrets when the client sends a placeholder.
         if (section === "smtp" && vals.pass === "__KEEP__") delete vals.pass;
         if (section === "imap" && vals.pass === "__KEEP__") delete vals.pass;
         if (section === "matrix" && vals.token === "__KEEP__") delete vals.token;
+        if (section === "google" && vals.clientSecret === "__KEEP__") delete vals.clientSecret;
         (settings as any)[section] = { ...(settings as any)[section], ...vals };
         await saveSettings();
         return json({ ok: true });
@@ -321,10 +351,88 @@ const server = (Bun as any).serve({
           await saveSettings();
           return json({ ok: true, userId });
         }
+        if (b.service === "google") {
+          const token = await googleToken();
+          const email = await googleAccountEmail(token);
+          settings.google.email = email;
+          await saveSettings();
+          return json({ ok: true, email });
+        }
         return json({ error: "unknown service" }, 400);
       }
       if (path === "/api/matrix/rooms" && method === "GET") {
         return json({ rooms: await matrixRooms(settings.matrix) });
+      }
+
+      // ----- Google Contacts -----
+      const googleRedirectUri = () => {
+        const u = new URL(req.url);
+        return `${u.protocol}//${u.host}/api/google/callback`;
+      };
+      if (path === "/api/google/redirect-uri" && method === "GET") {
+        return json({ redirect_uri: googleRedirectUri() });
+      }
+      if (path === "/api/google/auth" && method === "GET") {
+        if (!settings.google.clientId) return json({ error: "Add your Google OAuth client ID in Settings first." }, 400);
+        return json({ url: googleAuthUrl(settings.google.clientId, googleRedirectUri()) });
+      }
+      if (path === "/api/google/callback" && method === "GET") {
+        const code = url.searchParams.get("code");
+        const denied = url.searchParams.get("error");
+        if (denied || !code) {
+          return new Response(null, { status: 302, headers: { Location: "/?google=denied#/settings" } });
+        }
+        try {
+          const g = settings.google;
+          const t = await exchangeCode(g.clientId, g.clientSecret, code, googleRedirectUri());
+          g.accessToken = t.access_token;
+          if (t.refresh_token) g.refreshToken = t.refresh_token;
+          g.expiresAt = Date.now() + t.expires_in * 1000;
+          g.email = await googleAccountEmail(g.accessToken).catch(() => "");
+          await saveSettings();
+          return new Response(null, { status: 302, headers: { Location: "/?google=connected#/settings" } });
+        } catch (e) {
+          return new Response(null, { status: 302, headers: { Location: "/?google=error#/settings" } });
+        }
+      }
+      if (path === "/api/google/contacts" && method === "GET") {
+        try {
+          const token = await googleToken();
+          return json({ contacts: await listGoogleContacts(token) });
+        } catch (e) {
+          const st = (e as any)?.status === 401 || (e as any)?.status === 403 ? 401 : 502;
+          return json({ error: errMsg(e), notConnected: st === 401 }, st);
+        }
+      }
+      if (path === "/api/google/import" && method === "POST") {
+        const b = await readBody(req);
+        const items = (Array.isArray(b.contacts) ? b.contacts : [])
+          .map((c: any) => ({ name: String(c.name || "").trim(), email: String(c.email || "").trim().toLowerCase() }))
+          .filter((c: any) => c.name || c.email);
+        const haveEmail = new Set(listContacts().map((c) => c.email.toLowerCase()).filter(Boolean));
+        const haveName = new Set(listContacts().map((c) => c.name.toLowerCase()));
+        let imported = 0, skipped = 0;
+        for (const it of items) {
+          if (countContacts() >= MAX_PEOPLE) break;
+          if ((it.email && haveEmail.has(it.email)) || haveName.has(it.name.toLowerCase())) { skipped++; continue; }
+          const c = createContact({
+            name: it.name || it.email, email: it.email, gv_number: "", matrix_id: "",
+            matrix_room_id: "", color: pickColor(it.name || it.email), notes: "",
+          });
+          dmFor(c.id);
+          if (it.email) haveEmail.add(it.email);
+          haveName.add(c.name.toLowerCase());
+          imported++;
+        }
+        return json({ imported, skipped, capped: countContacts() >= MAX_PEOPLE });
+      }
+      if (path === "/api/google/disconnect" && method === "POST") {
+        settings.google.accessToken = "";
+        settings.google.refreshToken = "";
+        settings.google.expiresAt = 0;
+        settings.google.email = "";
+        await saveSettings();
+        return json({ ok: true });
       }
 
       // ----- contacts -----

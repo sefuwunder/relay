@@ -288,6 +288,7 @@ function renderPeople() {
   app.innerHTML = `
     <div class="view">
       <div class="nav-bar"><div class="nav-title">People</div>
+        <button class="nav-action" id="import-google">⤓ Import</button>
         <button class="nav-action" id="new-group2">＋ Group</button></div>
       <div class="scroll"><div class="people-grid">
         ${state.contacts.map((c) => `
@@ -310,6 +311,83 @@ function renderPeople() {
   $$(".person-card[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/" + b.dataset.id; }));
   $("#add-person").addEventListener("click", () => { if (!full) location.hash = "#/people/new"; });
   $("#new-group2").addEventListener("click", () => { location.hash = "#/group/new"; });
+  $("#import-google").addEventListener("click", openImportSheet);
+}
+
+// ---------- Google Contacts import ----------
+
+function openImportSheet() {
+  const scrim = document.createElement("div");
+  scrim.className = "sheet-scrim";
+  scrim.innerHTML = `
+    <div class="sheet" role="dialog" aria-modal="true">
+      <div class="grabber"></div><h3>Import from Google</h3>
+      <div id="imp-body"><div class="empty"><div class="glyph">⏳</div><p>Loading your Google contacts…</p></div></div>
+    </div>`;
+  document.body.appendChild(scrim);
+  const close = () => scrim.remove();
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+
+  const body = $("#imp-body", scrim);
+  (async () => {
+    let gcontacts;
+    try {
+      const r = await api("/api/google/contacts");
+      gcontacts = r.contacts || [];
+    } catch (e) {
+      body.innerHTML = `<div class="empty"><div class="glyph">🔌</div><h3>Google isn't connected</h3>
+        <p>${esc(e.message)}</p>
+        <div style="margin-top:14px"><button class="btn" id="imp-settings">Open Settings</button></div></div>`;
+      $("#imp-settings", body).addEventListener("click", () => { close(); location.hash = "#/settings"; });
+      return;
+    }
+    if (!gcontacts.length) {
+      body.innerHTML = `<div class="empty"><div class="glyph">📇</div><h3>No Google contacts found</h3><p>Your Google contacts list is empty.</p></div>`;
+      return;
+    }
+    const remaining = (state.maxPeople || 8) - state.contacts.length;
+    const picked = new Set();
+    let q = "";
+    const draw = () => {
+      const list = gcontacts.filter((c) =>
+        !q || c.name.toLowerCase().includes(q) || (c.email || "").toLowerCase().includes(q));
+      body.innerHTML = `
+        <div class="search-field" style="margin-bottom:10px">🔍<input id="imp-q" placeholder="Search contacts" value="${esc(q)}"></div>
+        <div class="hint" style="margin-bottom:8px">${remaining} of ${state.maxPeople || 8} spots left — Relay stays small on purpose.</div>
+        <div class="ios-group card" style="margin:0;max-height:40vh;overflow-y:auto">
+          ${list.map((c, i) => { const idx = gcontacts.indexOf(c); return `
+            <div class="pick-row${picked.has(idx) ? " on" : ""}" data-idx="${idx}">
+              <span class="check">✓</span>${avatarHtml(c.name || c.email, "#0a84ff", 48)}
+              <span class="pname" style="font-size:15px">${esc(c.name || "(no name)")}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${esc(c.email || "")}${c.phone ? " · " + esc(c.phone) : ""}</span></span>
+            </div>`; }).join("") || `<div class="empty"><p>No matches.</p></div>`}
+        </div>
+        <button class="btn" id="imp-go" style="width:100%;margin-top:12px" ${picked.size ? "" : "disabled"}>Import ${picked.size} contact${picked.size === 1 ? "" : "s"}</button>
+        <div class="hint" style="text-align:center">Names and email addresses are imported. Add a Google Voice number afterwards (Edit person) to enable SMS.</div>`;
+      const qi = $("#imp-q", body);
+      qi.addEventListener("input", () => { q = qi.value.toLowerCase(); const pos = qi.selectionStart; draw(); const nq = $("#imp-q", body); nq.focus(); nq.setSelectionRange(pos, pos); });
+      $$(".pick-row", body).forEach((r) => r.addEventListener("click", () => {
+        const idx = Number(r.dataset.idx);
+        if (picked.has(idx)) picked.delete(idx);
+        else {
+          if (picked.size >= remaining) { toast(`Only ${remaining} spot${remaining === 1 ? "" : "s"} left.`, true); return; }
+          picked.add(idx);
+        }
+        draw();
+      }));
+      $("#imp-go", body).addEventListener("click", async () => {
+        const btn = $("#imp-go", body);
+        btn.disabled = true; btn.textContent = "Importing…";
+        try {
+          const r = await api("/api/google/import", { method: "POST", body: JSON.stringify({ contacts: [...picked].map((i) => gcontacts[i]) }) });
+          await loadContacts();
+          close();
+          toast(r.imported ? `Imported ${r.imported}.` + (r.skipped ? ` ${r.skipped} already here.` : "") : "Everyone selected was already here.");
+          if ((location.hash || "").startsWith("#/people")) renderPeople();
+        } catch (e) { toast(e.message, true); btn.disabled = false; draw(); }
+      });
+    };
+    draw();
+  })();
 }
 
 function renderPersonDetail(id) {
@@ -568,6 +646,18 @@ function renderSettings() {
           <div class="test-row" style="margin-top:8px"><button class="btn secondary small" id="t-matrix">Test connection</button><span class="test-result" id="r-matrix"></span></div>
         </div>
 
+        <div class="group-caption">Google Contacts</div>
+        <div class="ios-group card" style="padding:14px 16px">
+          <div class="ios-row" style="padding:0 0 10px;background:none;border:none">${dot(st.google)}<div class="rlabel"><div class="t1">Google Contacts</div><div class="t2">${s.google.connected ? "Connected as " + esc(s.google.email || "your account") : "Not connected"}</div></div></div>
+          <div class="field"><label>OAuth client ID</label><input class="text-input" id="g-id" value="${esc(s.google.clientId || "")}" placeholder="1234…apps.googleusercontent.com"></div>
+          ${secretField(0, s.google.hasClientSecret, "g-secret", "OAuth client secret", "")}
+          <div class="hint" style="margin-bottom:10px"><b>One-time setup</b> — Google Cloud Console → new project → enable the <b>People API</b> → Credentials → Create OAuth client ID (Web application) → add this redirect URI:<br><code id="g-uri" style="word-break:break-all;user-select:all">…</code><br>Then paste the ID + secret above, save, and connect.</div>
+          <div class="test-row">
+            <button class="btn secondary small" id="g-connect">${s.google.connected ? "Reconnect" : "Save & connect Google"}</button>
+            ${s.google.connected ? `<button class="btn secondary small" id="g-disconnect">Disconnect</button>` : ""}
+          </div>
+        </div>
+
         <div style="padding:8px 32px 40px"><button class="btn" id="save-all" style="width:100%">Save settings</button></div>
       </div>
       ${tabBar("settings")}
@@ -586,6 +676,22 @@ function renderSettings() {
   test("#t-imap", "#r-imap", "imap");
   test("#t-matrix", "#r-matrix", "matrix");
 
+  api("/api/google/redirect-uri").then((r) => { const el = $("#g-uri"); if (el) el.textContent = r.redirect_uri; }).catch(() => {});
+
+  $("#g-connect").addEventListener("click", async () => {
+    try {
+      await saveAll(true);
+      const r = await api("/api/google/auth");
+      location.href = r.url;
+    } catch (e) { toast(e.message, true); }
+  });
+  const gd = $("#g-disconnect");
+  if (gd) gd.addEventListener("click", async () => {
+    await api("/api/google/disconnect", { method: "POST" });
+    toast("Google disconnected.");
+    await loadSettings(); renderSettings();
+  });
+
   async function saveAll(quiet) {
     const secret = (id, has) => { const v = $(id).value; return v ? v : (has ? "__KEEP__" : ""); };
     await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "smtp", values: {
@@ -599,6 +705,9 @@ function renderSettings() {
     }})});
     await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "matrix", values: {
       homeserver: $("#m-hs").value.trim().replace(/\/+$/, ""), token: secret("#m-token", s.matrix.hasToken),
+    }})});
+    await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "google", values: {
+      clientId: $("#g-id").value.trim(), clientSecret: secret("#g-secret", s.google.hasClientSecret),
     }})});
     if (!quiet) { toast("Settings saved."); await loadSettings(); renderSettings(); }
   }
@@ -642,6 +751,12 @@ async function route() {
     } else if (parts[0] === "settings") {
       await loadSettings();
       renderSettings();
+      const qp = new URLSearchParams(location.search);
+      const g = qp.get("google");
+      if (g === "connected") toast("Google connected — tap ⤓ Import on the People tab to pick contacts.");
+      else if (g === "denied") toast("Google sign-in was cancelled.", true);
+      else if (g === "error") toast("Google sign-in failed — check the client ID and secret, then try again.", true);
+      if (g) history.replaceState(null, "", "/#/settings");
     } else {
       location.hash = "#/chats";
     }
