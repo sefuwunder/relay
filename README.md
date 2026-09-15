@@ -7,7 +7,7 @@ A small, glossy, iOS-style messaging app for your inner circle — up to **8 peo
 In any message view a segmented control offers the channels that contact can actually use right now:
 
 - **✉️ Email** — sent through your SMTP server; replies arrive via IMAP and land in the same thread.
-- **💬 SMS** — sent through **Google Voice's SMS email gateway** (`5551234567@txt.voice.google.com`). Just add the contact's Google Voice number; no phone hardware needed. Replies forwarded by Google Voice to your email are picked up by the IMAP poller and threaded as SMS.
+- **💬 SMS** — sent through **Google Voice's SMS email gateway**. Just add the contact's Google Voice number; no phone hardware needed. Replies forwarded by Google Voice to your email are picked up by the IMAP poller and threaded as SMS. Outbound 1:1 texts are sent as *replies* to the newest GV forward seen for that number (Google Voice drops fresh mail to the bare gateway address); groups and never-seen numbers fall back to the plain gateway address.
 - **🟣 Matrix** — sent with your Matrix access token to a room you pick per contact (or per group); incoming room messages arrive over `/sync` long-polling.
 
 A channel only appears when the service is configured in Settings **and** every participant has that channel's address. Hints explain what's missing.

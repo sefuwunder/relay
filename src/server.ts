@@ -204,6 +204,20 @@ function pickColor(name: string): string {
 
 // ---------- sending ----------
 
+/** Newest Google Voice forward seen for a 10-digit number, for reply threading. */
+function gvReplyFor(gvNumber: string): { messageId: string; from: string; subject: string } | null {
+  const d = normDigits(gvNumber || "");
+  if (d.length !== 10) return null;
+  try {
+    const r = JSON.parse(kvGet("gv:reply:" + d) || "null");
+    if (r && typeof r.messageId === "string" && r.messageId && typeof r.from === "string" && r.from) {
+      r.messageId = r.messageId.replace(/[\r\n]+/g, "");
+      if (r.messageId) return r;
+    }
+  } catch { /* corrupt entry — treat as no record */ }
+  return null;
+}
+
 async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string) {
   const conv = getConversation(convId);
   if (!conv) throw new Error("Conversation not found.");
@@ -220,9 +234,27 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
     return insertMessage({ conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", status: "sent" });
   }
   if (channel === "sms") {
-    const to = members.map((m) => gvGatewayAddress(m.gv_number));
-    const subj = "sms"; // gateway ignores subject; keep it inert
-    await sendMail(settings.smtp, { to, subject: subj, text });
+    // Google Voice only delivers mail sent as a *reply* to its last forward
+    // for that number — a fresh mail to the bare gateway address fails. So
+    // 1:1 texts go out threaded under the newest GV forward we have seen
+    // (recorded by the IMAP poll and the SMS harvester). Groups and unknown
+    // numbers fall back to the plain gateway address.
+    let to = members.map((m) => gvGatewayAddress(m.gv_number));
+    let subj = "sms"; // gateway ignores subject; keep it inert
+    let inReplyTo: string | undefined;
+    if (members.length === 1) {
+      const rec = gvReplyFor(members[0].gv_number);
+      // Keep the gateway token's original case — extractEmail() lowercases,
+      // which is right for contact matching but not for the reply address.
+      const m = rec ? rec.from.match(/<([^<>]+)>/) : null;
+      const replyAddr = (m ? m[1] : rec?.from || "").trim();
+      if (rec && replyAddr) {
+        to = [replyAddr];
+        inReplyTo = rec.messageId;
+        if (rec.subject) subj = "Re: " + rec.subject.replace(/^Re:\s*/i, "");
+      }
+    }
+    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo });
     return insertMessage({ conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: "", status: "sent" });
   }
   // matrix
@@ -255,6 +287,9 @@ async function pollMail() {
       let subject = m.subject || "";
       if (gvNum) {
         const digits = gvNum; // already normalized to 10 digits
+        if (m.messageId && m.from) {
+          kvSet("gv:reply:" + digits, JSON.stringify({ messageId: m.messageId, from: m.from, subject: m.subject || "" }));
+        }
         contact = byGv.get(digits) || null;
         channel = "sms";
         subject = "";
@@ -462,6 +497,9 @@ const server = (Bun as any).serve({
           if (!smsCache || now - smsCache.at > 5 * 60 * 1000) {
             const h = await harvestRecentSms(settings.imap, 14);
             smsCache = { at: now, conversations: h.conversations, scanned: h.scanned };
+            for (const c of h.conversations) {
+              if (c.replyTo) kvSet("gv:reply:" + c.number, JSON.stringify(c.replyTo));
+            }
           }
           // Cross-reference with existing contacts by GV number (fresh every request).
           const byGv = new Map<string, { id: string; name: string }>();

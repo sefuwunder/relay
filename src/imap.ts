@@ -314,8 +314,8 @@ function parseSearchUids(lines: string[]): string[] {
 }
 
 // Fetch envelopes for a batch of UIDs; returns partial results on parse issues.
-async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<Map<string, { from: string; subject: string; date: string }>> {
-  const out = new Map<string, { from: string; subject: string; date: string }>();
+async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<Map<string, { from: string; subject: string; date: string; messageId: string }>> {
+  const out = new Map<string, { from: string; subject: string; date: string; messageId: string }>();
   const lines = await conn.cmd(tag, `UID FETCH ${uids.join(",")} (UID INTERNALDATE ENVELOPE)`);
   let cur: string[] = [];
   const flush = () => {
@@ -353,16 +353,18 @@ async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<
       const [v] = parseImapValue(env.trim());
       env = v;
     }
-    let from = "", subject = "", date = "";
+    let from = "", subject = "", date = "", messageId = "";
     if (Array.isArray(env)) {
       subject = decodeHeader(String(env[1] ?? "")).trim();
       const fromList = env[2];
       if (Array.isArray(fromList)) from = fromList.map(addrText).filter(Boolean).join(", ");
       date = internalDateToIso(String(parts["INTERNALDATE"] ?? env[0] ?? ""));
+      // ENVELOPE = (date subject from sender reply-to to cc bcc in-reply-to message-id)
+      if (typeof env[9] === "string" && env[9].toUpperCase() !== "NIL") messageId = env[9].trim();
     } else {
       date = internalDateToIso(String(parts["INTERNALDATE"] ?? ""));
     }
-    out.set(uid, { from, subject, date });
+    out.set(uid, { from, subject, date, messageId });
   };
   for (const line of lines) {
     if (/^\* \d+ FETCH/i.test(line) && cur.length) flush();
@@ -466,6 +468,7 @@ export interface UnseenMail {
   date: string;
   snippet: string;
   returnPath: string;
+  messageId: string; // ENVELOPE message-id — used to thread SMS replies
 }
 
 /** Fetch UNSEEN messages from INBOX (oldest first), then mark them \Seen. */
@@ -480,7 +483,7 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
     const rps = await fetchReturnPaths(conn, "b004", picked);
     const mails: UnseenMail[] = [];
     for (const uid of picked) {
-      const e = envs.get(uid) || { from: "", subject: "", date: "" };
+      const e = envs.get(uid) || { from: "", subject: "", date: "", messageId: "" };
       mails.push({
         uid,
         from: e.from,
@@ -488,6 +491,7 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
         date: e.date,
         snippet: snips.get(uid) || "",
         returnPath: rps.get(uid) || "",
+        messageId: e.messageId || "",
       });
     }
     await conn.cmd("b005", `UID STORE ${picked.join(",")} +FLAGS (\\Seen)`);
@@ -518,6 +522,9 @@ export interface HarvestedSms {
   name: string;     // sender name from the forward ("Acela"), "" when unknown
   count: number;    // messages in the window
   lastDate: string; // YYYY-MM-DD of the most recent one
+  // Newest forward in the window — sending "replies" to it keeps the GV
+  // gateway delivering (a fresh mail to the bare gateway address fails).
+  replyTo: { messageId: string; from: string; subject: string } | null;
 }
 
 export interface SmsHarvest {
@@ -541,23 +548,24 @@ export async function harvestRecentSms(cfg0: ImapConfig, days = 14): Promise<Sms
     const picked = uids.slice(-500);
     const envs = await fetchEnvelopes(conn, "s002", picked);
     const rps = await fetchReturnPaths(conn, "s003", picked);
-    const agg = new Map<string, { name: string; count: number; last: string }>();
+    const agg = new Map<string, { name: string; count: number; last: string; replyTo: { messageId: string; from: string; subject: string } | null }>();
     for (const uid of picked) {
       const e = envs.get(uid);
       if (!e) continue;
       const num = gvNumberFrom(e.from || "", e.subject || "", rps.get(uid) || "");
       if (!num) continue;
       const nm = gvSenderName(e.from || "", e.subject || "");
+      const replyTo = e.messageId ? { messageId: e.messageId, from: e.from || "", subject: e.subject || "" } : null;
       const cur = agg.get(num);
       if (cur) {
         if (nm && e.date >= cur.last) cur.name = nm;
         cur.count++;
-        if (e.date > cur.last) cur.last = e.date;
-      } else agg.set(num, { name: nm, count: 1, last: e.date });
+        if (e.date > cur.last) { cur.last = e.date; if (replyTo) cur.replyTo = replyTo; }
+      } else agg.set(num, { name: nm, count: 1, last: e.date, replyTo });
     }
     return {
       conversations: [...agg.entries()]
-        .map(([number, v]) => ({ number, name: v.name, count: v.count, lastDate: v.last }))
+        .map(([number, v]) => ({ number, name: v.name, count: v.count, lastDate: v.last, replyTo: v.replyTo }))
         .sort((a, b) => b.lastDate.localeCompare(a.lastDate) || b.count - a.count),
       scanned: picked.length,
     };

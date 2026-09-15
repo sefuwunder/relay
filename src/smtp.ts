@@ -126,6 +126,9 @@ export interface SendMailOpts {
   to: string[];
   subject: string;
   text: string;
+  /** Message-ID to thread under (In-Reply-To + References). Used for SMS:
+      Google Voice only delivers mail sent as a reply to its last forward. */
+  inReplyTo?: string;
 }
 
 function dotStuff(text: string): string {
@@ -144,6 +147,9 @@ function buildMessage(cfg: SmtpConfig, opts: SendMailOpts): string {
     "Content-Transfer-Encoding: 8bit",
     "X-Mailer: Relay",
   ];
+  if (opts.inReplyTo) {
+    headers.push(`In-Reply-To: ${opts.inReplyTo}`, `References: ${opts.inReplyTo}`);
+  }
   return headers.join("\r\n") + "\r\n\r\n" + dotStuff(opts.text.replace(/\r?\n/g, "\n"));
 }
 
