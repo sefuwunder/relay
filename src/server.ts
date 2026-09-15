@@ -114,7 +114,7 @@ async function handleImportContacts(req: Request): Promise<Response> {
 // Harvested sent-mail contacts, cached briefly (sent mail barely changes).
 let sentCache: { at: number; contacts: { name: string; email: string; count: number }[] } | null = null;
 // Recent GV SMS conversations, cached briefly too.
-let smsCache: { at: number; conversations: { number: string; count: number; lastDate: string }[] } | null = null;
+let smsCache: { at: number; conversations: { number: string; count: number; lastDate: string }[]; scanned: number } | null = null;
 
 /** A live Google access token, refreshing it when expired. */
 async function googleToken(): Promise<string> {
@@ -462,9 +462,10 @@ const server = (Bun as any).serve({
         try {
           const now = Date.now();
           if (!smsCache || now - smsCache.at > 5 * 60 * 1000) {
-            smsCache = { at: now, conversations: await harvestRecentSms(settings.imap, 14) };
+            const h = await harvestRecentSms(settings.imap, 14);
+            smsCache = { at: now, conversations: h.conversations, scanned: h.scanned };
           }
-          return json({ conversations: smsCache.conversations });
+          return json({ conversations: smsCache.conversations, scanned: smsCache.scanned });
         } catch (e) {
           smsCache = null;
           return json({ error: errMsg(e) }, 502);

@@ -398,7 +398,8 @@ async function drawSmsTab(body, close) {
       sub: `\u00D7${c.count} message${c.count === 1 ? "" : "s"} \u00B7 last ${fmtDay(c.lastDate)}`,
     }));
     if (!items.length) {
-      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCAC</div><h3>No recent texts</h3><p>No Google Voice messages in your inbox from the last 14 days.</p></div>`;
+      const n = Number(r.scanned || 0);
+      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCAC</div><h3>No recent texts</h3><p>Scanned ${n} inbox message${n === 1 ? "" : "s"} from the last 14 days \u2014 none were Google Voice SMS forwards.</p></div>`;
       return;
     }
     contactPicker(body, close, items, "Creates contacts with the Google Voice number filled in \u2014 ready for SMS.");

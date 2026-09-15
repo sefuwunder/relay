@@ -487,36 +487,47 @@ export interface HarvestedSms {
   lastDate: string; // YYYY-MM-DD of the most recent one
 }
 
+export interface SmsHarvest {
+  conversations: HarvestedSms[];
+  scanned: number; // inbox messages seen in the window (diagnostic)
+}
+
 /**
  * Most-recent Google Voice SMS conversations in INBOX over the last `days`.
- * GV forwards arrive as mail from {10digits}@txt.voice.google.com; ENVELOPE
+ * GV forwards arrive as mail from {digits}@txt|mms.voice.google.com; ENVELOPE
  * fetches never set \Seen, so this is read-only and non-destructive.
  */
-export async function harvestRecentSms(cfg0: ImapConfig, days = 14): Promise<HarvestedSms[]> {
+export async function harvestRecentSms(cfg0: ImapConfig, days = 14): Promise<SmsHarvest> {
   const conn = await login(cfg0); // SELECTs INBOX
   try {
     const d = new Date(Date.now() - days * 86400_000);
     const mon = Object.keys(MONTHS)[d.getMonth()];
     const since = `${String(d.getDate()).padStart(2, "0")}-${mon}-${d.getFullYear()}`;
     const uids = parseSearchUids(await conn.cmd("s001", `UID SEARCH SINCE ${since}`));
-    if (!uids.length) return [];
+    if (!uids.length) return { conversations: [], scanned: 0 };
     const picked = uids.slice(-500);
     const envs = await fetchEnvelopes(conn, "s002", picked);
     const agg = new Map<string, { count: number; last: string }>();
     for (const uid of picked) {
       const e = envs.get(uid);
       if (!e) continue;
-      const num = gvNumberOf(extractEmail(e.from));
-      if (!num) continue;
+      // Match the raw From text (display name may be a contact name, not the number).
+      const m = (e.from || "").match(GV_RE);
+      if (!m) continue;
+      const num = gvDigits(m);
+      if (num.length !== 10) continue;
       const cur = agg.get(num);
       if (cur) {
         cur.count++;
         if (e.date > cur.last) cur.last = e.date;
       } else agg.set(num, { count: 1, last: e.date });
     }
-    return [...agg.entries()]
-      .map(([number, v]) => ({ number, count: v.count, lastDate: v.last }))
-      .sort((a, b) => b.lastDate.localeCompare(a.lastDate) || b.count - a.count);
+    return {
+      conversations: [...agg.entries()]
+        .map(([number, v]) => ({ number, count: v.count, lastDate: v.last }))
+        .sort((a, b) => b.lastDate.localeCompare(a.lastDate) || b.count - a.count),
+      scanned: picked.length,
+    };
   } finally {
     conn.close();
   }
@@ -570,12 +581,13 @@ function envelopeAddrs(env: any[]): { name: string; email: string }[] {
 }
 
 const SKIP_SENDERS = /^(noreply|no-reply|donotreply|mailer-daemon|postmaster)@/i;
-const GV_HOST = "txt.voice.google.com";
+// Same definition of "a Google Voice message" as the inbound mail poll:
+// 10 or 11 digits, txt or mms gateway.
+const GV_RE = /(\d{10,11})@(?:txt|mms)\.voice\.google\.com/i;
 
-/** Pull the 10-digit number out of a Google Voice gateway address. "" when not one. */
-export function gvNumberOf(email: string): string {
-  const m = email.toLowerCase().match(/^(\d{10})@txt\.voice\.google\.com$/);
-  return m ? m[1] : "";
+/** Normalize a GV match to the 10-digit number. */
+function gvDigits(m: RegExpMatchArray): string {
+  return m[1].replace(/\D/g, "").slice(-10);
 }
 
 /**
@@ -615,7 +627,7 @@ export async function harvestSentContacts(
       if (!Array.isArray(env)) continue;
       for (const a of envelopeAddrs(env)) {
         if (self.has(a.email) || SKIP_SENDERS.test(a.email)) continue;
-        if (a.email.toLowerCase().endsWith("@" + GV_HOST)) continue; // phone numbers live in the SMS tab
+        if (GV_RE.test(a.email)) continue; // phone numbers live in the SMS tab
         const cur = agg.get(a.email);
         if (cur) { cur.count++; }
         else agg.set(a.email, { name: a.name, count: 1, order: order++ });
