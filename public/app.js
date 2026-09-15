@@ -406,7 +406,7 @@ async function openAttachSheet(item, onDone) {
   const num = normDigits(item.gv_number);
   const targets = contacts.filter((c) => { const d = normDigits(c.gv_number); return !num || d !== num; });
   const scrim = document.createElement("div");
-  scrim.className = "scrim";
+  scrim.className = "sheet-scrim";
   scrim.innerHTML = `<div class="sheet"><div class="grabber"></div><h3>Add number to\u2026</h3>
     <p class="hint" style="text-align:center;margin:0 0 10px">${esc(item.name || fmtPhone(item.gv_number))} \u00B7 ${esc(fmtPhone(item.gv_number))}</p>
     <div class="ios-group card" style="margin:0;max-height:40vh;overflow-y:auto">
