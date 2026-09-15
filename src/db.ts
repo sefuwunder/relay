@@ -3,6 +3,8 @@
 // gitignored ./data and is never pushed.
 
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export type Channel = "email" | "sms" | "matrix";
 
@@ -44,6 +46,7 @@ export const MAX_PEOPLE = 8;
 let db: Database;
 
 export function openDb(path: string): Database {
+  mkdirSync(dirname(path), { recursive: true });
   db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(`
