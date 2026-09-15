@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, stripGvFooter, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -307,6 +307,7 @@ async function pollMail() {
         contact = byGv.get(digits) || null;
         channel = "sms";
         subject = "";
+        body = stripGvFooter(body); // drop the GV email footer boilerplate
         if (!body) body = "(empty SMS)";
       } else {
         contact = byEmail.get(extractEmail(rawFrom)) || null;

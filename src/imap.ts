@@ -690,6 +690,16 @@ export function parseGvNumber(rawFrom: string): string {
   return /^\d{10}$/.test(digits) ? digits : "";
 }
 
+/**
+ * Strip the Google Voice email footer from an inbound SMS body.
+ * GV forwards arrive as e.g. "hey mom YOUR ACCOUNT <https://voice.google.com>
+ * HELP CENTER <...> HELP FORUM <...> ..." — everything from YOUR ACCOUNT on
+ * is boilerplate, not the message.
+ */
+export function stripGvFooter(body: string): string {
+  return (body || "").replace(/\s*YOUR ACCOUNT\s*<\s*https?:\/\/voice\.google\.com\s*>[\s\S]*$/i, "").trim();
+}
+
 /** "New text message from Acela (513) 967-2841" -> "5139672841". */
 function subjectPhone(subject: string): string {
   const m = subject.match(/\((\d{3})\)\s*(\d{3})[.-]?(\d{4})/);
