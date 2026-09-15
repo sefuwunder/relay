@@ -262,8 +262,8 @@ function cfgOk(c: ImapConfig): ImapConfig {
   };
 }
 
-/** Connect, log in, select INBOX. Returns the open connection. */
-async function login(cfg0: ImapConfig): Promise<Conn> {
+/** Connect and log in without selecting a mailbox. */
+async function connectAndLogin(cfg0: ImapConfig): Promise<{ conn: Conn; cfg: ImapConfig }> {
   const cfg = cfgOk(cfg0);
   const conn = new Conn();
   await conn.open(cfg.host, cfg.port!, cfg.secure!);
@@ -274,6 +274,17 @@ async function login(cfg0: ImapConfig): Promise<Conn> {
   }
   try {
     await conn.cmd("a001", `LOGIN ${qstr(cfg.user)} ${qstr(cfg.pass)}`);
+  } catch (e) {
+    conn.close();
+    throw e;
+  }
+  return { conn, cfg };
+}
+
+/** Connect, log in, select INBOX. Returns the open connection. */
+async function login(cfg0: ImapConfig): Promise<Conn> {
+  const { conn } = await connectAndLogin(cfg0);
+  try {
     await conn.cmd("a002", "SELECT INBOX");
   } catch (e) {
     conn.close();
@@ -460,4 +471,112 @@ export function extractEmail(from: string): string {
   if (m) return m[1].toLowerCase();
   const m2 = from.match(/([^\s<>,;]+@[^\s<>,;]+)/);
   return (m2 ? m2[1] : from).toLowerCase().trim();
+}
+
+// ---------- sent-folder contact harvesting ----------
+
+export interface HarvestedContact {
+  name: string;
+  email: string;
+  count: number; // how many of the scanned sent mails went to them
+}
+
+/** Find the sent mailbox: "Sent", "[Gmail]/Sent Mail", "Sent Items", … */
+async function findSentMailbox(conn: Conn): Promise<string | null> {
+  const lines = await conn.cmd("h002", 'LIST "" "*"');
+  const names: string[] = [];
+  for (const line of lines) {
+    const rest = line.replace(/^\* LIST\s+/i, "");
+    if (rest === line) continue;
+    // Response shape: (flags) delimiter name
+    const parts: any[] = [];
+    let r = rest;
+    for (let i = 0; i < 3 && r.trim(); i++) {
+      const [v, nr] = parseImapValue(r);
+      parts.push(v);
+      r = nr;
+    }
+    if (typeof parts[2] === "string") names.push(parts[2]);
+  }
+  const tests: RegExp[] = [
+    /^sent$/i,
+    /^\[gmail\]\/sent mail$/i,
+    /^sent (items|messages)$/i,
+    /sent/i,
+  ];
+  for (const re of tests) {
+    const hit = names.find((n) => re.test(n));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function envelopeAddrs(env: any[]): { name: string; email: string }[] {
+  const out: { name: string; email: string }[] = [];
+  // ENVELOPE = (date subject from sender reply-to to cc bcc in-reply-to message-id)
+  for (const idx of [5, 6]) { // to, cc
+    const list = env[idx];
+    if (!Array.isArray(list)) continue;
+    for (const a of list) {
+      if (!Array.isArray(a)) continue;
+      const [rawName, , mailbox, host] = a;
+      const email = mailbox && host ? `${mailbox}@${host}`.toLowerCase() : "";
+      if (!email || !email.includes("@")) continue;
+      out.push({ name: decodeHeader(String(rawName || "")).trim(), email });
+    }
+  }
+  return out;
+}
+
+const SKIP_SENDERS = /^(noreply|no-reply|donotreply|mailer-daemon|postmaster)@/i;
+
+/**
+ * Scan the last `limit` messages in the sent folder and aggregate the
+ * recipients into contacts, most-emailed first. Excludes the user's own
+ * addresses and obvious automated senders.
+ */
+export async function harvestSentContacts(
+  cfg0: ImapConfig, limit = 40, selfEmails: string[] = []
+): Promise<HarvestedContact[]> {
+  const { conn } = await connectAndLogin(cfg0);
+  try {
+    const sent = await findSentMailbox(conn);
+    if (!sent) throw new ImapError(502, "couldn't find a Sent folder in this mailbox");
+    const sel = await conn.cmd("h003", `EXAMINE ${qstr(sent)}`);
+    const ex = sel.map((l) => l.match(/^\* (\d+) EXISTS/i)).find(Boolean);
+    const exists = ex ? Number(ex[1]) : 0;
+    if (!exists) return [];
+    const start = Math.max(1, exists - Math.min(limit, 200) + 1);
+    const lines = await conn.cmd("h004", `FETCH ${start}:${exists} (ENVELOPE)`);
+    const self = new Set(selfEmails.map((s) => s.toLowerCase().trim()).filter(Boolean));
+    const agg = new Map<string, { name: string; count: number; order: number }>();
+    let order = 0;
+    const blocks: string[] = [];
+    for (const line of lines) {
+      if (/^\* \d+ FETCH/i.test(line)) blocks.push(line);
+      else if (blocks.length) blocks[blocks.length - 1] += "\r\n" + line;
+    }
+    // Newest first so the first name we see for an address is the freshest.
+    for (const block of blocks.reverse()) {
+      const m = block.match(/ENVELOPE\s*/i);
+      if (!m) continue;
+      let rest = block.slice(m.index! + m[0].length).trim();
+      const lm = rest.match(/^\{(\d+)\}\n?/);
+      if (lm) rest = rest.slice(lm[0].length);
+      const [env] = parseImapValue(rest);
+      if (!Array.isArray(env)) continue;
+      for (const a of envelopeAddrs(env)) {
+        if (self.has(a.email) || SKIP_SENDERS.test(a.email)) continue;
+        const cur = agg.get(a.email);
+        if (cur) { cur.count++; }
+        else agg.set(a.email, { name: a.name, count: 1, order: order++ });
+      }
+    }
+    return [...agg.entries()]
+      .map(([email, v]) => ({ name: v.name || email, email, count: v.count, _o: v.order }))
+      .sort((a, b) => b.count - a.count || a._o - b._o)
+      .map(({ name, email, count }) => ({ name, email, count }));
+  } finally {
+    conn.close();
+  }
 }

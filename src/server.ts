@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -80,6 +80,33 @@ function matrixReady(): boolean {
 function googleReady(): boolean {
   return !!(settings.google.clientId && settings.google.refreshToken);
 }
+
+/** Import picked contacts (from Google or sent-mail harvesting). Shared by both. */
+async function handleImportContacts(req: Request): Promise<Response> {
+  const b = await readBody(req);
+  const items = (Array.isArray(b.contacts) ? b.contacts : [])
+    .map((c: any) => ({ name: String(c.name || "").trim(), email: String(c.email || "").trim().toLowerCase() }))
+    .filter((c: any) => c.name || c.email);
+  const haveEmail = new Set(listContacts().map((c) => c.email.toLowerCase()).filter(Boolean));
+  const haveName = new Set(listContacts().map((c) => c.name.toLowerCase()));
+  let imported = 0, skipped = 0;
+  for (const it of items) {
+    if (countContacts() >= MAX_PEOPLE) break;
+    if ((it.email && haveEmail.has(it.email)) || haveName.has(it.name.toLowerCase())) { skipped++; continue; }
+    const c = createContact({
+      name: it.name || it.email, email: it.email, gv_number: "", matrix_id: "",
+      matrix_room_id: "", color: pickColor(it.name || it.email), notes: "",
+    });
+    dmFor(c.id);
+    if (it.email) haveEmail.add(it.email);
+    haveName.add(c.name.toLowerCase());
+    imported++;
+  }
+  return json({ imported, skipped, capped: countContacts() >= MAX_PEOPLE });
+}
+
+// Harvested sent-mail contacts, cached briefly (sent mail barely changes).
+let sentCache: { at: number; contacts: { name: string; email: string; count: number }[] } | null = null;
 
 /** A live Google access token, refreshing it when expired. */
 async function googleToken(): Promise<string> {
@@ -338,6 +365,7 @@ const server = (Bun as any).serve({
         if (section === "matrix" && vals.token === "__KEEP__") delete vals.token;
         if (section === "google" && vals.clientSecret === "__KEEP__") delete vals.clientSecret;
         (settings as any)[section] = { ...(settings as any)[section], ...vals };
+        if (section === "imap") sentCache = null; // harvested contacts came from the old mailbox
         await saveSettings();
         return json({ ok: true });
       }
@@ -404,27 +432,12 @@ const server = (Bun as any).serve({
           return json({ error: errMsg(e), notConnected: st === 401 }, st);
         }
       }
+      // Generic import (sent-mail picks); the google endpoint below is an alias.
+      if (path === "/api/import-contacts" && method === "POST") {
+        return handleImportContacts(req);
+      }
       if (path === "/api/google/import" && method === "POST") {
-        const b = await readBody(req);
-        const items = (Array.isArray(b.contacts) ? b.contacts : [])
-          .map((c: any) => ({ name: String(c.name || "").trim(), email: String(c.email || "").trim().toLowerCase() }))
-          .filter((c: any) => c.name || c.email);
-        const haveEmail = new Set(listContacts().map((c) => c.email.toLowerCase()).filter(Boolean));
-        const haveName = new Set(listContacts().map((c) => c.name.toLowerCase()));
-        let imported = 0, skipped = 0;
-        for (const it of items) {
-          if (countContacts() >= MAX_PEOPLE) break;
-          if ((it.email && haveEmail.has(it.email)) || haveName.has(it.name.toLowerCase())) { skipped++; continue; }
-          const c = createContact({
-            name: it.name || it.email, email: it.email, gv_number: "", matrix_id: "",
-            matrix_room_id: "", color: pickColor(it.name || it.email), notes: "",
-          });
-          dmFor(c.id);
-          if (it.email) haveEmail.add(it.email);
-          haveName.add(c.name.toLowerCase());
-          imported++;
-        }
-        return json({ imported, skipped, capped: countContacts() >= MAX_PEOPLE });
+        return handleImportContacts(req);
       }
       if (path === "/api/google/disconnect" && method === "POST") {
         settings.google.accessToken = "";
@@ -433,6 +446,22 @@ const server = (Bun as any).serve({
         settings.google.email = "";
         await saveSettings();
         return json({ ok: true });
+      }
+
+      // ----- Sent-mail contact harvesting -----
+      if (path === "/api/sent-contacts" && method === "GET") {
+        if (!imapReady()) return json({ error: "Add your mail account in Settings first." }, 400);
+        try {
+          const now = Date.now();
+          if (!sentCache || now - sentCache.at > 5 * 60 * 1000) {
+            const selfEmails = [settings.imap.user, settings.smtp.from].filter(Boolean) as string[];
+            sentCache = { at: now, contacts: await harvestSentContacts(settings.imap, 40, selfEmails) };
+          }
+          return json({ contacts: sentCache.contacts });
+        } catch (e) {
+          sentCache = null;
+          return json({ error: errMsg(e) }, 502);
+        }
       }
 
       // ----- contacts -----

@@ -288,7 +288,7 @@ function renderPeople() {
   app.innerHTML = `
     <div class="view">
       <div class="nav-bar"><div class="nav-title">People</div>
-        <button class="nav-action" id="import-google">⤓ Import</button>
+        <button class="nav-action" id="import-contacts">⤓ Import</button>
         <button class="nav-action" id="new-group2">＋ Group</button></div>
       <div class="scroll"><div class="people-grid">
         ${state.contacts.map((c) => `
@@ -311,7 +311,7 @@ function renderPeople() {
   $$(".person-card[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/" + b.dataset.id; }));
   $("#add-person").addEventListener("click", () => { if (!full) location.hash = "#/people/new"; });
   $("#new-group2").addEventListener("click", () => { location.hash = "#/group/new"; });
-  $("#import-google").addEventListener("click", openImportSheet);
+  $("#import-contacts").addEventListener("click", openImportSheet);
 }
 
 // ---------- Google Contacts import ----------
@@ -321,73 +321,114 @@ function openImportSheet() {
   scrim.className = "sheet-scrim";
   scrim.innerHTML = `
     <div class="sheet" role="dialog" aria-modal="true">
-      <div class="grabber"></div><h3>Import from Google</h3>
-      <div id="imp-body"><div class="empty"><div class="glyph">⏳</div><p>Loading your Google contacts…</p></div></div>
+      <div class="grabber"></div><h3>Add people</h3>
+      <div class="seg" id="imp-tabs" style="margin-bottom:12px">
+        <button data-tab="sent" class="on">\u2709\uFE0F Sent mail</button><button data-tab="google">\uD83D\uDD35 Google</button>
+      </div>
+      <div id="imp-body"></div>
     </div>`;
   document.body.appendChild(scrim);
   const close = () => scrim.remove();
   scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
-
   const body = $("#imp-body", scrim);
-  (async () => {
-    let gcontacts;
-    try {
-      const r = await api("/api/google/contacts");
-      gcontacts = r.contacts || [];
-    } catch (e) {
-      body.innerHTML = `<div class="empty"><div class="glyph">🔌</div><h3>Google isn't connected</h3>
-        <p>${esc(e.message)}</p>
-        <div style="margin-top:14px"><button class="btn" id="imp-settings">Open Settings</button></div></div>`;
-      $("#imp-settings", body).addEventListener("click", () => { close(); location.hash = "#/settings"; });
+  const setTab = (t) => {
+    $$("#imp-tabs button", scrim).forEach((b) => b.classList.toggle("on", b.dataset.tab === t));
+    if (t === "sent") drawSentTab(body, close); else drawGoogleTab(body, close);
+  };
+  $$("#imp-tabs button", scrim).forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
+  setTab("sent");
+}
+
+// Shared checkbox picker for the import tabs.
+// items: [{name, email, sub}] where sub is a small trailing label (phone, "x3 emails").
+function contactPicker(body, close, items, importHint) {
+  const remaining = (state.maxPeople || 8) - state.contacts.length;
+  const picked = new Set();
+  let q = "";
+  const draw = () => {
+    const list = items.filter((c) =>
+      !q || c.name.toLowerCase().includes(q) || (c.email || "").toLowerCase().includes(q));
+    body.innerHTML = `
+      <div class="search-field" style="margin-bottom:10px">\uD83D\uDD0D<input id="imp-q" placeholder="Search" value="${esc(q)}"></div>
+      <div class="hint" style="margin-bottom:8px">${remaining} of ${state.maxPeople || 8} spots left \u2014 Relay stays small on purpose.</div>
+      <div class="ios-group card" style="margin:0;max-height:38vh;overflow-y:auto">
+        ${list.map((c) => { const idx = items.indexOf(c); return `
+          <div class="pick-row${picked.has(idx) ? " on" : ""}" data-idx="${idx}">
+            <span class="check">\u2713</span>${avatarHtml(c.name || c.email, "#0a84ff", 48)}
+            <span class="pname" style="font-size:15px">${esc(c.name || "(no name)")}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${esc(c.email || "")}${c.sub ? " \u00B7 " + esc(c.sub) : ""}</span></span>
+          </div>`; }).join("") || `<div class="empty"><p>No matches.</p></div>`}
+      </div>
+      <button class="btn" id="imp-go" style="width:100%;margin-top:12px" ${picked.size ? "" : "disabled"}>Import ${picked.size} contact${picked.size === 1 ? "" : "s"}</button>
+      ${importHint ? `<div class="hint" style="text-align:center">${importHint}</div>` : ""}`;
+    const qi = $("#imp-q", body);
+    qi.addEventListener("input", () => { q = qi.value.toLowerCase(); const pos = qi.selectionStart; draw(); const nq = $("#imp-q", body); nq.focus(); nq.setSelectionRange(pos, pos); });
+    $$(".pick-row", body).forEach((r) => r.addEventListener("click", () => {
+      const idx = Number(r.dataset.idx);
+      if (picked.has(idx)) picked.delete(idx);
+      else {
+        if (picked.size >= remaining) { toast(`Only ${remaining} spot${remaining === 1 ? "" : "s"} left.`, true); return; }
+        picked.add(idx);
+      }
+      draw();
+    }));
+    $("#imp-go", body).addEventListener("click", async () => {
+      const btn = $("#imp-go", body);
+      btn.disabled = true; btn.textContent = "Importing\u2026";
+      try {
+        const r = await api("/api/import-contacts", { method: "POST", body: JSON.stringify({ contacts: [...picked].map((i) => items[i]) }) });
+        await loadContacts();
+        close();
+        toast(r.imported ? `Imported ${r.imported}.` + (r.skipped ? ` ${r.skipped} already here.` : "") : "Everyone selected was already here.");
+        if ((location.hash || "").startsWith("#/people")) renderPeople();
+      } catch (e) { toast(e.message, true); btn.disabled = false; draw(); }
+    });
+  };
+  draw();
+}
+
+async function drawSentTab(body, close) {
+  body.innerHTML = `<div class="empty"><div class="glyph">\u23F3</div><p>Reading your last 40 sent emails\u2026</p></div>`;
+  try {
+    const r = await api("/api/sent-contacts");
+    const items = (r.contacts || []).map((c) => ({
+      name: c.name, email: c.email,
+      sub: c.count > 1 ? `\u00D7${c.count} emails` : "1 email",
+    }));
+    if (!items.length) {
+      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCED</div><h3>No sent mail found</h3><p>Your Sent folder is empty or couldn't be read.</p></div>`;
       return;
     }
-    if (!gcontacts.length) {
-      body.innerHTML = `<div class="empty"><div class="glyph">📇</div><h3>No Google contacts found</h3><p>Your Google contacts list is empty.</p></div>`;
+    contactPicker(body, close, items, "Harvested from your last 40 sent emails \u2014 names and addresses are imported.");
+  } catch (e) {
+    const needSettings = /Settings/.test(e.message || "");
+    body.innerHTML = `<div class="empty"><div class="glyph">${needSettings ? "\uD83D\uDD0C" : "\u26A0\uFE0F"}</div>
+      <h3>${needSettings ? "Mail isn't connected" : "Couldn't read sent mail"}</h3><p>${esc(e.message)}</p>
+      <div style="margin-top:14px">${needSettings
+        ? `<button class="btn" id="imp-settings">Open Settings</button>`
+        : `<button class="btn secondary" id="imp-retry">Try again</button>`}</div></div>`;
+    const s = $("#imp-settings", body);
+    if (s) s.addEventListener("click", () => { close(); location.hash = "#/settings"; });
+    const rt = $("#imp-retry", body);
+    if (rt) rt.addEventListener("click", () => drawSentTab(body, close));
+  }
+}
+
+async function drawGoogleTab(body, close) {
+  body.innerHTML = `<div class="empty"><div class="glyph">\u23F3</div><p>Loading your Google contacts\u2026</p></div>`;
+  try {
+    const r = await api("/api/google/contacts");
+    const items = (r.contacts || []).map((c) => ({ name: c.name, email: c.email, sub: c.phone || "" }));
+    if (!items.length) {
+      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCC7</div><h3>No Google contacts found</h3><p>Your Google contacts list is empty.</p></div>`;
       return;
     }
-    const remaining = (state.maxPeople || 8) - state.contacts.length;
-    const picked = new Set();
-    let q = "";
-    const draw = () => {
-      const list = gcontacts.filter((c) =>
-        !q || c.name.toLowerCase().includes(q) || (c.email || "").toLowerCase().includes(q));
-      body.innerHTML = `
-        <div class="search-field" style="margin-bottom:10px">🔍<input id="imp-q" placeholder="Search contacts" value="${esc(q)}"></div>
-        <div class="hint" style="margin-bottom:8px">${remaining} of ${state.maxPeople || 8} spots left — Relay stays small on purpose.</div>
-        <div class="ios-group card" style="margin:0;max-height:40vh;overflow-y:auto">
-          ${list.map((c, i) => { const idx = gcontacts.indexOf(c); return `
-            <div class="pick-row${picked.has(idx) ? " on" : ""}" data-idx="${idx}">
-              <span class="check">✓</span>${avatarHtml(c.name || c.email, "#0a84ff", 48)}
-              <span class="pname" style="font-size:15px">${esc(c.name || "(no name)")}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${esc(c.email || "")}${c.phone ? " · " + esc(c.phone) : ""}</span></span>
-            </div>`; }).join("") || `<div class="empty"><p>No matches.</p></div>`}
-        </div>
-        <button class="btn" id="imp-go" style="width:100%;margin-top:12px" ${picked.size ? "" : "disabled"}>Import ${picked.size} contact${picked.size === 1 ? "" : "s"}</button>
-        <div class="hint" style="text-align:center">Names and email addresses are imported. Add a Google Voice number afterwards (Edit person) to enable SMS.</div>`;
-      const qi = $("#imp-q", body);
-      qi.addEventListener("input", () => { q = qi.value.toLowerCase(); const pos = qi.selectionStart; draw(); const nq = $("#imp-q", body); nq.focus(); nq.setSelectionRange(pos, pos); });
-      $$(".pick-row", body).forEach((r) => r.addEventListener("click", () => {
-        const idx = Number(r.dataset.idx);
-        if (picked.has(idx)) picked.delete(idx);
-        else {
-          if (picked.size >= remaining) { toast(`Only ${remaining} spot${remaining === 1 ? "" : "s"} left.`, true); return; }
-          picked.add(idx);
-        }
-        draw();
-      }));
-      $("#imp-go", body).addEventListener("click", async () => {
-        const btn = $("#imp-go", body);
-        btn.disabled = true; btn.textContent = "Importing…";
-        try {
-          const r = await api("/api/google/import", { method: "POST", body: JSON.stringify({ contacts: [...picked].map((i) => gcontacts[i]) }) });
-          await loadContacts();
-          close();
-          toast(r.imported ? `Imported ${r.imported}.` + (r.skipped ? ` ${r.skipped} already here.` : "") : "Everyone selected was already here.");
-          if ((location.hash || "").startsWith("#/people")) renderPeople();
-        } catch (e) { toast(e.message, true); btn.disabled = false; draw(); }
-      });
-    };
-    draw();
-  })();
+    contactPicker(body, close, items, "Names and email addresses are imported. Add a Google Voice number afterwards (Edit person) to enable SMS.");
+  } catch (e) {
+    body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDD0C</div><h3>Google isn't connected</h3>
+      <p>${esc(e.message)}</p>
+      <div style="margin-top:14px"><button class="btn" id="imp-settings">Open Settings</button></div></div>`;
+    $("#imp-settings", body).addEventListener("click", () => { close(); location.hash = "#/settings"; });
+  }
 }
 
 function renderPersonDetail(id) {

@@ -28,16 +28,22 @@ bun src/server.ts   # http://localhost:3006
 
 For Matrix DMs: create the DM room in Element first, then paste the room ID on the contact (or use **Browse** to pick from rooms you've joined). For group Matrix chat, set the room on the group.
 
-### Google Contacts import (optional)
+### Adding people
 
-Relay can pull names and email addresses straight from your Google contacts so you don't have to type them:
+On the **People** tab, tap **⤓ Import** to pick from two sources:
+
+- **✉️ Sent mail** (no extra setup) — Relay scans the last 40 emails in your Sent folder over IMAP and lists everyone you've written to, most-emailed first. Your own address and automated senders (noreply@…) are skipped.
+- **🔵 Google** — import from Google Contacts via OAuth (one-time setup below).
+
+Picks respect the 8-person cap, duplicates are skipped, and names + email addresses are imported. Add a Google Voice number afterwards (Edit person) to enable SMS for someone.
+
+#### Google Contacts import (optional)
 
 1. [Google Cloud Console](https://console.cloud.google.com/) → create a project.
 2. **APIs & Services → Library** → enable the **People API**.
 3. **APIs & Services → Credentials** → Create Credentials → **OAuth client ID** → application type **Web application**.
 4. Under *Authorized redirect URIs*, add the URI shown in Relay's Settings (Google Contacts section) — for a local run it looks like `http://localhost:3006/api/google/callback`.
 5. Paste the **client ID** and **client secret** into Relay's Settings → Google Contacts, save, then **Save & connect Google**.
-6. On the **People** tab, tap **⤓ Import** to search and pick contacts. Names and email addresses are imported; add a Google Voice number afterwards (Edit person) to enable SMS.
 
 Google tokens are stored in the gitignored `./data/config.json` next to your other credentials and never leave your machine.
 
