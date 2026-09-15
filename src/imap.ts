@@ -404,6 +404,35 @@ async function fetchSnippets(conn: Conn, tag: string, uids: string[]): Promise<M
   return out;
 }
 
+// Batched Return-Path header fetch; best-effort like snippets. Used to spot
+// Google Voice forwards via their stable bounce domain.
+async function fetchReturnPaths(conn: Conn, tag: string, uids: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  try {
+    const lines = await conn.cmd(tag, `UID FETCH ${uids.join(",")} (UID BODY.PEEK[HEADER.FIELDS (RETURN-PATH)])`);
+    let cur: string[] = [];
+    const flush = () => {
+      if (!cur.length) return;
+      const joined = cur.join("\r\n");
+      cur = [];
+      const um = joined.match(/UID (\d+)/i);
+      if (!um) return;
+      const lm = joined.match(/\{(\d+)\}\n([\s\S]*)$/);
+      const text = lm ? lm[2].slice(0, Number(lm[1])) : "";
+      const rm = text.match(/^return-path:\s*(\S+)/im);
+      if (rm) out.set(um[1], rm[1]);
+    };
+    for (const line of lines) {
+      if (/^\* \d+ FETCH/i.test(line) && cur.length) flush();
+      cur.push(line);
+    }
+    flush();
+  } catch {
+    /* optional — callers fall back to From-address detection */
+  }
+  return out;
+}
+
 /** List starred (\\Flagged) messages in INBOX, newest first. */
 export async function fetchStarred(cfg0: ImapConfig, limit = 200): Promise<StarredMail[]> {
   const conn = await login(cfg0);
@@ -436,6 +465,7 @@ export interface UnseenMail {
   subject: string;
   date: string;
   snippet: string;
+  returnPath: string;
 }
 
 /** Fetch UNSEEN messages from INBOX (oldest first), then mark them \Seen. */
@@ -447,6 +477,7 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
     const picked = uids.slice(0, Math.min(limit, 50));
     const envs = await fetchEnvelopes(conn, "b002", picked);
     const snips = await fetchSnippets(conn, "b003", picked);
+    const rps = await fetchReturnPaths(conn, "b004", picked);
     const mails: UnseenMail[] = [];
     for (const uid of picked) {
       const e = envs.get(uid) || { from: "", subject: "", date: "" };
@@ -456,9 +487,10 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
         subject: e.subject || "(no subject)",
         date: e.date,
         snippet: snips.get(uid) || "",
+        returnPath: rps.get(uid) || "",
       });
     }
-    await conn.cmd("b004", `UID STORE ${picked.join(",")} +FLAGS (\\Seen)`);
+    await conn.cmd("b005", `UID STORE ${picked.join(",")} +FLAGS (\\Seen)`);
     return mails;
   } finally {
     conn.close();
@@ -507,15 +539,13 @@ export async function harvestRecentSms(cfg0: ImapConfig, days = 14): Promise<Sms
     if (!uids.length) return { conversations: [], scanned: 0 };
     const picked = uids.slice(-500);
     const envs = await fetchEnvelopes(conn, "s002", picked);
+    const rps = await fetchReturnPaths(conn, "s003", picked);
     const agg = new Map<string, { count: number; last: string }>();
     for (const uid of picked) {
       const e = envs.get(uid);
       if (!e) continue;
-      // Match the raw From text (display name may be a contact name, not the number).
-      const m = (e.from || "").match(GV_RE);
-      if (!m) continue;
-      const num = gvDigits(m);
-      if (num.length !== 10) continue;
+      const num = gvNumberFrom(e.from || "", e.subject || "", rps.get(uid) || "");
+      if (!num) continue;
       const cur = agg.get(num);
       if (cur) {
         cur.count++;
@@ -581,13 +611,47 @@ function envelopeAddrs(env: any[]): { name: string; email: string }[] {
 }
 
 const SKIP_SENDERS = /^(noreply|no-reply|donotreply|mailer-daemon|postmaster)@/i;
-// Same definition of "a Google Voice message" as the inbound mail poll:
-// 10 or 11 digits, txt or mms gateway.
-const GV_RE = /(\d{10,11})@(?:txt|mms)\.voice\.google\.com/i;
+const GV_HOST_RE = /^(?:txt|mms)\.voice\.google\.com$/i;
+// Google Voice's bounce domain — stable even when Google changes the From format.
+const GV_BOUNCE_RE = /@grandcentral\.bounces\.google\.com/i;
 
-/** Normalize a GV match to the 10-digit number. */
-function gvDigits(m: RegExpMatchArray): string {
-  return m[1].replace(/\D/g, "").slice(-10);
+/**
+ * Pull the sender's 10-digit number out of a Google Voice forward address.
+ * Formats seen in the wild:
+ *   12014720451.15139672841.X47VN2Z-g6@txt.voice.google.com  (own.sender.token)
+ *   15553334444@txt.voice.google.com                         (11-digit)
+ *   5551112222@txt.voice.google.com                          (10-digit)
+ *   ... on txt. or mms.voice.google.com
+ * Returns "" when the address is not a GV forward.
+ */
+export function parseGvNumber(rawFrom: string): string {
+  const email = extractEmail(rawFrom).toLowerCase();
+  const at = email.lastIndexOf("@");
+  if (at < 0) return "";
+  if (!GV_HOST_RE.test(email.slice(at + 1))) return "";
+  const parts = email.slice(0, at).split(".");
+  const numParts = parts.filter((p) => /^\d{10,11}$/.test(p));
+  // In the composite format the first numeric part is the account's own GV
+  // number; the sender is the next one. Single-part formats take the part.
+  const cand = numParts.find((p) => p !== parts[0]) || numParts[0] || "";
+  const digits = cand.replace(/^1(\d{10})$/, "$1"); // strip US country code
+  return /^\d{10}$/.test(digits) ? digits : "";
+}
+
+/** "New text message from Acela (513) 967-2841" -> "5139672841". */
+function subjectPhone(subject: string): string {
+  const m = subject.match(/\((\d{3})\)\s*(\d{3})[.-]?(\d{4})/);
+  return m ? m[1] + m[2] + m[3] : "";
+}
+
+/**
+ * Resolve the sender's 10-digit number for a Google Voice message.
+ * Primary: the From address (composite own.sender.token or bare-digit formats).
+ * Fallback: Google's GV bounce domain in Return-Path (survives From-format
+ * changes) with the number taken from the subject line.
+ */
+export function gvNumberFrom(from: string, subject: string, returnPath: string): string {
+  return parseGvNumber(from) || (GV_BOUNCE_RE.test(returnPath) ? subjectPhone(subject) : "");
 }
 
 /**
@@ -627,7 +691,7 @@ export async function harvestSentContacts(
       if (!Array.isArray(env)) continue;
       for (const a of envelopeAddrs(env)) {
         if (self.has(a.email) || SKIP_SENDERS.test(a.email)) continue;
-        if (GV_RE.test(a.email)) continue; // phone numbers live in the SMS tab
+        if (parseGvNumber(a.email)) continue; // phone numbers live in the SMS tab
         const cur = agg.get(a.email);
         if (cur) { cur.count++; }
         else agg.set(a.email, { name: a.name, count: 1, order: order++ });

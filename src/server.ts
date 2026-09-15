@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -237,8 +237,6 @@ let lastPoll: { mail: string | null; matrix: string | null; mailError: string | 
   mail: null, matrix: null, mailError: null, matrixError: null,
 };
 
-const GV_RE = /(\d{10,11})@(?:txt|mms)\.voice\.google\.com/i;
-
 async function pollMail() {
   if (!imapReady()) return;
   try {
@@ -250,13 +248,13 @@ async function pollMail() {
       const extId = `mail:${m.uid}`;
       if (hasExternalId(extId)) continue;
       const rawFrom = m.from || "";
-      const gv = rawFrom.match(GV_RE);
+      const gvNum = gvNumberFrom(rawFrom, m.subject || "", m.returnPath || "");
       let contact: Contact | null = null;
       let channel: Channel = "email";
       let body = m.snippet || "";
       let subject = m.subject || "";
-      if (gv) {
-        const digits = normDigits(gv[1]);
+      if (gvNum) {
+        const digits = gvNum; // already normalized to 10 digits
         contact = byGv.get(digits) || null;
         channel = "sms";
         subject = "";
