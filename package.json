@@ -1,0 +1,1 @@
+{"description":"Small-group unified messaging: email, SMS via Google Voice, and Matrix — in a glossy iOS-style app.","name":"relay","scripts":{"start":"bun src/server.ts"},"version":"1.0.0"}

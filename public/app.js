@@ -1,0 +1,655 @@
+/* Relay — glossy iOS unified messenger frontend */
+"use strict";
+
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const CHAN_META = {
+  email: { label: "Email", glyph: "✉️" },
+  sms: { label: "SMS", glyph: "💬" },
+  matrix: { label: "Matrix", glyph: "🟣" },
+};
+
+const state = {
+  status: null,
+  conversations: [],
+  contacts: [],
+  conv: null,          // open conversation detail
+  messages: [],
+  search: "",
+  settings: null,
+  chanSel: {},         // convId -> channel
+  sending: false,
+  timer: null,
+};
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  let body = null;
+  try { body = await res.json(); } catch { /* noop */ }
+  if (!res.ok) throw new Error((body && body.error) || `Request failed (${res.status})`);
+  return body;
+}
+
+function toast(msg, isErr) {
+  const t = document.createElement("div");
+  t.className = "toast" + (isErr ? " error" : "");
+  t.textContent = msg;
+  $("#toasts").appendChild(t);
+  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity .3s"; setTimeout(() => t.remove(), 320); }, 2600);
+}
+
+function initials(name) {
+  return name.trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
+}
+
+function avatarHtml(name, color, size, group) {
+  return `<div class="avatar a${size}${group ? " group" : ""}" style="background:linear-gradient(135deg, ${color}, ${color}cc)">${esc(initials(name))}</div>`;
+}
+
+function chanPill(ch) {
+  const m = CHAN_META[ch];
+  if (!m) return "";
+  return `<span class="chan-pill ${ch}">${m.glyph} ${m.label}</span>`;
+}
+
+function fmtTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const yest = new Date(now); yest.setDate(now.getDate() - 1);
+  const hm = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (sameDay) return hm;
+  if (d.toDateString() === yest.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function dayLabel(iso) {
+  const d = new Date(iso);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return "Today";
+  const yest = new Date(now); yest.setDate(now.getDate() - 1);
+  if (d.toDateString() === yest.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+}
+
+// ---------- shell ----------
+
+function tabBar(active) {
+  const unread = state.conversations.reduce((n, c) => n + (c.unread || 0), 0);
+  const tabs = [
+    { id: "chats", glyph: "💬", label: "Chats", badge: unread },
+    { id: "people", glyph: "👥", label: "People", badge: 0 },
+    { id: "settings", glyph: "⚙️", label: "Settings", badge: 0 },
+  ];
+  return `<nav class="tab-bar">${tabs.map((t) =>
+    `<button class="tab${active === t.id ? " active" : ""}" data-tab="${t.id}">
+      <span class="glyph">${t.glyph}</span><span>${t.label}</span>
+      ${t.badge ? `<span class="badge">${t.badge}</span>` : ""}
+    </button>`).join("")}</nav>`;
+}
+
+function bindTabs(root) {
+  $$(".tab", root).forEach((b) => b.addEventListener("click", () => { location.hash = "#/" + b.dataset.tab; }));
+}
+
+// ---------- chats list ----------
+
+async function loadConversations() {
+  const r = await api("/api/conversations");
+  state.conversations = r.conversations || [];
+}
+
+function renderChats() {
+  const q = state.search.toLowerCase();
+  const list = state.conversations.filter((c) =>
+    !q || c.title.toLowerCase().includes(q) || (c.members || []).some((m) => m.name.toLowerCase().includes(q)));
+  const app = $("#app");
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar"><div class="nav-title">Chats</div>
+        <button class="nav-action" id="new-group">＋ Group</button></div>
+      <div class="search-wrap"><div class="search-field">🔍<input id="q" placeholder="Search" value="${esc(state.search)}"></div></div>
+      <div class="scroll">
+        ${list.length ? list.map((c) => `
+          <button class="chat-row" data-id="${c.id}">
+            ${avatarHtml(c.title, c.avatar_color, 48, c.is_group)}
+            <div class="meta">
+              <div class="top"><span class="name">${esc(c.title)}</span><span class="time">${fmtTime(c.last_at)}</span></div>
+              <div class="preview">
+                ${c.last_channel ? chanPill(c.last_channel) : ""}
+                <span style="overflow:hidden;text-overflow:ellipsis">${esc(c.last_body || (c.is_group ? `${c.member_count + 1} people` : "Say hello 👋"))}</span>
+              </div>
+            </div>
+            ${c.unread ? `<span class="unread-dot">${c.unread}</span>` : ""}
+          </button>`).join("")
+        : `<div class="empty"><div class="glyph">💬</div><h3>No chats yet</h3><p>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
+      </div>
+      ${tabBar("chats")}
+    </div>`;
+  bindTabs(app);
+  $("#new-group").addEventListener("click", () => { location.hash = "#/group/new"; });
+  const qi = $("#q");
+  qi.addEventListener("input", () => { state.search = qi.value; renderChats(); const nq = $("#q"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
+  $$(".chat-row", app).forEach((r) => r.addEventListener("click", () => { location.hash = "#/chats/" + r.dataset.id; }));
+}
+
+// ---------- message view ----------
+
+async function loadConversation(id) {
+  const r = await api("/api/conversations/" + encodeURIComponent(id));
+  state.conv = r.conversation;
+  const m = await api("/api/conversations/" + encodeURIComponent(id) + "/messages?limit=100");
+  state.messages = m.messages || [];
+  await api("/api/conversations/" + encodeURIComponent(id) + "/read", { method: "POST" }).catch(() => {});
+}
+
+function selectedChannel() {
+  const conv = state.conv;
+  if (!conv || !conv.channels.length) return null;
+  const saved = state.chanSel[conv.id] || localStorage.getItem("relay_chan_" + conv.id);
+  if (saved && conv.channels.includes(saved)) return saved;
+  return conv.channels[0];
+}
+
+function renderChatDetail() {
+  const conv = state.conv;
+  if (!conv) { location.hash = "#/chats"; return; }
+  const ch = selectedChannel();
+  const memberNames = conv.members.map((m) => m.name).join(", ");
+  const app = $("#app");
+
+  let body = "";
+  let lastDay = "";
+  for (const m of state.messages) {
+    const day = dayLabel(m.created_at);
+    if (day !== lastDay) { body += `<div class="day-divider">${esc(day)}</div>`; lastDay = day; }
+    const out = m.direction === "out";
+    body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}">
+      ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
+      <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}${esc(m.body)}</div>
+      <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span>` : ""}</div>
+    </div>`;
+  }
+
+  const hints = Object.entries(conv.hints || {}).filter(([, v]) => v).map(([, v]) => esc(v));
+
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar">
+        <button class="nav-back" id="back">‹ Chats</button>
+        ${avatarHtml(conv.title, conv.is_group ? "#8e8e93" : (conv.members[0]?.color || "#8e8e93"), 48, conv.is_group)}
+        <div style="flex:1;min-width:0">
+          <div class="nav-title small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(conv.title)}</div>
+          <div style="font-size:12px;color:var(--label-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(memberNames)}${conv.is_group ? " · " + (conv.members.length + 1) + "/8" : ""}</div>
+        </div>
+        ${conv.is_group ? `<button class="nav-action" id="grp-edit">Edit</button>` : ""}
+      </div>
+      <div class="msg-scroll" id="msgs">${body || `<div class="empty"><div class="glyph">👋</div><h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
+      <div class="chan-bar">
+        ${conv.channels.length ? `
+          <div class="seg" id="seg">${conv.channels.map((c) =>
+            `<button data-ch="${c}" class="${c === ch ? "on" : ""}">${CHAN_META[c].glyph} ${CHAN_META[c].label}</button>`).join("")}</div>
+          ${hints.length ? `<div class="chan-hint">${hints.join(" ")}</div>` : ""}`
+        : `<div class="chan-hint">No channels available yet. ${hints.join(" ") || "Add contact details in the People tab."}</div>`}
+      </div>
+      <div class="composer">
+        <div class="grow">
+          <div class="subject-line${ch === "email" ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
+          <textarea id="draft" rows="1" placeholder="Message ${ch ? CHAN_META[ch].label : ""}…"></textarea>
+        </div>
+        <button class="send-btn" id="send" ${ch ? "" : "disabled"}>↑</button>
+      </div>
+    </div>`;
+
+  $("#back").addEventListener("click", () => { location.hash = "#/chats"; });
+  const ge = $("#grp-edit");
+  if (ge) ge.addEventListener("click", () => openGroupSheet(conv));
+
+  $$("#seg button").forEach((b) => b.addEventListener("click", () => {
+    state.chanSel[conv.id] = b.dataset.ch;
+    localStorage.setItem("relay_chan_" + conv.id, b.dataset.ch);
+    renderChatDetail();
+    $("#draft").focus();
+  }));
+
+  const draft = $("#draft");
+  draft.addEventListener("input", () => { draft.style.height = "auto"; draft.style.height = Math.min(draft.scrollHeight, 120) + "px"; });
+  draft.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
+
+  $("#send").addEventListener("click", sendMsg);
+
+  const sc = $("#msgs");
+  sc.scrollTop = sc.scrollHeight;
+}
+
+function senderName(m) {
+  // Best-effort: match inbound message to a member via external hints is unreliable;
+  // show the conversation title for DMs, generic for groups handled by caller.
+  return "";
+}
+
+async function sendMsg() {
+  const conv = state.conv;
+  const ch = selectedChannel();
+  if (!conv || !ch || state.sending) return;
+  const body = $("#draft").value;
+  if (!body.trim()) return;
+  state.sending = true;
+  $("#send").disabled = true;
+  try {
+    const r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages", {
+      method: "POST",
+      body: JSON.stringify({ channel: ch, body, subject: ch === "email" ? ($("#subject")?.value || "") : "" }),
+    });
+    state.messages.push(r.message);
+    renderChatDetail();
+  } catch (e) {
+    toast(e.message, true);
+    state.sending = false;
+    $("#send").disabled = false;
+  }
+}
+
+async function refreshChat() {
+  const conv = state.conv;
+  if (!conv) return;
+  try {
+    const m = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages?limit=100");
+    const before = state.messages.length;
+    state.messages = m.messages || [];
+    if (state.messages.length !== before) {
+      const sc = $("#msgs");
+      const nearBottom = sc && (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120);
+      renderChatDetail();
+      await api("/api/conversations/" + encodeURIComponent(conv.id) + "/read", { method: "POST" }).catch(() => {});
+      if (!nearBottom) { /* keep position */ }
+    }
+  } catch { /* stay quiet on background refresh */ }
+}
+
+// ---------- people ----------
+
+async function loadContacts() {
+  const r = await api("/api/contacts");
+  state.contacts = r.contacts || [];
+  state.maxPeople = r.maxPeople;
+}
+
+function renderPeople() {
+  const full = state.contacts.length >= (state.maxPeople || 8);
+  const app = $("#app");
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar"><div class="nav-title">People</div>
+        <button class="nav-action" id="new-group2">＋ Group</button></div>
+      <div class="scroll"><div class="people-grid">
+        ${state.contacts.map((c) => `
+          <button class="person-card card" data-id="${c.id}">
+            ${avatarHtml(c.name, c.color, 72)}
+            <div class="pname">${esc(c.name)}</div>
+            <div class="chan-dots">${["email", "sms", "matrix"].map((ch) =>
+              `<span class="chan-dot ${ch}" style="${c.channels.includes(ch) ? "" : "opacity:.18;filter:grayscale(1)"}" title="${CHAN_META[ch].label}"></span>`).join("")}</div>
+          </button>`).join("")}
+        <button class="person-card add" id="add-person" ${full ? "disabled" : ""}>
+          <div class="glyph">＋</div>
+          <div>${full ? `Full — ${state.maxPeople} max` : "Add person"}</div>
+        </button>
+      </div>
+      <div class="hint" style="text-align:center;padding:0 24px 24px">Relay is for your inner circle — up to ${state.maxPeople || 8} people, ${state.maxPeople || 8} per group. Tap a person to see their channels, then message them.</div>
+      </div>
+      ${tabBar("people")}
+    </div>`;
+  bindTabs(app);
+  $$(".person-card[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/" + b.dataset.id; }));
+  $("#add-person").addEventListener("click", () => { if (!full) location.hash = "#/people/new"; });
+  $("#new-group2").addEventListener("click", () => { location.hash = "#/group/new"; });
+}
+
+function renderPersonDetail(id) {
+  const c = state.contacts.find((x) => x.id === id);
+  if (!c) { location.hash = "#/people"; return; }
+  const rows = [
+    { ch: "email", t1: "Email", t2: c.email || "Not set" },
+    { ch: "sms", t1: "SMS · Google Voice", t2: c.gv_number || "Not set" },
+    { ch: "matrix", t1: "Matrix", t2: c.matrix_id || c.matrix_room_id || "Not set" },
+  ];
+  const app = $("#app");
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar">
+        <button class="nav-back" id="back">‹ People</button>
+        <div class="nav-title small" style="flex:1"></div>
+        <button class="nav-action" id="edit">Edit</button>
+      </div>
+      <div class="scroll">
+        <div class="profile-hero">
+          ${avatarHtml(c.name, c.color, 72)}
+          <h2>${esc(c.name)}</h2>
+          <div class="sub">${c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet"}</div>
+        </div>
+        <div style="padding:0 32px"><button class="btn" id="message" style="width:100%">Message</button></div>
+        <div class="group-caption">Channels</div>
+        <div class="ios-group card">
+          ${rows.map((r) => `
+            <div class="ios-row"><span class="chan-dot ${r.ch}"></span>
+              <div class="rlabel"><div class="t1">${r.t1}</div><div class="t2">${esc(r.t2)}</div></div>
+            </div>`).join("")}
+        </div>
+        ${c.notes ? `<div class="group-caption">Notes</div><div class="ios-group card"><div class="ios-row"><div class="rlabel"><div class="t1" style="font-weight:400">${esc(c.notes)}</div></div></div></div>` : ""}
+        <div style="padding:8px 32px 32px"><button class="btn danger" id="del" style="width:100%">Remove person</button></div>
+      </div>
+      ${tabBar("people")}
+    </div>`;
+  bindTabs(app);
+  $("#back").addEventListener("click", () => { location.hash = "#/people"; });
+  $("#edit").addEventListener("click", () => openContactSheet(c));
+  $("#message").addEventListener("click", () => { location.hash = "#/chats/" + c.conversation_id; });
+  $("#del").addEventListener("click", async () => {
+    if (!confirm(`Remove ${c.name} from Relay? Their chats will be deleted.`)) return;
+    await api("/api/contacts/" + c.id, { method: "DELETE" });
+    await loadContacts();
+    toast("Removed.");
+    location.hash = "#/people";
+  });
+}
+
+// ---------- contact sheet (new/edit) ----------
+
+function openContactSheet(existing) {
+  const c = existing || { name: "", email: "", gv_number: "", matrix_id: "", matrix_room_id: "", notes: "" };
+  const scrim = document.createElement("div");
+  scrim.className = "sheet-scrim";
+  scrim.innerHTML = `
+    <div class="sheet" role="dialog" aria-modal="true">
+      <div class="grabber"></div>
+      <h3>${existing ? "Edit person" : "Add person"}</h3>
+      <div class="field"><label>Name</label><input class="text-input" id="f-name" value="${esc(c.name)}" placeholder="Ada Lovelace" maxlength="60"></div>
+      <div class="field"><label>Email</label><input class="text-input" id="f-email" value="${esc(c.email)}" placeholder="ada@example.com" inputmode="email"></div>
+      <div class="field"><label>Google Voice number</label><input class="text-input" id="f-gv" value="${esc(c.gv_number)}" placeholder="5551234567" inputmode="tel">
+        <div class="hint">Their Google Voice number — Relay texts it through the GV email gateway.</div></div>
+      <div class="field"><label>Matrix user <span style="font-weight:400">(for reference)</span></label><input class="text-input" id="f-mxid" value="${esc(c.matrix_id)}" placeholder="@ada:matrix.org"></div>
+      <div class="field"><label>Matrix room</label>
+        <div style="display:flex;gap:8px"><input class="text-input" id="f-room" value="${esc(c.matrix_room_id)}" placeholder="!abc:matrix.org" style="flex:1">
+        <button class="btn secondary small" id="pick-room" type="button">Browse</button></div>
+        <div class="hint">A DM room you're both in. Create it in Element first, then pick it here.</div></div>
+      <div class="field"><label>Notes</label><textarea class="text-area" id="f-notes" placeholder="Anything worth remembering…">${esc(c.notes)}</textarea></div>
+      <button class="btn" id="save" style="width:100%;margin-top:4px">${existing ? "Save" : "Add person"}</button>
+      <div style="height:8px"></div>
+    </div>`;
+  document.body.appendChild(scrim);
+  const close = () => scrim.remove();
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+
+  $("#pick-room", scrim).addEventListener("click", async () => {
+    try {
+      const r = await api("/api/matrix/rooms");
+      const rooms = r.rooms || [];
+      if (!rooms.length) { toast("No Matrix rooms found — join one first.", true); return; }
+      const list = rooms.map((rm, i) => `${i + 1}. ${rm.name}`).join("\n");
+      const pick = prompt(`Pick a room (number):\n${list}`);
+      const n = Number(pick);
+      if (n >= 1 && n <= rooms.length) $("#f-room", scrim).value = rooms[n - 1].id;
+    } catch (e) { toast(e.message, true); }
+  });
+
+  $("#save", scrim).addEventListener("click", async () => {
+    const vals = {
+      name: $("#f-name", scrim).value.trim(),
+      email: $("#f-email", scrim).value.trim(),
+      gv_number: $("#f-gv", scrim).value.trim(),
+      matrix_id: $("#f-mxid", scrim).value.trim(),
+      matrix_room_id: $("#f-room", scrim).value.trim(),
+      notes: $("#f-notes", scrim).value.trim(),
+    };
+    if (!vals.name) { toast("Give them a name.", true); return; }
+    try {
+      if (existing) await api("/api/contacts/" + existing.id, { method: "PATCH", body: JSON.stringify(vals) });
+      else await api("/api/contacts", { method: "POST", body: JSON.stringify(vals) });
+      await loadContacts();
+      close();
+      toast(existing ? "Saved." : "Added. Say hello 👋");
+      if (!existing) { const nc = state.contacts.find((x) => x.name === vals.name); if (nc) location.hash = "#/people/" + nc.id; }
+      else renderPersonDetail(existing.id);
+    } catch (e) { toast(e.message, true); }
+  });
+  setTimeout(() => $("#f-name", scrim).focus(), 60);
+}
+
+// ---------- new group ----------
+
+function renderNewGroup() {
+  const picked = new Set();
+  const app = $("#app");
+  const draw = () => {
+    app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar"><button class="nav-back" id="back">‹ People</button><div class="nav-title small" style="flex:1">New group</div>
+        <button class="nav-action" id="create" ${picked.size ? "" : "disabled"}>Create</button></div>
+      <div class="scroll">
+        <div style="padding:16px 16px 0"><div class="field"><label>Group name</label><input class="text-input" id="g-name" placeholder="Weekend crew" maxlength="60"></div>
+        <div class="field"><label>Matrix room <span style="font-weight:400">(optional)</span></label><input class="text-input" id="g-room" placeholder="!xyz:matrix.org"></div></div>
+        <div class="group-caption">Members · ${picked.size + 1} of ${state.maxPeople || 8} (you included)</div>
+        <div class="ios-group card">
+          ${state.contacts.map((c) => `
+            <div class="pick-row${picked.has(c.id) ? " on" : ""}" data-id="${c.id}">
+              <span class="check">✓</span>${avatarHtml(c.name, c.color, 48)}<span class="pname">${esc(c.name)}</span>
+            </div>`).join("") || `<div class="empty"><p>Add people first.</p></div>`}
+        </div>
+        <div class="hint" style="padding:0 20px 24px">Only channels every member has set up can be used in the group.</div>
+      </div>
+      ${tabBar("people")}
+    </div>`;
+    bindTabs(app);
+    $("#back").addEventListener("click", () => { location.hash = "#/people"; });
+    $$(".pick-row", app).forEach((r) => r.addEventListener("click", () => {
+      const id = r.dataset.id;
+      if (picked.has(id)) picked.delete(id);
+      else {
+        if (picked.size + 1 >= (state.maxPeople || 8)) { toast(`Groups hold ${state.maxPeople || 8} people max, you included.`, true); return; }
+        picked.add(id);
+      }
+      const nm = $("#g-name").value, rm = $("#g-room").value;
+      draw();
+      $("#g-name").value = nm; $("#g-room").value = rm;
+    }));
+    $("#create").addEventListener("click", async () => {
+      try {
+        const r = await api("/api/conversations", { method: "POST", body: JSON.stringify({ name: $("#g-name").value, member_ids: [...picked], matrix_room_id: $("#g-room").value }) });
+        toast("Group created.");
+        location.hash = "#/chats/" + r.conversation.id;
+      } catch (e) { toast(e.message, true); }
+    });
+  };
+  draw();
+}
+
+// ---------- group edit sheet ----------
+
+function openGroupSheet(conv) {
+  const scrim = document.createElement("div");
+  scrim.className = "sheet-scrim";
+  scrim.innerHTML = `
+    <div class="sheet" role="dialog" aria-modal="true">
+      <div class="grabber"></div><h3>Group settings</h3>
+      <div class="field"><label>Group name</label><input class="text-input" id="g-name" value="${esc(conv.name)}" maxlength="60"></div>
+      <div class="field"><label>Matrix room</label><input class="text-input" id="g-room" value="${esc(conv.matrix_room_id || "")}" placeholder="!xyz:matrix.org"></div>
+      <button class="btn" id="save" style="width:100%">Save</button>
+      <div style="height:8px"></div>
+      <button class="btn danger" id="del" style="width:100%">Delete group</button>
+      <div style="height:8px"></div>
+    </div>`;
+  document.body.appendChild(scrim);
+  const close = () => scrim.remove();
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+  $("#save", scrim).addEventListener("click", async () => {
+    try {
+      await api("/api/conversations/" + conv.id, { method: "PATCH", body: JSON.stringify({ name: $("#g-name", scrim).value, matrix_room_id: $("#g-room", scrim).value }) });
+      close(); toast("Saved.");
+      await loadConversation(conv.id); renderChatDetail();
+    } catch (e) { toast(e.message, true); }
+  });
+  $("#del", scrim).addEventListener("click", async () => {
+    if (!confirm("Delete this group and its messages?")) return;
+    await api("/api/conversations/" + conv.id, { method: "DELETE" });
+    close(); location.hash = "#/chats";
+  });
+}
+
+// ---------- settings ----------
+
+async function loadSettings() {
+  state.settings = await api("/api/settings");
+  state.status = await api("/api/status");
+}
+
+function secretField(val, has, id, label, hint) {
+  return `<div class="field"><label>${label}</label>
+    <input class="text-input" type="password" id="${id}" placeholder="${has ? "Saved — leave blank to keep" : ""}" autocomplete="new-password">
+    ${hint ? `<div class="hint">${hint}</div>` : ""}</div>`;
+}
+
+function renderSettings() {
+  const s = state.settings, st = state.status;
+  const app = $("#app");
+  const dot = (ok) => `<span class="status-dot ${ok ? "ok" : "no"}"></span>`;
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar"><div class="nav-title">Settings</div></div>
+      <div class="scroll">
+        <div class="group-caption">Connections</div>
+        <div class="ios-group card">
+          <div class="ios-row">${dot(st.smtp)}<div class="rlabel"><div class="t1">Email sending (SMTP)</div><div class="t2">${st.smtp ? esc(s.smtp.host) : "Not configured"}</div></div></div>
+          <div class="ios-row">${dot(st.imap)}<div class="rlabel"><div class="t1">Inbox (IMAP)</div><div class="t2">${st.imap ? esc(s.imap.host) : "Not configured"}</div></div></div>
+          <div class="ios-row">${dot(st.matrix)}<div class="rlabel"><div class="t1">Matrix</div><div class="t2">${st.matrix ? esc(s.matrix.homeserver) : "Not configured"}</div></div></div>
+        </div>
+        <div style="padding:4px 32px 0"><button class="btn secondary" id="poll" style="width:100%">↻ Check for new messages</button></div>
+        ${st.lastPoll && (st.lastPoll.mail || st.lastPoll.matrix) ? `<div class="hint" style="text-align:center">Last check — mail: ${st.lastPoll.mail ? fmtTime(st.lastPoll.mail) : "—"} · matrix: ${st.lastPoll.matrix ? fmtTime(st.lastPoll.matrix) : "—"}</div>` : ""}
+
+        <div class="group-caption">Email sending · SMTP</div>
+        <div class="ios-group card" style="padding:14px 16px">
+          <div class="row-2col">
+            <div class="field"><label>Host</label><input class="text-input" id="s-host" value="${esc(s.smtp.host)}" placeholder="smtp.gmail.com"></div>
+            <div class="field"><label>Port</label><input class="text-input" id="s-port" value="${esc(String(s.smtp.port || 465))}" inputmode="numeric"></div>
+          </div>
+          <div class="field"><label>Security</label><select class="text-input" id="s-sec">
+            ${["ssl", "starttls", "none"].map((o) => `<option value="${o}"${s.smtp.secure === o ? " selected" : ""}>${o === "ssl" ? "SSL / TLS (465)" : o === "starttls" ? "STARTTLS (587)" : "None"}</option>`).join("")}</select></div>
+          <div class="row-2col">
+            <div class="field"><label>Username</label><input class="text-input" id="s-user" value="${esc(s.smtp.user)}" autocomplete="username"></div>
+            <div class="field"><label>Your name</label><input class="text-input" id="s-name" value="${esc(s.smtp.fromName || "")}" placeholder="You"></div>
+          </div>
+          <div class="field"><label>From address</label><input class="text-input" id="s-from" value="${esc(s.smtp.from)}" placeholder="you@gmail.com" inputmode="email"></div>
+          ${secretField(0, s.smtp.hasPass, "s-pass", "Password", "Gmail needs an <b>app password</b>, not your login password.")}
+          <div class="test-row"><button class="btn secondary small" id="t-smtp">Test connection</button><span class="test-result" id="r-smtp"></span></div>
+        </div>
+
+        <div class="group-caption">Inbox · IMAP <span style="font-weight:400">(for replies)</span></div>
+        <div class="ios-group card" style="padding:14px 16px">
+          <div class="row-2col">
+            <div class="field"><label>Host</label><input class="text-input" id="i-host" value="${esc(s.imap.host)}" placeholder="imap.gmail.com"></div>
+            <div class="field"><label>Port</label><input class="text-input" id="i-port" value="${esc(String(s.imap.port || 993))}" inputmode="numeric"></div>
+          </div>
+          <div class="field"><label>Username</label><input class="text-input" id="i-user" value="${esc(s.imap.user)}" autocomplete="username"></div>
+          ${secretField(0, s.imap.hasPass, "i-pass", "Password", "Same app password as SMTP, usually.")}
+          <div class="test-row"><button class="btn secondary small" id="t-imap">Test connection</button><span class="test-result" id="r-imap"></span></div>
+        </div>
+
+        <div class="group-caption">Matrix</div>
+        <div class="ios-group card" style="padding:14px 16px">
+          <div class="field"><label>Homeserver</label><input class="text-input" id="m-hs" value="${esc(s.matrix.homeserver)}" placeholder="https://matrix.org"></div>
+          ${secretField(0, s.matrix.hasToken, "m-token", "Access token", "Element → Settings → Help → Access token.")}
+          ${s.matrix.userId ? `<div class="hint">Signed in as <b>${esc(s.matrix.userId)}</b></div>` : ""}
+          <div class="test-row" style="margin-top:8px"><button class="btn secondary small" id="t-matrix">Test connection</button><span class="test-result" id="r-matrix"></span></div>
+        </div>
+
+        <div style="padding:8px 32px 40px"><button class="btn" id="save-all" style="width:100%">Save settings</button></div>
+      </div>
+      ${tabBar("settings")}
+    </div>`;
+  bindTabs(app);
+
+  const test = (btnId, resId, service) => {
+    $(btnId).addEventListener("click", async () => {
+      const el = $(resId);
+      el.className = "test-result"; el.textContent = "Testing…";
+      try { await saveAll(true); await api("/api/settings/test", { method: "POST", body: JSON.stringify({ service }) }); el.className = "test-result ok"; el.textContent = "✓ Connected"; }
+      catch (e) { el.className = "test-result err"; el.textContent = "✕ " + e.message; }
+    });
+  };
+  test("#t-smtp", "#r-smtp", "smtp");
+  test("#t-imap", "#r-imap", "imap");
+  test("#t-matrix", "#r-matrix", "matrix");
+
+  async function saveAll(quiet) {
+    const secret = (id, has) => { const v = $(id).value; return v ? v : (has ? "__KEEP__" : ""); };
+    await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "smtp", values: {
+      host: $("#s-host").value.trim(), port: Number($("#s-port").value) || 465, secure: $("#s-sec").value,
+      user: $("#s-user").value.trim(), fromName: $("#s-name").value.trim(), from: $("#s-from").value.trim(),
+      pass: secret("#s-pass", s.smtp.hasPass),
+    }})});
+    await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "imap", values: {
+      host: $("#i-host").value.trim(), port: Number($("#i-port").value) || 993,
+      user: $("#i-user").value.trim(), pass: secret("#i-pass", s.imap.hasPass),
+    }})});
+    await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "matrix", values: {
+      homeserver: $("#m-hs").value.trim().replace(/\/+$/, ""), token: secret("#m-token", s.matrix.hasToken),
+    }})});
+    if (!quiet) { toast("Settings saved."); await loadSettings(); renderSettings(); }
+  }
+  $("#save-all").addEventListener("click", () => saveAll(false).catch((e) => toast(e.message, true)));
+  $("#poll").addEventListener("click", async () => {
+    try { await api("/api/poll", { method: "POST" }); toast("Checked for new messages."); await loadConversations(); }
+    catch (e) { toast(e.message, true); }
+  });
+}
+
+// ---------- router ----------
+
+function stopTimer() { if (state.timer) { clearInterval(state.timer); state.timer = null; } }
+
+async function route() {
+  stopTimer();
+  const h = location.hash || "#/chats";
+  const parts = h.replace(/^#\//, "").split("/");
+  try {
+    if (parts[0] === "chats" && parts[1]) {
+      await loadConversation(parts[1]);
+      renderChatDetail();
+      state.timer = setInterval(refreshChat, 10000);
+    } else if (parts[0] === "chats") {
+      await loadConversations();
+      renderChats();
+      state.timer = setInterval(async () => { await loadConversations().catch(() => {}); if ((location.hash || "#/chats") === "#/chats") renderChats(); }, 15000);
+    } else if (parts[0] === "people" && parts[1] === "new") {
+      await loadContacts();
+      openContactSheet(null);
+      location.hash = "#/people";
+    } else if (parts[0] === "people" && parts[1]) {
+      await loadContacts();
+      renderPersonDetail(parts[1]);
+    } else if (parts[0] === "people") {
+      await loadContacts();
+      renderPeople();
+    } else if (parts[0] === "group" && parts[1] === "new") {
+      await loadContacts();
+      renderNewGroup();
+    } else if (parts[0] === "settings") {
+      await loadSettings();
+      renderSettings();
+    } else {
+      location.hash = "#/chats";
+    }
+  } catch (e) {
+    $("#app").innerHTML = `<div class="view"><div class="nav-bar"><div class="nav-title">Relay</div></div>
+      <div class="empty"><div class="glyph">⚠️</div><h3>Couldn't load</h3><p>${esc(e.message)}</p></div></div>`;
+  }
+}
+
+window.addEventListener("hashchange", route);
+route();
