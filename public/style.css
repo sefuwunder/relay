@@ -303,3 +303,13 @@ button.ios-row:active { background: rgba(120,120,128,0.14); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001s !important; transition-duration: 0.001s !important; }
 }
+
+/* --- SMS import: attach number to existing contact --- */
+.link-btn { background: none; border: none; color: var(--blue); font-size: 13px; font-weight: 600; padding: 6px 4px; margin-left: auto; cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+.link-btn:active { opacity: 0.5; }
+.attach-row { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: none; border: none; border-bottom: 0.5px solid var(--hairline); padding: 10px 16px; cursor: pointer; color: var(--label); font: inherit; }
+.attach-row:last-child { border-bottom: none; }
+.attach-row:active { background: rgba(120, 120, 128, 0.12); }
+.attach-row .pname { flex: 1; }
+.btn-quiet { background: transparent; border: none; color: var(--blue); font-size: 16px; font-weight: 500; padding: 12px; width: 100%; cursor: pointer; }
+.btn-quiet:active { opacity: 0.5; }

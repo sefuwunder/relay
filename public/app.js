@@ -346,7 +346,8 @@ function openImportSheet() {
 // items: [{name, email, sub, gv_number?, badge?, disabled?}] — badge shows a
 // trailing match note (e.g. "already in contacts"); disabled rows are dimmed
 // and cannot be picked.
-function contactPicker(body, close, items, importHint) {
+function contactPicker(body, close, items, importHint, opts) {
+  opts = opts || {};
   const remaining = (state.maxPeople || 8) - state.contacts.length;
   const picked = new Set();
   let q = "";
@@ -361,6 +362,7 @@ function contactPicker(body, close, items, importHint) {
           <div class="pick-row${picked.has(idx) ? " on" : ""}${c.disabled ? " disabled" : ""}" data-idx="${idx}">
             <span class="check">\u2713</span>${avatarHtml(c.name || c.email, "#0a84ff", 48)}
             <span class="pname" style="font-size:15px">${esc(c.name || "(no name)")}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${[c.email, c.sub].filter(Boolean).map(esc).join(" \u00B7 ")}</span>${c.badge ? `<br><span class="pick-badge">${esc(c.badge)}</span>` : ""}</span>
+            ${c.attachable ? `<button class="link-btn" data-attach="${idx}">Add to existing</button>` : ""}
           </div>`; }).join("") || `<div class="empty"><p>No matches.</p></div>`}
       </div>
       <button class="btn" id="imp-go" style="width:100%;margin-top:12px" ${picked.size ? "" : "disabled"}>Import ${picked.size} contact${picked.size === 1 ? "" : "s"}</button>
@@ -377,6 +379,10 @@ function contactPicker(body, close, items, importHint) {
       }
       draw();
     }));
+    $$("[data-attach]", body).forEach((b) => b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (opts.onAttach) opts.onAttach(items[Number(b.dataset.attach)]);
+    }));
     $("#imp-go", body).addEventListener("click", async () => {
       const btn = $("#imp-go", body);
       btn.disabled = true; btn.textContent = "Importing\u2026";
@@ -392,6 +398,36 @@ function contactPicker(body, close, items, importHint) {
   draw();
 }
 
+async function openAttachSheet(item, onDone) {
+  let contacts = [];
+  try { contacts = (await api("/api/contacts")).contacts || []; }
+  catch (e) { toast("Couldn't load contacts.", true); return; }
+  const num = String(item.gv_number || "").replace(/\D/g, "");
+  const targets = contacts.filter((c) => { const d = String(c.gv_number || "").replace(/\D/g, ""); return !num || d !== num; });
+  const scrim = document.createElement("div");
+  scrim.className = "scrim";
+  scrim.innerHTML = `<div class="sheet"><div class="grabber"></div><h3>Add number to\u2026</h3>
+    <p class="hint" style="text-align:center;margin:0 0 10px">${esc(item.name || fmtPhone(item.gv_number))} \u00B7 ${esc(fmtPhone(item.gv_number))}</p>
+    <div class="ios-group card" style="margin:0;max-height:40vh;overflow-y:auto">
+      ${targets.map((c) => `<button class="attach-row" data-id="${esc(c.id)}">${avatarHtml(c.name, c.color, 40)}<span class="pname" style="font-size:15px">${esc(c.name)}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${esc([c.email, fmtPhone(c.gv_number)].filter(Boolean).join(" \u00B7 ") || "No number yet")}</span></span></button>`).join("") || `<div class="empty"><p>No other contacts yet.</p></div>`}
+    </div>
+    <button class="btn-quiet" id="attach-cancel">Cancel</button></div>`;
+  document.body.appendChild(scrim);
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) scrim.remove(); });
+  $("#attach-cancel", scrim).addEventListener("click", () => scrim.remove());
+  $$(".attach-row", scrim).forEach((b) => b.addEventListener("click", async () => {
+    const t = targets.find((c) => String(c.id) === b.dataset.id);
+    b.disabled = true;
+    try {
+      await api(`/api/contacts/${b.dataset.id}`, { method: "PATCH", body: JSON.stringify({ gv_number: item.gv_number }) });
+      scrim.remove();
+      toast(`Added to ${t ? t.name : "contact"}.`);
+      await loadContacts();
+      onDone();
+    } catch (e) { toast(e.message, true); b.disabled = false; }
+  }));
+}
+
 async function drawSmsTab(body, close) {
   body.innerHTML = `<div class="empty"><div class="glyph">\u23F3</div><p>Reading recent text conversations\u2026</p></div>`;
   try {
@@ -401,13 +437,16 @@ async function drawSmsTab(body, close) {
       sub: `${fmtPhone(c.number)} \u00B7 \u00D7${c.count} message${c.count === 1 ? "" : "s"} \u00B7 last ${fmtDay(c.lastDate)}`,
       badge: c.contact ? `\u2713 ${c.contact.name} \u2014 already in contacts` : "",
       disabled: !!c.contact,
+      attachable: !c.contact,
     }));
     if (!items.length) {
       const n = Number(r.scanned || 0);
       body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCAC</div><h3>No recent texts</h3><p>Scanned ${n} inbox message${n === 1 ? "" : "s"} from the last 14 days \u2014 none were Google Voice SMS forwards.</p></div>`;
       return;
     }
-    contactPicker(body, close, items, "Creates contacts with the Google Voice number filled in \u2014 ready for SMS.");
+    contactPicker(body, close, items, "Creates contacts with the Google Voice number filled in \u2014 ready for SMS.", {
+      onAttach: (item) => openAttachSheet(item, () => drawSmsTab(body, close)),
+    });
   } catch (e) {
     const needSettings = /Settings/.test(e.message || "");
     body.innerHTML = `<div class="empty"><div class="glyph">${needSettings ? "\uD83D\uDD0C" : "\u26A0\uFE0F"}</div>
