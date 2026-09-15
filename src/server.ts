@@ -82,17 +82,20 @@ function googleReady(): boolean {
 }
 
 /** Import picked contacts (from Google, sent mail, or recent SMS). Shared by all. */
+// 10-digit NANP digits for a GV number, tolerating a leading US country code.
+const normDigits = (s: string) => s.replace(/\D/g, "").replace(/^1(\d{10})$/, "$1");
+
 async function handleImportContacts(req: Request): Promise<Response> {
   const b = await readBody(req);
   const items = (Array.isArray(b.contacts) ? b.contacts : [])
     .map((c: any) => ({
       name: String(c.name || "").trim(),
       email: String(c.email || "").trim().toLowerCase(),
-      gv: String(c.gv_number || "").replace(/\D/g, ""),
+      gv: normDigits(String(c.gv_number || "")),
     }))
     .filter((c: any) => c.name || c.email || c.gv);
   const haveEmail = new Set(listContacts().map((c) => c.email.toLowerCase()).filter(Boolean));
-  const haveGv = new Set(listContacts().map((c) => (c.gv_number || "").replace(/\D/g, "")).filter(Boolean));
+  const haveGv = new Set(listContacts().map((c) => normDigits(c.gv_number || "")).filter(Boolean));
   const haveName = new Set(listContacts().map((c) => c.name.toLowerCase()));
   let imported = 0, skipped = 0;
   for (const it of items) {
@@ -149,7 +152,6 @@ function atErr(e: unknown): Response {
   return json({ error: m }, 500);
 }
 
-const normDigits = (s: string) => s.replace(/\D/g, "").replace(/^1(\d{10})$/, "$1");
 
 /** Which channels a contact has addresses for (regardless of service config). */
 export function contactChannels(c: Contact): Channel[] {

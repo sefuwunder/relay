@@ -6,6 +6,7 @@ const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmtPhone = (d) => { const s = String(d || "").replace(/\D/g, ""); return s.length === 10 ? `(${s.slice(0, 3)}) ${s.slice(3, 6)}-${s.slice(6)}` : s; };
+const normDigits = (d) => String(d || "").replace(/\D/g, "").replace(/^1(\d{10})$/, "$1");
 const MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const fmtDay = (iso) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ""); return m ? `${MON3[Number(m[2]) - 1]} ${Number(m[3])}` : (iso || ""); };
 
@@ -402,8 +403,8 @@ async function openAttachSheet(item, onDone) {
   let contacts = [];
   try { contacts = (await api("/api/contacts")).contacts || []; }
   catch (e) { toast("Couldn't load contacts.", true); return; }
-  const num = String(item.gv_number || "").replace(/\D/g, "");
-  const targets = contacts.filter((c) => { const d = String(c.gv_number || "").replace(/\D/g, ""); return !num || d !== num; });
+  const num = normDigits(item.gv_number);
+  const targets = contacts.filter((c) => { const d = normDigits(c.gv_number); return !num || d !== num; });
   const scrim = document.createElement("div");
   scrim.className = "scrim";
   scrim.innerHTML = `<div class="sheet"><div class="grabber"></div><h3>Add number to\u2026</h3>
