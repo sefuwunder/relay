@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, stripGvFooter, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, stripGvFooter, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -686,6 +686,36 @@ const server = (Bun as any).serve({
         if (m && method === "POST") {
           markRead(decodeURIComponent(m[1]));
           return json({ ok: true });
+        }
+      }
+
+      // Pre-populate an empty 1:1 chat with the last email conversation.
+      {
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/seed-email$/);
+        if (m && method === "POST") {
+          const id = decodeURIComponent(m[1]);
+          const conv = getConversation(id);
+          if (!conv) return json({ error: "not found" }, 404);
+          if (conv.is_group) return json({ seeded: false, reason: "group" });
+          if (listMessages(id, 1).length) return json({ seeded: false, reason: "not-empty" });
+          const contact = conversationMembers(id)[0];
+          if (!contact || !contact.email) return json({ seeded: false, reason: "no-email" });
+          if (!imapReady()) return json({ seeded: false, reason: "imap-not-configured" });
+          try {
+            const found = await latestEmailWith(settings.imap, contact.email);
+            if (!found || !found.body) return json({ seeded: false, reason: "none-found" });
+            // Reuse the poller's external-id for inbox mail so a later poll dedupes.
+            const extId = found.mailbox === "inbox" ? `mail:${found.uid}` : `sentmail:${found.uid}`;
+            if (hasExternalId(extId)) return json({ seeded: false, reason: "already-present" });
+            insertMessage({
+              conversation_id: id, channel: "email", direction: found.direction,
+              body: found.body, subject: found.subject, external_id: extId, status: "",
+              created_at: found.date,
+            });
+            return json({ seeded: true });
+          } catch {
+            return json({ seeded: false, reason: "lookup-failed" });
+          }
         }
       }
 

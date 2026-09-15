@@ -151,6 +151,18 @@ async function loadConversation(id) {
   state.conv = r.conversation;
   const m = await api("/api/conversations/" + encodeURIComponent(id) + "/messages?limit=100");
   state.messages = m.messages || [];
+  if (!state.messages.length && state.conv && !state.conv.is_group) {
+    // Empty chat: pre-populate the first message from the last email exchange.
+    api("/api/conversations/" + encodeURIComponent(id) + "/seed-email", { method: "POST" })
+      .then(async (se) => {
+        if (se && se.seeded && state.conv && state.conv.id === id) {
+          const m2 = await api("/api/conversations/" + encodeURIComponent(id) + "/messages?limit=100");
+          state.messages = m2.messages || [];
+          renderChatDetail();
+        }
+      })
+      .catch(() => {});
+  }
   await api("/api/conversations/" + encodeURIComponent(id) + "/read", { method: "POST" }).catch(() => {});
 }
 

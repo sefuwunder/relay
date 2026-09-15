@@ -406,6 +406,77 @@ async function fetchSnippets(conn: Conn, tag: string, uids: string[]): Promise<M
   return out;
 }
 
+/** Fetch up to maxChars of plain text for one UID; "" on any failure. */
+async function fetchTextPlain(conn: Conn, tag: string, uid: string, maxChars: number): Promise<string> {
+  try {
+    const lines = await conn.cmd(tag, `UID FETCH ${uid} (UID BODY.PEEK[TEXT]<0.${maxChars}>)`);
+    const joined = lines.join("\r\n");
+    const lm = joined.match(/\{(\d+)\}\r?\n([\s\S]*)$/);
+    let text = lm ? lm[2].slice(0, Number(lm[1])) : "";
+    const hm = text.match(/\r?\n\r?\n/);
+    if (hm) text = text.slice(hm.index! + hm[0].length);
+    if (/<\/?(html|body|div|p|br|table|span)\b/i.test(text)) {
+      text = text.replace(/<[^>]*>/g, " ");
+      text = text.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">");
+    }
+    return text.replace(/\s+/g, " ").trim().slice(0, maxChars);
+  } catch {
+    return "";
+  }
+}
+
+export interface EmailContext {
+  mailbox: "inbox" | "sent";
+  uid: string;
+  messageId: string;
+  from: string;
+  subject: string;
+  date: string; // ISO
+  body: string; // plain text
+  direction: "in" | "out";
+}
+
+/**
+ * Newest email (inbox or sent) involving `email`, used to pre-populate an
+ * empty chat with the last email conversation. Read-only: SELECT/EXAMINE and
+ * BODY.PEEK fetches never set \\Seen.
+ */
+export async function latestEmailWith(cfg0: ImapConfig, email: string, maxBodyChars = 1500): Promise<EmailContext | null> {
+  const addr = (email || "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr)) return null;
+  const { conn } = await connectAndLogin(cfg0);
+  try {
+    const sentName = await findSentMailbox(conn).catch(() => null);
+    const boxes: { name: string; kind: "inbox" | "sent" }[] = [{ name: "INBOX", kind: "inbox" }];
+    if (sentName && sentName.toUpperCase() !== "INBOX") boxes.push({ name: sentName, kind: "sent" });
+    let best: { kind: "inbox" | "sent"; box: string; uid: string; from: string; subject: string; date: string; messageId: string } | null = null;
+    for (const box of boxes) {
+      await conn.cmd("e001", `${box.kind === "inbox" ? "SELECT" : "EXAMINE"} ${qstr(box.name)}`);
+      const uids = parseSearchUids(await conn.cmd("e002", `UID SEARCH OR FROM ${qstr(addr)} TO ${qstr(addr)}`));
+      if (!uids.length) continue;
+      const tail = uids.slice(-3);
+      const envs = await fetchEnvelopes(conn, "e003", tail);
+      for (const u of tail) {
+        const e = envs.get(u);
+        if (!e || !e.date) continue;
+        if (!best || e.date >= best.date) {
+          best = { kind: box.kind, box: box.name, uid: u, from: e.from, subject: e.subject, date: e.date, messageId: e.messageId };
+        }
+      }
+    }
+    if (!best) return null;
+    await conn.cmd("e004", `${best.kind === "inbox" ? "SELECT" : "EXAMINE"} ${qstr(best.box)}`);
+    const body = await fetchTextPlain(conn, "e005", best.uid, maxBodyChars);
+    return {
+      mailbox: best.kind, uid: best.uid, messageId: best.messageId,
+      from: best.from, subject: best.subject, date: best.date, body,
+      direction: extractEmail(best.from).toLowerCase() === addr ? "in" : "out",
+    };
+  } finally {
+    conn.close();
+  }
+}
+
 // Batched Return-Path header fetch; best-effort like snippets. Used to spot
 // Google Voice forwards via their stable bounce domain.
 async function fetchReturnPaths(conn: Conn, tag: string, uids: string[]): Promise<Map<string, string>> {
