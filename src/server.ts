@@ -114,7 +114,7 @@ async function handleImportContacts(req: Request): Promise<Response> {
 // Harvested sent-mail contacts, cached briefly (sent mail barely changes).
 let sentCache: { at: number; contacts: { name: string; email: string; count: number }[] } | null = null;
 // Recent GV SMS conversations, cached briefly too.
-let smsCache: { at: number; conversations: { number: string; count: number; lastDate: string }[]; scanned: number } | null = null;
+let smsCache: { at: number; conversations: { number: string; name: string; count: number; lastDate: string }[]; scanned: number } | null = null;
 
 /** A live Google access token, refreshing it when expired. */
 async function googleToken(): Promise<string> {
@@ -463,7 +463,17 @@ const server = (Bun as any).serve({
             const h = await harvestRecentSms(settings.imap, 14);
             smsCache = { at: now, conversations: h.conversations, scanned: h.scanned };
           }
-          return json({ conversations: smsCache.conversations, scanned: smsCache.scanned });
+          // Cross-reference with existing contacts by GV number (fresh every request).
+          const byGv = new Map<string, { id: string; name: string }>();
+          for (const c of listContacts()) {
+            const d = normDigits(c.gv_number || "");
+            if (d.length === 10 && !byGv.has(d)) byGv.set(d, { id: c.id, name: c.name });
+          }
+          const conversations = smsCache.conversations.map((c) => ({
+            ...c,
+            contact: byGv.get(c.number) || null,
+          }));
+          return json({ conversations, scanned: smsCache.scanned });
         } catch (e) {
           smsCache = null;
           return json({ error: errMsg(e) }, 502);

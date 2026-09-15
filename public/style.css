@@ -277,6 +277,9 @@ button.ios-row:active { background: rgba(120,120,128,0.14); }
 .pick-row .check { width: 24px; height: 24px; border-radius: 50%; border: 1.5px solid var(--label-3); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 14px; flex-shrink: 0; transition: all 0.15s ease; }
 .pick-row.on .check { background: linear-gradient(180deg, #3a9dff, var(--blue-deep)); border-color: var(--blue); box-shadow: 0 2px 6px rgba(10,132,255,0.4); }
 .pick-row .pname { font-size: 16px; font-weight: 500; flex: 1; }
+.pick-row.disabled { opacity: 0.45; cursor: default; }
+.pick-row.disabled .check { visibility: hidden; }
+.pick-badge { font-size: 12px; font-weight: 600; color: var(--green); }
 
 /* settings */
 .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }

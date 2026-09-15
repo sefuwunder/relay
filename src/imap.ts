@@ -515,6 +515,7 @@ export interface HarvestedContact {
 
 export interface HarvestedSms {
   number: string;   // 10 digits
+  name: string;     // sender name from the forward ("Acela"), "" when unknown
   count: number;    // messages in the window
   lastDate: string; // YYYY-MM-DD of the most recent one
 }
@@ -540,21 +541,23 @@ export async function harvestRecentSms(cfg0: ImapConfig, days = 14): Promise<Sms
     const picked = uids.slice(-500);
     const envs = await fetchEnvelopes(conn, "s002", picked);
     const rps = await fetchReturnPaths(conn, "s003", picked);
-    const agg = new Map<string, { count: number; last: string }>();
+    const agg = new Map<string, { name: string; count: number; last: string }>();
     for (const uid of picked) {
       const e = envs.get(uid);
       if (!e) continue;
       const num = gvNumberFrom(e.from || "", e.subject || "", rps.get(uid) || "");
       if (!num) continue;
+      const nm = gvSenderName(e.from || "", e.subject || "");
       const cur = agg.get(num);
       if (cur) {
+        if (nm && e.date >= cur.last) cur.name = nm;
         cur.count++;
         if (e.date > cur.last) cur.last = e.date;
-      } else agg.set(num, { count: 1, last: e.date });
+      } else agg.set(num, { name: nm, count: 1, last: e.date });
     }
     return {
       conversations: [...agg.entries()]
-        .map(([number, v]) => ({ number, count: v.count, lastDate: v.last }))
+        .map(([number, v]) => ({ number, name: v.name, count: v.count, lastDate: v.last }))
         .sort((a, b) => b.lastDate.localeCompare(a.lastDate) || b.count - a.count),
       scanned: picked.length,
     };
@@ -652,6 +655,33 @@ function subjectPhone(subject: string): string {
  */
 export function gvNumberFrom(from: string, subject: string, returnPath: string): string {
   return parseGvNumber(from) || (GV_BOUNCE_RE.test(returnPath) ? subjectPhone(subject) : "");
+}
+
+/** Display name from an envelope addrText: `"Acela (SMS)" <...>` or `Acela (SMS) <...>` or "". */
+function displayNameOf(addrText: string): string {
+  const t = (addrText || "").trim();
+  let m = t.match(/^\s*"([^"]*)"\s*</);
+  if (m) return m[1].trim();
+  m = t.match(/^\s*([^<]*?)\s*</);
+  return m ? m[1].trim() : "";
+}
+
+/** Clean a GV sender name: drop the " (SMS)" tag; reject blanks and phone-like strings. */
+function cleanGvName(n: string): string {
+  const c = (n || "").replace(/\s*\(SMS\)\s*$/i, "").trim();
+  if (!c || /^[\d\s()+.-]+$/.test(c)) return "";
+  return c;
+}
+
+/** "New text message from Acela (513) 967-2841" -> "Acela". */
+function subjectGvName(subject: string): string {
+  const m = (subject || "").match(/\bfrom\s+(.+?)\s+\(\d{3}\)/i);
+  return m ? cleanGvName(m[1]) : "";
+}
+
+/** Best sender name for a GV forward: display name first, then the subject line. */
+function gvSenderName(from: string, subject: string): string {
+  return cleanGvName(displayNameOf(from)) || subjectGvName(subject);
 }
 
 /**

@@ -343,7 +343,9 @@ function openImportSheet() {
 }
 
 // Shared checkbox picker for the import tabs.
-// items: [{name, email, sub}] where sub is a small trailing label (phone, "x3 emails").
+// items: [{name, email, sub, gv_number?, badge?, disabled?}] — badge shows a
+// trailing match note (e.g. "already in contacts"); disabled rows are dimmed
+// and cannot be picked.
 function contactPicker(body, close, items, importHint) {
   const remaining = (state.maxPeople || 8) - state.contacts.length;
   const picked = new Set();
@@ -356,9 +358,9 @@ function contactPicker(body, close, items, importHint) {
       <div class="hint" style="margin-bottom:8px">${remaining} of ${state.maxPeople || 8} spots left \u2014 Relay stays small on purpose.</div>
       <div class="ios-group card" style="margin:0;max-height:38vh;overflow-y:auto">
         ${list.map((c) => { const idx = items.indexOf(c); return `
-          <div class="pick-row${picked.has(idx) ? " on" : ""}" data-idx="${idx}">
+          <div class="pick-row${picked.has(idx) ? " on" : ""}${c.disabled ? " disabled" : ""}" data-idx="${idx}">
             <span class="check">\u2713</span>${avatarHtml(c.name || c.email, "#0a84ff", 48)}
-            <span class="pname" style="font-size:15px">${esc(c.name || "(no name)")}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${esc(c.email || "")}${c.sub ? " \u00B7 " + esc(c.sub) : ""}</span></span>
+            <span class="pname" style="font-size:15px">${esc(c.name || "(no name)")}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${[c.email, c.sub].filter(Boolean).map(esc).join(" \u00B7 ")}</span>${c.badge ? `<br><span class="pick-badge">${esc(c.badge)}</span>` : ""}</span>
           </div>`; }).join("") || `<div class="empty"><p>No matches.</p></div>`}
       </div>
       <button class="btn" id="imp-go" style="width:100%;margin-top:12px" ${picked.size ? "" : "disabled"}>Import ${picked.size} contact${picked.size === 1 ? "" : "s"}</button>
@@ -367,6 +369,7 @@ function contactPicker(body, close, items, importHint) {
     qi.addEventListener("input", () => { q = qi.value.toLowerCase(); const pos = qi.selectionStart; draw(); const nq = $("#imp-q", body); nq.focus(); nq.setSelectionRange(pos, pos); });
     $$(".pick-row", body).forEach((r) => r.addEventListener("click", () => {
       const idx = Number(r.dataset.idx);
+      if (items[idx].disabled) return;
       if (picked.has(idx)) picked.delete(idx);
       else {
         if (picked.size >= remaining) { toast(`Only ${remaining} spot${remaining === 1 ? "" : "s"} left.`, true); return; }
@@ -394,8 +397,10 @@ async function drawSmsTab(body, close) {
   try {
     const r = await api("/api/recent-sms");
     const items = (r.conversations || []).map((c) => ({
-      name: fmtPhone(c.number), email: "", gv_number: c.number,
-      sub: `\u00D7${c.count} message${c.count === 1 ? "" : "s"} \u00B7 last ${fmtDay(c.lastDate)}`,
+      name: c.name || fmtPhone(c.number), email: "", gv_number: c.number,
+      sub: `${fmtPhone(c.number)} \u00B7 \u00D7${c.count} message${c.count === 1 ? "" : "s"} \u00B7 last ${fmtDay(c.lastDate)}`,
+      badge: c.contact ? `\u2713 ${c.contact.name} \u2014 already in contacts` : "",
+      disabled: !!c.contact,
     }));
     if (!items.length) {
       const n = Number(r.scanned || 0);
