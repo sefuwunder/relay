@@ -7,7 +7,7 @@ A small, glossy, iOS-style messaging app for your inner circle — up to **8 peo
 In any message view a segmented control offers the channels that contact can actually use right now:
 
 - **✉️ Email** — sent through your SMTP server; replies arrive via IMAP and land in the same thread.
-- **💬 SMS** — sent through **Google Voice's SMS email gateway**. Just add the contact's Google Voice number; no phone hardware needed. Replies forwarded by Google Voice to your email are picked up by the IMAP poller and threaded as SMS (the GV email footer boilerplate is stripped, so threads show just the message).
+- **💬 SMS** — sent through **Google Voice's SMS email gateway**. Just add the contact's Google Voice number; no phone hardware needed. Replies forwarded by Google Voice to your email are picked up by the IMAP poller and threaded as SMS (the MIME text/plain part is decoded (base64/quoted-printable) and the GV email footer boilerplate is stripped, so threads show just the message).
 
 Opening an empty 1:1 chat pre-populates its first message from the last email conversation with that contact (inbox or Sent, read-only lookup), so the thread starts with context instead of blank. Outbound 1:1 texts are always sent as *replies* to the previous GV thread for that number (Google Voice drops fresh mail to the bare gateway address): Relay uses the newest forward it has recorded, and if it has none (e.g. the forward was already marked seen before Relay polled), it looks the thread up live over IMAP at send time. Groups and numbers with no thread in the last 30 days fall back to the plain gateway address.
 - **🟣 Matrix** — sent with your Matrix access token to a room you pick per contact (or per group); incoming room messages arrive over `/sync` long-polling.

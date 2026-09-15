@@ -31,7 +31,7 @@ export interface StarredMail {
 }
 
 const READ_TIMEOUT_MS = 30000;
-const SNIPPET_BYTES = 2048;
+// (text fetch sizing lives with fetchSnippets as TEXT_FETCH_BYTES)
 
 // ---------- RFC 2047 encoded-word decoding (=?UTF-8?Q?...?= / =?UTF-8?B?...?=) ----------
 function decodeQ(s: string, charset: string): string {
@@ -375,10 +375,14 @@ async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<
 }
 
 // Best-effort text snippets; a failure here never fails the import.
+// The fetch window is deliberately larger than the final snippet: multipart
+// mail (e.g. Google Voice forwards) needs the whole text/plain part present
+// to base64-decode cleanly.
+const TEXT_FETCH_BYTES = 8192;
 async function fetchSnippets(conn: Conn, tag: string, uids: string[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   try {
-    const lines = await conn.cmd(tag, `UID FETCH ${uids.join(",")} (UID BODY.PEEK[TEXT]<0.${SNIPPET_BYTES}>)`);
+    const lines = await conn.cmd(tag, `UID FETCH ${uids.join(",")} (UID BODY.PEEK[TEXT]<0.${TEXT_FETCH_BYTES}>)`);
     let cur: string[] = [];
     const flush = () => {
       if (!cur.length) return;
@@ -389,9 +393,15 @@ async function fetchSnippets(conn: Conn, tag: string, uids: string[]): Promise<M
       // The literal payload is everything after the last {N}\n marker.
       const lm = joined.match(/\{(\d+)\}\n([\s\S]*)$/);
       let text = lm ? lm[2].slice(0, Number(lm[1])) : "";
-      // Strip a leading MIME header block when present.
-      const hm = text.match(/\r?\n\r?\n/);
-      if (hm) text = text.slice(hm.index! + hm[0].length);
+      const mime = decodeMimeText(text);
+      if (mime !== null) {
+        text = mime;
+      } else {
+        // Strip a leading MIME header block when present.
+        const hm = text.match(/\r?\n\r?\n/);
+        if (hm) text = text.slice(hm.index! + hm[0].length);
+      }
+      text = stripGvFooter(text);
       text = text.replace(/\s+/g, " ").trim().slice(0, 280);
       if (text) out.set(um[1], text);
     };
@@ -413,8 +423,14 @@ async function fetchTextPlain(conn: Conn, tag: string, uid: string, maxChars: nu
     const joined = lines.join("\r\n");
     const lm = joined.match(/\{(\d+)\}\r?\n([\s\S]*)$/);
     let text = lm ? lm[2].slice(0, Number(lm[1])) : "";
-    const hm = text.match(/\r?\n\r?\n/);
-    if (hm) text = text.slice(hm.index! + hm[0].length);
+    const mime = decodeMimeText(text);
+    if (mime !== null) {
+      text = mime;
+    } else {
+      const hm = text.match(/\r?\n\r?\n/);
+      if (hm) text = text.slice(hm.index! + hm[0].length);
+    }
+    text = stripGvFooter(text);
     if (/<\/?(html|body|div|p|br|table|span)\b/i.test(text)) {
       text = text.replace(/<[^>]*>/g, " ");
       text = text.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">");
@@ -768,7 +784,51 @@ export function parseGvNumber(rawFrom: string): string {
  * is boilerplate, not the message.
  */
 export function stripGvFooter(body: string): string {
-  return (body || "").replace(/\s*YOUR ACCOUNT\s*<\s*https?:\/\/voice\.google\.com\s*>[\s\S]*$/i, "").trim();
+  const noLead = (body || "").replace(/^\s*<\s*https?:\/\/voice\.google\.com\s*>\s*/i, "");
+  return noLead.replace(/\s*YOUR ACCOUNT\s*<\s*https?:\/\/voice\.google\.com\s*>[\s\S]*$/i, "").trim();
+}
+
+/**
+ * If `raw` is a MIME multipart (or carries part headers), extract the first
+ * text/plain part and decode its Content-Transfer-Encoding (base64,
+ * quoted-printable, 7bit/8bit passthrough). Returns null when no text/plain
+ * part is present, so callers can fall back to treating `raw` as plain text.
+ */
+export function decodeMimeText(raw: string): string | null {
+  const lines = raw.split(/\r?\n/);
+  let i = lines.findIndex((l) => /^content-type:\s*text\/plain/i.test(l));
+  if (i < 0) return null;
+  let encoding = "", charset = "utf-8";
+  for (i++; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim()) { i++; break; } // blank line: part headers end, body begins
+    const em = l.match(/^content-transfer-encoding:\s*([^\s;]+)/i);
+    if (em) encoding = em[1].toLowerCase();
+    const cm = l.match(/^content-type:[^;]*;\s*charset="?([^"\s;]+)"?/i);
+    if (cm) charset = cm[1].toLowerCase();
+    if (/^content-type:/i.test(l)) return null; // ran into the next part: malformed
+  }
+  const bodyLines: string[] = [];
+  for (; i < lines.length; i++) {
+    if (/^--/.test(lines[i])) break; // MIME boundary
+    bodyLines.push(lines[i]);
+  }
+  let text = bodyLines.join("\n");
+  if (encoding === "base64") {
+    try {
+      text = Buffer.from(text.replace(/\s+/g, ""), "base64").toString(charset === "utf-8" || charset === "utf8" ? "utf-8" : "latin1");
+    } catch { /* keep the raw text */ }
+  } else if (encoding === "quoted-printable") {
+    // A soft break (= at end of line, incl. the last line before the boundary).
+    const noSoft = (text + "\n").replace(/=\r?\n/g, "");
+    const bytes: number[] = [];
+    noSoft.replace(/=([0-9A-Fa-f]{2})|([\s\S])/g, (_m, hex: string, ch: string) => {
+      bytes.push(hex ? parseInt(hex, 16) : ch.charCodeAt(0) & 0xff);
+      return "";
+    });
+    text = Buffer.from(bytes).toString("utf-8");
+  }
+  return text;
 }
 
 /** "New text message from Acela (513) 967-2841" -> "5139672841". */
