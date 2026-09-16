@@ -822,6 +822,34 @@ export function stripGvFooter(body: string): string {
 }
 
 /**
+ * Drop quoted reply history and signatures from an inbound email body.
+ * Handles Gmail ("On ... wrote:") and Outlook ("-----Original Message-----"
+ * / From:-Sent:-To:-Subject: blocks) quote headers, ">" quoted lines, and
+ * "-- " signature delimiters. Returns the original when nothing new would
+ * remain, so a fully-quoted body is never blanked.
+ */
+export function stripEmailQuotes(body: string): string {
+  if (!body) return body;
+  const lines = body.replace(/\r\n?/g, "\n").split("\n");
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^On .+ wrote:$/.test(l)) { end = i; break; } // Gmail quote header
+    if (/^-{2,}\s*Original Message\s*-{2,}$/i.test(l)) { end = i; break; } // Outlook
+    if (/^_{10,}$/.test(l) && i > 0) { end = i; break; } // Outlook separator
+    if (/^-- ?$/.test(l)) { end = i; break; } // signature delimiter
+    if (/^From: \S/.test(l)) { // Outlook header block without the dashes line
+      let j = i + 1, headers = 0;
+      while (j < lines.length && /^(Sent|To|Cc|Date|Subject): /i.test(lines[j])) { headers++; j++; }
+      if (headers >= 2) { end = i; break; }
+    }
+  }
+  const kept = lines.slice(0, end).filter((l) => !/^\s*>/.test(l));
+  const out = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return out || body;
+}
+
+/**
  * If `raw` is a MIME multipart (or carries part headers), extract the first
  * text/plain part and decode its Content-Transfer-Encoding (base64,
  * quoted-printable, 7bit/8bit passthrough). Returns null when no text/plain

@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel, type Message,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -115,6 +115,26 @@ if (imapReady()) {
     } catch { /* stale UID — leave the row alone */ }
   }
   if (repaired) console.log(`repaired ${repaired} truncated email/SMS message(s)`);
+}
+
+// One-time sweep: strip quoted reply history ("On ... wrote:", ">" lines)
+// and signatures out of stored inbound email bodies. Idempotent — stripped
+// rows no longer match on later boots.
+{
+  const db = getDb();
+  const rows = db.query(
+    `SELECT id, body FROM messages WHERE channel = 'email' AND direction = 'in'
+     AND (body LIKE '% wrote:%' OR body LIKE '%' || char(10) || '>%' OR body LIKE '%' || char(10) || '-- %')`
+  ).all() as { id: string; body: string }[];
+  let stripped = 0;
+  for (const r of rows) {
+    const clean = stripEmailQuotes(r.body);
+    if (clean !== r.body) {
+      db.query("UPDATE messages SET body = ? WHERE id = ?").run(clean, r.id);
+      stripped++;
+    }
+  }
+  if (stripped) console.log(`stripped quoted history from ${stripped} stored email message(s)`);
 }
 
 // ---------- helpers ----------
@@ -407,6 +427,7 @@ async function pollMail() {
         if (!body) body = "(empty SMS)";
       } else {
         contact = byEmail.get(extractEmail(rawFrom)) || null;
+        body = stripEmailQuotes(body); // drop quoted reply history + signatures
       }
       if (!contact) continue; // not from someone we track
       const conv = dmFor(contact.id);
