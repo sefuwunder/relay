@@ -4,7 +4,7 @@
 
 import {
   openDb, getDb, uid,
-  listContacts, getContact, createContact, updateContact, deleteContact, countContacts,
+  listContacts, listActiveContacts, listArchivedContacts, getContact, createContact, updateContact, deleteContact, countActiveContacts,
   getConversation, conversationMembers, dmFor, createGroup, listConversations, markRead,
   listMessages, insertMessage, hasExternalId, kvGet, kvSet, MAX_PEOPLE,
   type Contact, type Conversation, type Channel,
@@ -99,7 +99,7 @@ async function handleImportContacts(req: Request): Promise<Response> {
   const haveName = new Set(listContacts().map((c) => c.name.toLowerCase()));
   let imported = 0, skipped = 0;
   for (const it of items) {
-    if (countContacts() >= MAX_PEOPLE) break;
+    if (countActiveContacts() >= MAX_PEOPLE) break;
     if ((it.email && haveEmail.has(it.email)) || (it.gv && haveGv.has(it.gv)) || haveName.has(it.name.toLowerCase())) { skipped++; continue; }
     const c = createContact({
       name: it.name || it.email || it.gv, email: it.email, gv_number: it.gv,
@@ -111,7 +111,7 @@ async function handleImportContacts(req: Request): Promise<Response> {
     haveName.add(c.name.toLowerCase());
     imported++;
   }
-  return json({ imported, skipped, capped: countContacts() >= MAX_PEOPLE });
+  return json({ imported, skipped, capped: countActiveContacts() >= MAX_PEOPLE });
 }
 
 // Harvested sent-mail contacts, cached briefly (sent mail barely changes).
@@ -391,7 +391,7 @@ const server = (Bun as any).serve({
       if (path === "/api/status" && method === "GET") {
         return json({
           smtp: smtpReady(), imap: imapReady(), matrix: matrixReady(), google: googleReady(),
-          contacts: listContacts().length, maxPeople: MAX_PEOPLE,
+          contacts: countActiveContacts(), maxPeople: MAX_PEOPLE,
           lastPoll,
         });
       }
@@ -551,8 +551,12 @@ const server = (Bun as any).serve({
 
       // ----- contacts -----
       if (path === "/api/contacts" && method === "GET") {
-        const contacts = listContacts().map((c) => ({ ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id }));
-        return json({ contacts, maxPeople: MAX_PEOPLE });
+        const withMeta = (c: Contact) => ({ ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id });
+        return json({
+          contacts: listActiveContacts().map(withMeta),
+          archived: listArchivedContacts().map(withMeta),
+          maxPeople: MAX_PEOPLE,
+        });
       }
       if (path === "/api/contacts" && method === "POST") {
         const b = await readBody(req);
@@ -585,8 +589,14 @@ const server = (Bun as any).serve({
             for (const k of ["name", "email", "gv_number", "matrix_id", "matrix_room_id", "color", "notes"]) {
               if (k in b) patch[k] = String(b[k] ?? "").trim();
             }
+            if ("archived" in b) patch.archived = b.archived === true || b.archived === 1 || b.archived === "1" ? 1 : 0;
             if (patch.email) patch.email = patch.email.toLowerCase();
             if (patch.name !== undefined && !patch.name) return json({ error: "Give them a name." }, 400);
+            const cur = getContact(id);
+            if (!cur) return json({ error: "not found" }, 404);
+            if (patch.archived === 0 && cur.archived === 1 && countActiveContacts() >= MAX_PEOPLE) {
+              return json({ error: `Your inner circle is full (${MAX_PEOPLE} max). Archive someone else first.` }, 400);
+            }
             const c = updateContact(id, patch);
             if (!c) return json({ error: "not found" }, 404);
             return json({ contact: c });

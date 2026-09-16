@@ -20,6 +20,7 @@ const state = {
   status: null,
   conversations: [],
   contacts: [],
+  archivedContacts: [],
   conv: null,          // open conversation detail
   messages: [],
   search: "",
@@ -295,6 +296,7 @@ async function refreshChat() {
 async function loadContacts() {
   const r = await api("/api/contacts");
   state.contacts = r.contacts || [];
+  state.archivedContacts = r.archived || [];
   state.maxPeople = r.maxPeople;
 }
 
@@ -319,12 +321,23 @@ function renderPeople() {
           <div>${full ? `Full — ${state.maxPeople} max` : "Add person"}</div>
         </button>
       </div>
-      <div class="hint" style="text-align:center;padding:0 24px 24px">Relay is for your inner circle — up to ${state.maxPeople || 8} people, ${state.maxPeople || 8} per group. Tap a person to see their channels, then message them.</div>
+      <div class="hint" style="text-align:center;padding:0 24px 24px">Relay is for your inner circle — up to ${state.maxPeople || 8} people, ${state.maxPeople || 8} per group. Tap a person to see their channels, then message them. Archived people don't count against the limit.</div>
+      ${state.archivedContacts.length ? `
+      <div class="group-caption">Archived · ${state.archivedContacts.length}</div>
+      <div class="ios-group card">
+        ${state.archivedContacts.map((c) => `
+          <button class="ios-row arch-row" data-id="${c.id}">
+            ${avatarHtml(c.name, c.color, 40)}
+            <div class="rlabel"><div class="t1">${esc(c.name)}</div><div class="t2">Archived — tap to restore</div></div>
+            <span class="arch-badge">📦</span>
+          </button>`).join("")}
+      </div>` : ""}
       </div>
       ${tabBar("people")}
     </div>`;
   bindTabs(app);
   $$(".person-card[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/" + b.dataset.id; }));
+  $$(".arch-row[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/" + b.dataset.id; }));
   $("#add-person").addEventListener("click", () => { if (!full) location.hash = "#/people/new"; });
   $("#new-group2").addEventListener("click", () => { location.hash = "#/group/new"; });
   $("#import-contacts").addEventListener("click", openImportSheet);
@@ -520,7 +533,7 @@ async function drawGoogleTab(body, close) {
 }
 
 function renderPersonDetail(id) {
-  const c = state.contacts.find((x) => x.id === id);
+  const c = state.contacts.find((x) => x.id === id) || state.archivedContacts.find((x) => x.id === id);
   if (!c) { location.hash = "#/people"; return; }
   const rows = [
     { ch: "email", t1: "Email", t2: c.email || "Not set" },
@@ -539,7 +552,7 @@ function renderPersonDetail(id) {
         <div class="profile-hero">
           ${avatarHtml(c.name, c.color, 72)}
           <h2>${esc(c.name)}</h2>
-          <div class="sub">${c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet"}</div>
+          <div class="sub">${c.archived ? "📦 Archived · " : ""}${c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet"}</div>
         </div>
         <div style="padding:0 32px"><button class="btn" id="message" style="width:100%">Message</button></div>
         <div class="group-caption">Channels</div>
@@ -550,7 +563,12 @@ function renderPersonDetail(id) {
             </div>`).join("")}
         </div>
         ${c.notes ? `<div class="group-caption">Notes</div><div class="ios-group card"><div class="ios-row"><div class="rlabel"><div class="t1" style="font-weight:400">${esc(c.notes)}</div></div></div></div>` : ""}
-        <div style="padding:8px 32px 32px"><button class="btn danger" id="del" style="width:100%">Remove person</button></div>
+        <div style="padding:8px 32px 32px;display:flex;flex-direction:column;gap:10px">
+          ${c.archived
+            ? `<button class="btn" id="unarchive" style="width:100%">Unarchive person</button>`
+            : `<button class="btn" id="archive" style="width:100%">📦 Archive person</button>`}
+          <button class="btn danger" id="del" style="width:100%">Remove person</button>
+        </div>
       </div>
       ${tabBar("people")}
     </div>`;
@@ -558,6 +576,15 @@ function renderPersonDetail(id) {
   $("#back").addEventListener("click", () => { location.hash = "#/people"; });
   $("#edit").addEventListener("click", () => openContactSheet(c));
   $("#message").addEventListener("click", () => { location.hash = "#/chats/" + c.conversation_id; });
+  const archBtn = c.archived ? $("#unarchive") : $("#archive");
+  if (archBtn) archBtn.addEventListener("click", async () => {
+    try {
+      await api("/api/contacts/" + c.id, { method: "PATCH", body: JSON.stringify({ archived: c.archived ? 0 : 1 }) });
+      await loadContacts();
+      toast(c.archived ? "Back in your circle." : "Archived — they no longer count against the limit.");
+      location.hash = "#/people";
+    } catch (e) { toast(e.message, true); }
+  });
   $("#del").addEventListener("click", async () => {
     if (!confirm(`Remove ${c.name} from Relay? Their chats will be deleted.`)) return;
     await api("/api/contacts/" + c.id, { method: "DELETE" });

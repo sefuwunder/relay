@@ -17,6 +17,7 @@ export interface Contact {
   matrix_room_id: string;
   color: string;
   notes: string;
+  archived: number;
   created_at: string;
 }
 
@@ -59,6 +60,7 @@ export function openDb(path: string): Database {
       matrix_room_id TEXT NOT NULL DEFAULT '',
       color TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT '',
+      archived INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS conversations (
@@ -92,6 +94,11 @@ export function openDb(path: string): Database {
       value TEXT NOT NULL DEFAULT ''
     );
   `);
+  // Migration: archived flag on contacts (older DBs lack the column).
+  const cols = db.query("PRAGMA table_info(contacts)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "archived")) {
+    db.exec("ALTER TABLE contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
+  }
   return db;
 }
 
@@ -111,6 +118,15 @@ export function listContacts(): Contact[] {
   return db.query("SELECT * FROM contacts ORDER BY name COLLATE NOCASE").all() as Contact[];
 }
 
+/** Active (non-archived) contacts — the ones that count against MAX_PEOPLE. */
+export function listActiveContacts(): Contact[] {
+  return db.query("SELECT * FROM contacts WHERE archived = 0 ORDER BY name COLLATE NOCASE").all() as Contact[];
+}
+
+export function listArchivedContacts(): Contact[] {
+  return db.query("SELECT * FROM contacts WHERE archived = 1 ORDER BY name COLLATE NOCASE").all() as Contact[];
+}
+
 export function getContact(id: string): Contact | null {
   return (db.query("SELECT * FROM contacts WHERE id = ?").get(id) as Contact) || null;
 }
@@ -119,12 +135,16 @@ export function countContacts(): number {
   return (db.query("SELECT COUNT(*) AS n FROM contacts").get() as any).n as number;
 }
 
-export function createContact(c: Omit<Contact, "id" | "created_at">): Contact {
-  if (countContacts() >= MAX_PEOPLE) throw new Error(`Relay keeps things small — ${MAX_PEOPLE} contacts maximum.`);
-  const row: Contact = { ...c, id: uid(), created_at: now() };
+export function countActiveContacts(): number {
+  return (db.query("SELECT COUNT(*) AS n FROM contacts WHERE archived = 0").get() as any).n as number;
+}
+
+export function createContact(c: Omit<Contact, "id" | "created_at" | "archived"> & { archived?: number }): Contact {
+  if (countActiveContacts() >= MAX_PEOPLE) throw new Error(`Relay keeps things small — ${MAX_PEOPLE} contacts maximum.`);
+  const row: Contact = { ...c, archived: c.archived ? 1 : 0, id: uid(), created_at: now() };
   db.query(
-    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.created_at);
+    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.archived, row.created_at);
   return row;
 }
 
@@ -132,9 +152,10 @@ export function updateContact(id: string, patch: Partial<Omit<Contact, "id" | "c
   const cur = getContact(id);
   if (!cur) return null;
   const next = { ...cur, ...patch };
+  if ("archived" in patch) next.archived = patch.archived ? 1 : 0;
   db.query(
-    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ? WHERE id = ?"
-  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, id);
+    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ?, archived = ? WHERE id = ?"
+  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, next.archived, id);
   return next;
 }
 
