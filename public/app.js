@@ -29,6 +29,7 @@ const state = {
   sending: false,
   replyTo: null,       // message being replied to in-thread (email)
   timer: null,
+  notify: (() => { try { return localStorage.getItem("relay_notify") === "1"; } catch { return false; } })(),
 };
 
 async function api(path, opts = {}) {
@@ -141,6 +142,79 @@ function bindTabs(root) {
 async function loadConversations() {
   const r = await api("/api/conversations");
   state.conversations = r.conversations || [];
+}
+
+// ---------- message notifications ----------
+
+function notifyPerm() {
+  return ("Notification" in window) ? Notification.permission : "unsupported";
+}
+
+/** Poll the conversation list, fire desktop notifications for new inbound
+    messages, and refresh the tab title badge. Never notifies for history:
+    every conversation's latest message is seeded as seen on first sight. */
+async function pollConversations() {
+  const prev = new Map((state.conversations || []).map((c) => [c.id, c.last_at || ""]));
+  try { await loadConversations(); } catch { return; }
+  checkNotifications(prev);
+  updateTitle();
+}
+
+function checkNotifications(prev) {
+  const seen = (id) => { try { return localStorage.getItem("relay_seen_" + id); } catch { return null; } };
+  const mark = (id, at) => { try { localStorage.setItem("relay_seen_" + id, at); } catch { /* noop */ } };
+  const fresh = (at) => { const t = Date.parse(at); return Number.isFinite(t) && (Date.now() - t) < 10 * 60 * 1000; };
+  const openId = state.conv && state.conv.id;
+  const visible = typeof document !== "undefined" && document.visibilityState === "visible";
+  for (const c of state.conversations || []) {
+    const at = c.last_at || "";
+    const inbound = c.last_direction === "in" && at;
+    const known = seen(c.id);
+    let isNew = false;
+    if (prev.get(c.id) !== undefined && known !== null) {
+      isNew = inbound && at !== known;
+    } else if (inbound && fresh(at)) {
+      // Never seen this conversation (first run, or a brand-new thread) and
+      // the message just arrived — worth a notification, not silent seeding.
+      isNew = true;
+    }
+    if (at) mark(c.id, at);
+    if (!isNew) continue;
+    if (!state.notify || notifyPerm() !== "granted") continue;
+    if (visible && openId === c.id) continue; // user is reading it right now
+    fireNotification(c);
+  }
+}
+
+function fireNotification(c) {
+  let body = String(c.last_body || "").replace(/\s+/g, " ").trim().slice(0, 140);
+  if (!body) body = "New message";
+  try {
+    const n = new Notification(c.title || "Relay", { body, tag: "relay-" + c.id });
+    n.onclick = () => { try { window.focus(); } catch { /* noop */ } location.hash = "#/conversations/" + c.id; n.close(); };
+  } catch { /* notifications unavailable */ }
+}
+
+function updateTitle() {
+  const n = (state.conversations || []).reduce((a, c) => a + (c.unread || 0), 0);
+  document.title = n > 0 ? `(${n}) Relay` : "Relay";
+}
+
+function notifyHint() {
+  const p = notifyPerm();
+  if (p === "granted") return state.notify ? "On — you'll get a desktop notification for new messages." : "Off — turn on to get desktop notifications.";
+  if (p === "denied") return "Blocked — allow notifications for this site in your browser settings, then toggle again.";
+  if (p === "unsupported") return "This browser doesn't support desktop notifications.";
+  return "Turn on, then allow notifications when your browser asks.";
+}
+
+async function setNotify(on) {
+  state.notify = on;
+  try { localStorage.setItem("relay_notify", on ? "1" : "0"); } catch { /* noop */ }
+  if (on && "Notification" in window && Notification.permission === "default") {
+    try { await Notification.requestPermission(); } catch { /* noop */ }
+  }
+  renderSettings();
 }
 
 function renderConversations() {
@@ -966,6 +1040,14 @@ function renderSettings() {
         <div style="padding:4px 32px 0"><button class="btn secondary" id="poll" style="width:100%">${icon("retry")} Check for new messages</button></div>
         ${st.lastPoll && (st.lastPoll.mail || st.lastPoll.matrix) ? `<div class="hint" style="text-align:center">Last check — mail: ${st.lastPoll.mail ? fmtTime(st.lastPoll.mail) : "—"} · matrix: ${st.lastPoll.matrix ? fmtTime(st.lastPoll.matrix) : "—"}</div>` : ""}
 
+        <div class="group-caption">Notifications</div>
+        <div class="group-card card">
+          <div class="group-row">
+            <div class="rlabel" style="flex:1"><div class="t1">New message notifications</div><div class="t2">${notifyHint()}</div></div>
+            <label class="switch"><input type="checkbox" id="notify-toggle" ${state.notify ? "checked" : ""} aria-label="New message notifications"><span class="track"><span class="thumb"></span></span></label>
+          </div>
+        </div>
+
         <div class="group-caption">Email sending · SMTP</div>
         <div class="group-card card" style="padding:14px 16px">
           <div class="row-2col">
@@ -1034,6 +1116,8 @@ function renderSettings() {
 
   api("/api/google/redirect-uri").then((r) => { const el = $("#g-uri"); if (el) el.textContent = r.redirect_uri; }).catch(() => {});
 
+  $("#notify-toggle").addEventListener("change", (e) => { setNotify(e.target.checked); });
+
   $("#g-connect").addEventListener("click", async () => {
     try {
       await saveAll(true);
@@ -1093,9 +1177,10 @@ async function route() {
       renderConversationDetail();
       state.timer = setInterval(refreshConversation, 10000);
     } else if (parts[0] === "conversations") {
-      await loadConversations();
+      await pollConversations();
       renderConversations();
-      state.timer = setInterval(async () => { await loadConversations().catch(() => {}); if ((location.hash || "#/conversations") === "#/conversations") renderConversations(); }, 15000);
+      // Data arrives via the global poller below; this just re-renders.
+      state.timer = setInterval(() => { if ((location.hash || "#/conversations") === "#/conversations") renderConversations(); }, 15000);
     } else if (parts[0] === "people" && parts[1] === "new") {
       await loadContacts();
       openContactSheet(null);
@@ -1129,3 +1214,6 @@ async function route() {
 
 window.addEventListener("hashchange", route);
 route();
+// Global notifier: polls the conversation list on every view so new inbound
+// messages raise a desktop notification and update the tab title badge.
+setInterval(pollConversations, 15000);

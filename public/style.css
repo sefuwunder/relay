@@ -154,6 +154,18 @@ body {
 .send-btn .ic { width: 20px; height: 20px; }
 .btn .ic { margin-right: 6px; }
 
+/* ---------- toggle switch ---------- */
+.switch { position: relative; display: inline-block; width: 46px; height: 28px; flex-shrink: 0; cursor: pointer; }
+.switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.switch .track { position: absolute; inset: 0; border-radius: 14px; background: var(--fill); border: 1px solid var(--hairline); transition: background 0.18s ease; pointer-events: none; }
+.switch .thumb { position: absolute; top: 2px; left: 2px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.28); transition: transform 0.18s ease; }
+.switch input:checked ~ .track { background: var(--blue); border-color: transparent; }
+.switch input:checked ~ .track .thumb { transform: translateX(18px); }
+.switch input:focus-visible ~ .track { outline: 2px solid var(--blue); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .switch .track, .switch .thumb { transition: none; }
+}
+
 .empty { text-align: center; color: var(--label-3); padding: 48px 24px; }
 .empty h3 { margin: 0 0 6px; color: var(--label-2); font-size: 18px; }
 .empty p { margin: 0; font-size: 15px; line-height: 1.45; }
