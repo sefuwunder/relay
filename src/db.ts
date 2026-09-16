@@ -39,6 +39,8 @@ export interface Message {
   body: string;
   subject: string;
   external_id: string;
+  /** Original email Message-ID (for In-Reply-To threading); "" when none. */
+  message_id: string;
   status: string;
   created_at: string;
 }
@@ -85,6 +87,7 @@ export function openDb(path: string): Database {
       body TEXT NOT NULL DEFAULT '',
       subject TEXT NOT NULL DEFAULT '',
       external_id TEXT NOT NULL DEFAULT '',
+      message_id TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
@@ -103,6 +106,11 @@ export function openDb(path: string): Database {
   // Migration: custom contact photo (older DBs lack the column).
   if (!cols.some((c) => c.name === "photo")) {
     db.exec("ALTER TABLE contacts ADD COLUMN photo TEXT NOT NULL DEFAULT ''");
+  }
+  // Migration: original email Message-ID for reply threading (older DBs lack it).
+  const msgCols = db.query("PRAGMA table_info(messages)").all() as { name: string }[];
+  if (!msgCols.some((c) => c.name === "message_id")) {
+    db.exec("ALTER TABLE messages ADD COLUMN message_id TEXT NOT NULL DEFAULT ''");
   }
   return db;
 }
@@ -244,11 +252,11 @@ export function listMessages(convId: string, limit = 100, before?: string): Mess
   return db.query("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?").all(convId, limit) as Message[];
 }
 
-export function insertMessage(m: Omit<Message, "id" | "created_at"> & { created_at?: string }): Message {
+export function insertMessage(m: Omit<Message, "id" | "created_at" | "message_id"> & { created_at?: string; message_id?: string }): Message {
   const row: Message = { ...m, id: uid(), created_at: m.created_at || now() };
   db.query(
-    "INSERT INTO messages (id, conversation_id, channel, direction, body, subject, external_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(row.id, row.conversation_id, row.channel, row.direction, row.body, row.subject, row.external_id, row.status, row.created_at);
+    "INSERT INTO messages (id, conversation_id, channel, direction, body, subject, external_id, message_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(row.id, row.conversation_id, row.channel, row.direction, row.body, row.subject, row.external_id, row.message_id || "", row.status, row.created_at);
   return row;
 }
 

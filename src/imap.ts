@@ -452,6 +452,20 @@ export async function fetchInboxBody(cfg0: ImapConfig, uid: string, maxChars = 4
   }
 }
 
+/** ENVELOPE message-id for one INBOX UID; "" on any failure. */
+export async function fetchInboxMessageId(cfg0: ImapConfig, uid: string): Promise<string> {
+  const { conn } = await connectAndLogin(cfg0);
+  try {
+    await conn.cmd("q001", "SELECT INBOX");
+    const envs = await fetchEnvelopes(conn, "q002", [uid]);
+    return envs.get(uid)?.messageId || "";
+  } catch {
+    return "";
+  } finally {
+    conn.close();
+  }
+}
+
 export interface EmailContext {
   mailbox: "inbox" | "sent";
   uid: string;

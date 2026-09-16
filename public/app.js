@@ -27,6 +27,7 @@ const state = {
   settings: null,
   chanSel: {},         // convId -> channel
   sending: false,
+  replyTo: null,       // message being replied to in-thread (email)
   timer: null,
 };
 
@@ -179,6 +180,7 @@ async function loadConversation(id) {
   state.conv = r.conversation;
   const m = await api("/api/conversations/" + encodeURIComponent(id) + "/messages?limit=100");
   state.messages = m.messages || [];
+  state.replyTo = null;
   if (!state.messages.length && state.conv && !state.conv.is_group) {
     // Empty chat: pre-populate the first message from the last email exchange.
     api("/api/conversations/" + encodeURIComponent(id) + "/seed-email", { method: "POST" })
@@ -215,10 +217,11 @@ function renderChatDetail() {
     const day = dayLabel(m.created_at);
     if (day !== lastDay) { body += `<div class="day-divider">${esc(day)}</div>`; lastDay = day; }
     const out = m.direction === "out";
+    const canReply = m.channel === "email" && !out && m.message_id;
     body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
       <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span></div>
-      <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span>` : ""}</div>
+      <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">↩ Reply</button>` : ""}</div>
     </div>`;
   }
 
@@ -244,8 +247,9 @@ function renderChatDetail() {
         : `<div class="chan-hint">No channels available yet. ${hints.join(" ") || "Add contact details in the People tab."}</div>`}
       </div>
       <div class="composer">
+        ${state.replyTo ? `<div class="reply-bar"><span>↩ Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply">×</button></div>` : ""}
         <div class="grow">
-          <div class="subject-line${ch === "email" ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
+          <div class="subject-line${ch === "email" && !state.replyTo ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
           <textarea id="draft" rows="1" placeholder="Message ${ch ? CHAN_META[ch].label : ""}…"></textarea>
         </div>
         <button class="send-btn" id="send" ${ch ? "" : "disabled"}>↑</button>
@@ -259,6 +263,7 @@ function renderChatDetail() {
   $$("#seg button").forEach((b) => b.addEventListener("click", () => {
     state.chanSel[conv.id] = b.dataset.ch;
     localStorage.setItem("relay_chan_" + conv.id, b.dataset.ch);
+    state.replyTo = null; // replies only thread on email
     renderChatDetail();
     $("#draft").focus();
   }));
@@ -268,6 +273,13 @@ function renderChatDetail() {
   draft.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
 
   $("#send").addEventListener("click", sendMsg);
+
+  $$("#msgs [data-reply]").forEach((b) => b.addEventListener("click", () => {
+    const target = state.messages.find((m) => m.id === b.dataset.reply);
+    if (target) { state.replyTo = target; renderChatDetail(); $("#draft")?.focus(); }
+  }));
+  const rc = $("#reply-cancel");
+  if (rc) rc.addEventListener("click", () => { state.replyTo = null; renderChatDetail(); });
 
   const sc = $("#msgs");
   sc.scrollTop = sc.scrollHeight;
@@ -290,9 +302,10 @@ async function sendMsg() {
   try {
     const r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages", {
       method: "POST",
-      body: JSON.stringify({ channel: ch, body, subject: ch === "email" ? ($("#subject")?.value || "") : "" }),
+      body: JSON.stringify({ channel: ch, body, subject: ch === "email" ? ($("#subject")?.value || "") : "", in_reply_to: state.replyTo ? state.replyTo.id : undefined }),
     });
     state.messages.push(r.message);
+    state.replyTo = null;
     renderChatDetail();
   } catch (e) {
     toast(e.message, true);

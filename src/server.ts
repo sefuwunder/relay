@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, stripGvFooter, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -81,29 +81,40 @@ await bootSettings();
 
 // One-time repair: re-fetch full bodies for inbound mail/SMS stored truncated
 // at the old 280-char snippet cap (the poller used to save the list preview
-// as the message body). Idempotent — only rows exactly 280 chars long match,
-// and repaired rows no longer match. A UID that no longer resolves is left alone.
+// as the message body), and backfill the original Message-ID so the reply
+// button can thread under older messages. Idempotent — repaired rows no
+// longer match; a UID that no longer resolves is left alone.
 if (imapReady()) {
   const db = getDb();
   const rows = db.query(
-    `SELECT id, external_id, channel FROM messages
+    `SELECT id, external_id, channel, message_id, LENGTH(body) AS len FROM messages
      WHERE direction = 'in' AND channel IN ('email', 'sms')
-     AND external_id LIKE 'mail:%' AND LENGTH(body) = 280`
-  ).all() as { id: string; external_id: string; channel: string }[];
+     AND external_id LIKE 'mail:%' AND (LENGTH(body) = 280 OR message_id = '')`
+  ).all() as { id: string; external_id: string; channel: string; message_id: string; len: number }[];
   let repaired = 0;
   for (const r of rows) {
     const uid = r.external_id.slice(5);
     if (!/^\d+$/.test(uid)) continue;
     try {
-      let full = await fetchInboxBody(settings.imap, uid, 4000);
-      if (r.channel === "sms") full = stripGvFooter(full);
-      if (full && full.length > 280) {
-        db.query("UPDATE messages SET body = ? WHERE id = ?").run(full, r.id);
+      let newBody: string | null = null;
+      let newMid: string | null = null;
+      if (r.len === 280) {
+        let full = await fetchInboxBody(settings.imap, uid, 4000);
+        if (r.channel === "sms") full = stripGvFooter(full);
+        if (full && full.length > 280) newBody = full;
+      }
+      if (!r.message_id) {
+        const mid = await fetchInboxMessageId(settings.imap, uid);
+        if (mid) newMid = mid;
+      }
+      if (newBody !== null || newMid !== null) {
+        db.query("UPDATE messages SET body = COALESCE(?, body), message_id = COALESCE(?, message_id) WHERE id = ?")
+          .run(newBody, newMid, r.id);
         repaired++;
       }
     } catch { /* stale UID — leave the row alone */ }
   }
-  if (repaired) console.log(`repaired ${repaired} truncated email/SMS bodie(s)`);
+  if (repaired) console.log(`repaired ${repaired} truncated email/SMS message(s)`);
 }
 
 // ---------- helpers ----------
@@ -288,7 +299,7 @@ function gvReplyFor(gvNumber: string): { messageId: string; from: string; subjec
   return null;
 }
 
-async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string) {
+async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string, inReplyToMsgId?: string) {
   const conv = getConversation(convId);
   if (!conv) throw new Error("Conversation not found.");
   const members = conversationMembers(convId);
@@ -299,8 +310,18 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
 
   if (channel === "email") {
     const to = members.map((m) => m.email);
-    const subj = subject.trim() || (conv.is_group ? conv.name : `Message for ${members[0]?.name || "you"}`);
-    await sendMail(settings.smtp, { to, subject: subj, text });
+    // Reply in-thread when the user picked a specific message: In-Reply-To /
+    // References carry the original's Message-ID and the subject gets Re:.
+    let inReplyTo: string | undefined;
+    let subj = subject.trim() || (conv.is_group ? conv.name : `Message for ${members[0]?.name || "you"}`);
+    if (inReplyToMsgId) {
+      const orig = getDb().query("SELECT subject, message_id FROM messages WHERE id = ? AND conversation_id = ?").get(inReplyToMsgId, convId) as any;
+      if (orig?.message_id) {
+        inReplyTo = orig.message_id;
+        subj = "Re: " + String(orig.subject || subj).replace(/^Re:\s*/i, "");
+      }
+    }
+    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo });
     return insertMessage({ conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", status: "sent" });
   }
   if (channel === "sms") {
@@ -384,7 +405,7 @@ async function pollMail() {
       const conv = dmFor(contact.id);
       insertMessage({
         conversation_id: conv.id, channel, direction: "in", body, subject,
-        external_id: extId, status: "",
+        external_id: extId, message_id: m.messageId || "", status: "",
       });
     }
     lastPoll.mail = new Date().toISOString();
@@ -756,7 +777,7 @@ const server = (Bun as any).serve({
             const channel = b.channel as Channel;
             if (!["email", "sms", "matrix"].includes(channel)) return json({ error: "Pick a channel." }, 400);
             try {
-              const msg = await sendConversationMessage(id, channel, String(b.body || ""), String(b.subject || ""));
+              const msg = await sendConversationMessage(id, channel, String(b.body || ""), String(b.subject || ""), typeof b.in_reply_to === "string" ? b.in_reply_to : undefined);
               return json({ message: msg }, 201);
             } catch (e) {
               // Record the failed attempt so nothing silently vanishes.
@@ -796,7 +817,8 @@ const server = (Bun as any).serve({
             if (hasExternalId(extId)) return json({ seeded: false, reason: "already-present" });
             insertMessage({
               conversation_id: id, channel: "email", direction: found.direction,
-              body: found.body, subject: found.subject, external_id: extId, status: "",
+              body: found.body, subject: found.subject, external_id: extId,
+              message_id: found.messageId || "", status: "",
               created_at: found.date,
             });
             return json({ seeded: true });
