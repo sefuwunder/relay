@@ -844,8 +844,19 @@ export function stripEmailQuotes(body: string): string {
       if (headers >= 2) { end = i; break; }
     }
   }
-  const kept = lines.slice(0, end).filter((l) => !/^\s*>/.test(l));
-  const out = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const kept0 = lines.slice(0, end).filter((l) => !/^\s*>/.test(l)).join("\n");
+  let kept = kept0;
+  if (end === lines.length) {
+    // Jammed / single-line bodies: the Gmail header sits mid-line, e.g.
+    // "...there. ABBYVIP On Tue, Sep 15, 2026 at 9:17 PM Sefu <s@x> wrote: > old".
+    // Strict weekday form plus a ">" quote marker right after the header, so a
+    // fresh "On Friday, she wrote: ..." sentence is never cut.
+    const m = /\bOn (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), .*? wrote:/.exec(kept);
+    if (m && />/.test(kept.slice(m.index + m[0].length, m.index + m[0].length + 80))) {
+      kept = kept.slice(0, m.index);
+    }
+  }
+  const out = kept.replace(/\n{3,}/g, "\n\n").trim();
   return out || body;
 }
 

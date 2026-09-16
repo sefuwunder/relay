@@ -135,6 +135,7 @@ if (imapReady()) {
     }
   }
   if (stripped) console.log(`stripped quoted history from ${stripped} stored email message(s)`);
+  else if (rows.length) console.log(`quote-strip sweep: ${rows.length} stored email(s) checked, none needed stripping`);
 }
 
 // ---------- helpers ----------
