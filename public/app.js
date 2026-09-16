@@ -11,9 +11,9 @@ const MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oc
 const fmtDay = (iso) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ""); return m ? `${MON3[Number(m[2]) - 1]} ${Number(m[3])}` : (iso || ""); };
 
 const CHAN_META = {
-  email: { label: "Email", glyph: "✉️" },
-  sms: { label: "SMS", glyph: "💬" },
-  matrix: { label: "Matrix", glyph: "🟣" },
+  email: { label: "Email", ic: "email" },
+  sms: { label: "SMS", ic: "sms" },
+  matrix: { label: "Matrix", ic: "matrix" },
 };
 
 const state = {
@@ -92,7 +92,7 @@ document.addEventListener("click", (e) => {
 function chanPill(ch) {
   const m = CHAN_META[ch];
   if (!m) return "";
-  return `<span class="chan-pill ${ch}">${m.glyph} ${m.label}</span>`;
+  return `<span class="chan-pill ${ch}">${icon(m.ic)}${m.label}</span>`;
 }
 
 function fmtTime(iso) {
@@ -121,13 +121,13 @@ function dayLabel(iso) {
 function tabBar(active) {
   const unread = state.conversations.reduce((n, c) => n + (c.unread || 0), 0);
   const tabs = [
-    { id: "conversations", glyph: "💬", label: "Conversations", badge: unread },
-    { id: "people", glyph: "👥", label: "People", badge: 0 },
-    { id: "settings", glyph: "⚙️", label: "Settings", badge: 0 },
+    { id: "conversations", ic: "convo", label: "Conversations", badge: unread },
+    { id: "people", ic: "people", label: "People", badge: 0 },
+    { id: "settings", ic: "sliders", label: "Settings", badge: 0 },
   ];
   return `<nav class="tab-bar">${tabs.map((t) =>
     `<button class="tab${active === t.id ? " active" : ""}" data-tab="${t.id}">
-      <span class="glyph">${t.glyph}</span><span>${t.label}</span>
+      ${icon(t.ic)}<span>${t.label}</span>
       ${t.badge ? `<span class="badge">${t.badge}</span>` : ""}
     </button>`).join("")}</nav>`;
 }
@@ -151,8 +151,8 @@ function renderConversations() {
   app.innerHTML = `
     <div class="view">
       <div class="nav-bar"><div class="nav-title">Conversations</div>
-        <button class="nav-action" id="new-group">＋ Group</button></div>
-      <div class="search-wrap"><div class="search-field">🔍<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
+        <button class="nav-action" id="new-group">${icon("plus")}Group</button></div>
+      <div class="search-wrap"><div class="search-field">${icon("search")}<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
       <div class="scroll">
         ${list.length ? list.map((c) => `
           <button class="conv-row" data-id="${c.id}">
@@ -166,7 +166,7 @@ function renderConversations() {
             </div>
             ${c.unread ? `<span class="unread-dot">${c.unread}</span>` : ""}
           </button>`).join("")
-        : `<div class="empty"><div class="glyph">💬</div><h3>No conversations yet</h3><p>Your inner circle lives here.<br>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
+        : `<div class="empty">${icon("burst", "big")}<h3>No conversations yet</h3><p>Your inner circle lives here.<br>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
       </div>
       ${tabBar("conversations")}
     </div>`;
@@ -225,7 +225,7 @@ function renderConversationDetail() {
     body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
       <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span></div>
-      <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span><button class="retry-btn" data-retry="${m.id}" title="Try sending again">↻ Retry</button>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">↩ Reply</button>` : ""}</div>
+      <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span><button class="retry-btn" data-retry="${m.id}" title="Try sending again">${icon("retry")}Retry</button>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">${icon("reply")}Reply</button>` : ""}</div>
     </div>`;
   }
 
@@ -234,7 +234,7 @@ function renderConversationDetail() {
   app.innerHTML = `
     <div class="view">
       <div class="nav-bar">
-        <button class="nav-back" id="back">← Conversations</button>
+        <button class="nav-back" id="back">${icon("back")}Conversations</button>
         ${avatarHtml(conv.title, conv.is_group ? "#8e8e93" : (conv.members[0]?.color || "#8e8e93"), 48, conv.is_group, conv.is_group ? null : conv.members[0]?.avatar_url)}
         <div style="flex:1;min-width:0">
           <div class="nav-title small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(conv.title)}</div>
@@ -242,21 +242,21 @@ function renderConversationDetail() {
         </div>
         ${conv.is_group ? `<button class="nav-action" id="grp-edit">Edit</button>` : ""}
       </div>
-      <div class="msg-scroll" id="msgs">${body || `<div class="empty"><div class="glyph">👋</div><h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
+      <div class="msg-scroll" id="msgs">${body || `<div class="empty">${icon("send", "big")}<h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
       <div class="chan-bar">
         ${conv.channels.length ? `
           <div class="seg" id="seg">${conv.channels.map((c) =>
-            `<button data-ch="${c}" class="${c === ch ? "on" : ""}">${CHAN_META[c].glyph} ${CHAN_META[c].label}</button>`).join("")}</div>
+            `<button data-ch="${c}" class="${c === ch ? "on" : ""}">${icon(CHAN_META[c].ic)}${CHAN_META[c].label}</button>`).join("")}</div>
           ${hints.length ? `<div class="chan-hint">${hints.join(" ")}</div>` : ""}`
         : `<div class="chan-hint">No channels available yet. ${hints.join(" ") || "Add contact details in the People tab."}</div>`}
       </div>
       <div class="composer">
-        ${state.replyTo ? `<div class="reply-bar"><span>↩ Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply">×</button></div>` : ""}
+          ${state.replyTo ? `<div class="reply-bar"><span>${icon("reply")}Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply" aria-label="Cancel reply">${icon("close")}</button></div>` : ""}
         <div class="grow">
           <div class="subject-line${ch === "email" && !state.replyTo ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
           <textarea id="draft" rows="1" placeholder="Message ${ch ? CHAN_META[ch].label : ""}…"></textarea>
         </div>
-        <button class="send-btn" id="send" ${ch ? "" : "disabled"}>↑</button>
+        <button class="send-btn" id="send" aria-label="Send" ${ch ? "" : "disabled"}>${icon("send")}</button>
       </div>
     </div>`;
 
@@ -377,8 +377,8 @@ function renderPeople() {
   app.innerHTML = `
     <div class="view">
       <div class="nav-bar"><div class="nav-title">People</div>
-        <button class="nav-action" id="import-contacts">⤓ Import</button>
-        <button class="nav-action" id="new-group2">＋ Group</button></div>
+        <button class="nav-action" id="import-contacts">${icon("tray")}Import</button>
+        <button class="nav-action" id="new-group2">${icon("plus")}Group</button></div>
       <div class="scroll"><div class="people-grid">
         ${state.contacts.map((c) => `
           <button class="person-card card" data-id="${c.id}">
@@ -388,7 +388,7 @@ function renderPeople() {
               `<span class="chan-dot ${ch}" style="${c.channels.includes(ch) ? "" : "opacity:.18;filter:grayscale(1)"}" title="${CHAN_META[ch].label}"></span>`).join("")}</div>
           </button>`).join("")}
         <button class="person-card add" id="add-person" ${full ? "disabled" : ""}>
-          <div class="glyph">＋</div>
+          ${icon("plus", "big")}
           <div>${full ? `Full — ${state.maxPeople} max` : "Add person"}</div>
         </button>
       </div>
@@ -400,7 +400,7 @@ function renderPeople() {
           <button class="group-row arch-row" data-id="${c.id}">
             ${avatarHtml(c.name, c.color, 40, false, c.avatar_url)}
             <div class="rlabel"><div class="t1">${esc(c.name)}</div><div class="t2">Archived — tap to restore</div></div>
-            <span class="arch-badge">📦</span>
+            <span class="arch-badge">${icon("box")}</span>
           </button>`).join("")}
       </div>` : ""}
       </div>
@@ -423,7 +423,7 @@ function openImportSheet() {
     <div class="sheet" role="dialog" aria-modal="true">
       <div class="grabber"></div><h3>Add people</h3>
       <div class="seg" id="imp-tabs" style="margin-bottom:12px">
-        <button data-tab="sent" class="on">\u2709\uFE0F Sent mail</button><button data-tab="sms">\uD83D\uDCAC SMS</button><button data-tab="google">\uD83D\uDD35 Google</button><button data-tab="vcf">\uD83D\uDCC7 vCard</button>
+        <button data-tab="sent" class="on">${icon("email")}Sent mail</button><button data-tab="sms">${icon("sms")}SMS</button><button data-tab="google">${icon("globe")}Google</button><button data-tab="vcf">${icon("card")}vCard</button>
       </div>
       <div id="imp-body"></div>
     </div>`;
@@ -453,12 +453,12 @@ function contactPicker(body, close, items, importHint, opts) {
     const list = items.filter((c) =>
       !q || c.name.toLowerCase().includes(q) || (c.email || "").toLowerCase().includes(q) || (c.gv_number || "").includes(q));
     body.innerHTML = `
-      <div class="search-field" style="margin-bottom:10px">\uD83D\uDD0D<input id="imp-q" placeholder="Search" value="${esc(q)}"></div>
+      <div class="search-field" style="margin-bottom:10px">${icon("search")}<input id="imp-q" placeholder="Search" value="${esc(q)}"></div>
       <div class="hint" style="margin-bottom:8px">${remaining} of ${state.maxPeople || 8} spots left \u2014 Relay stays small on purpose.</div>
       <div class="group-card card" style="margin:0;max-height:38vh;overflow-y:auto">
         ${list.map((c) => { const idx = items.indexOf(c); return `
           <div class="pick-row${picked.has(idx) ? " on" : ""}${c.disabled ? " disabled" : ""}" data-idx="${idx}">
-            <span class="check">\u2713</span>${avatarHtml(c.name || c.email, "#0a84ff", 48)}
+            <span class="check">${icon("check")}</span>${avatarHtml(c.name || c.email, "#0a84ff", 48)}
             <span class="pname" style="font-size:15px">${esc(c.name || "(no name)")}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${[c.email, c.sub].filter(Boolean).map(esc).join(" \u00B7 ")}</span>${c.badge ? `<br><span class="pick-badge">${esc(c.badge)}</span>` : ""}</span>
             ${c.attachable ? `<button class="link-btn" data-attach="${idx}">Add to existing</button>` : ""}
           </div>`; }).join("") || `<div class="empty"><p>No matches.</p></div>`}
@@ -527,7 +527,7 @@ async function openAttachSheet(item, onDone) {
 }
 
 async function drawSmsTab(body, close) {
-  body.innerHTML = `<div class="empty"><div class="glyph">\u23F3</div><p>Reading recent text conversations\u2026</p></div>`;
+  body.innerHTML = `<div class="empty">${icon("clock", "big")}<p>Reading recent text conversations\u2026</p></div>`;
   try {
     const r = await api("/api/recent-sms");
     const items = (r.conversations || []).map((c) => ({
@@ -539,7 +539,7 @@ async function drawSmsTab(body, close) {
     }));
     if (!items.length) {
       const n = Number(r.scanned || 0);
-      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCAC</div><h3>No recent texts</h3><p>Scanned ${n} inbox message${n === 1 ? "" : "s"} from the last 14 days \u2014 none were Google Voice SMS forwards.</p></div>`;
+      body.innerHTML = `<div class="empty">${icon("sms", "big")}<h3>No recent texts</h3><p>Scanned ${n} inbox message${n === 1 ? "" : "s"} from the last 14 days \u2014 none were Google Voice SMS forwards.</p></div>`;
       return;
     }
     contactPicker(body, close, items, "Creates contacts with the Google Voice number filled in \u2014 ready for SMS.", {
@@ -547,7 +547,7 @@ async function drawSmsTab(body, close) {
     });
   } catch (e) {
     const needSettings = /Settings/.test(e.message || "");
-    body.innerHTML = `<div class="empty"><div class="glyph">${needSettings ? "\uD83D\uDD0C" : "\u26A0\uFE0F"}</div>
+    body.innerHTML = `<div class="empty">${needSettings ? icon("email", "big") : icon("warn", "big")}
       <h3>${needSettings ? "Mail isn't connected" : "Couldn't read inbox"}</h3><p>${esc(e.message)}</p>
       <div style="margin-top:14px">${needSettings
         ? `<button class="btn" id="imp-settings">Open Settings</button>`
@@ -560,7 +560,7 @@ async function drawSmsTab(body, close) {
 }
 
 async function drawSentTab(body, close) {
-  body.innerHTML = `<div class="empty"><div class="glyph">\u23F3</div><p>Reading your last 40 sent emails\u2026</p></div>`;
+  body.innerHTML = `<div class="empty">${icon("clock", "big")}<p>Reading your last 40 sent emails\u2026</p></div>`;
   try {
     const r = await api("/api/sent-contacts");
     const items = (r.contacts || []).map((c) => ({
@@ -568,13 +568,13 @@ async function drawSentTab(body, close) {
       sub: c.count > 1 ? `\u00D7${c.count} emails` : "1 email",
     }));
     if (!items.length) {
-      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCED</div><h3>No sent mail found</h3><p>Your Sent folder is empty or couldn't be read.</p></div>`;
+      body.innerHTML = `<div class="empty">${icon("email", "big")}<h3>No sent mail found</h3><p>Your Sent folder is empty or couldn't be read.</p></div>`;
       return;
     }
     contactPicker(body, close, items, "Harvested from your last 40 sent emails \u2014 names and addresses are imported.");
   } catch (e) {
     const needSettings = /Settings/.test(e.message || "");
-    body.innerHTML = `<div class="empty"><div class="glyph">${needSettings ? "\uD83D\uDD0C" : "\u26A0\uFE0F"}</div>
+    body.innerHTML = `<div class="empty">${needSettings ? icon("email", "big") : icon("warn", "big")}
       <h3>${needSettings ? "Mail isn't connected" : "Couldn't read sent mail"}</h3><p>${esc(e.message)}</p>
       <div style="margin-top:14px">${needSettings
         ? `<button class="btn" id="imp-settings">Open Settings</button>`
@@ -587,17 +587,17 @@ async function drawSentTab(body, close) {
 }
 
 async function drawGoogleTab(body, close) {
-  body.innerHTML = `<div class="empty"><div class="glyph">\u23F3</div><p>Loading your Google contacts\u2026</p></div>`;
+  body.innerHTML = `<div class="empty">${icon("clock", "big")}<p>Loading your Google contacts\u2026</p></div>`;
   try {
     const r = await api("/api/google/contacts");
     const items = (r.contacts || []).map((c) => ({ name: c.name, email: c.email, sub: c.phone || "" }));
     if (!items.length) {
-      body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDCC7</div><h3>No Google contacts found</h3><p>Your Google contacts list is empty.</p></div>`;
+      body.innerHTML = `<div class="empty">${icon("globe", "big")}<h3>No Google contacts found</h3><p>Your Google contacts list is empty.</p></div>`;
       return;
     }
     contactPicker(body, close, items, "Names and email addresses are imported. Add a Google Voice number afterwards (Edit person) to enable SMS.");
   } catch (e) {
-    body.innerHTML = `<div class="empty"><div class="glyph">\uD83D\uDD0C</div><h3>Google isn't connected</h3>
+    body.innerHTML = `<div class="empty">${icon("globe", "big")}<h3>Google isn't connected</h3>
       <p>${esc(e.message)}</p>
       <div style="margin-top:14px"><button class="btn" id="imp-settings">Open Settings</button></div></div>`;
     $("#imp-settings", body).addEventListener("click", () => { close(); location.hash = "#/settings"; });
@@ -670,7 +670,7 @@ function drawVcfTab(body, close) {
   body.innerHTML = `
     <div class="hint" style="margin-bottom:12px">Pick a <b>.vcf</b> vCard file — from iCloud, a Google Contacts export, or anywhere else. It's parsed on this device; nothing is uploaded.</div>
     <input type="file" id="vcf-file" accept=".vcf,.vcard,text/vcard" style="display:none">
-    <button class="btn" id="vcf-pick" style="width:100%">\uD83D\uDCC7 Choose vCard file…</button>
+    <button class="btn" id="vcf-pick" style="width:100%">${icon("card")} Choose vCard file…</button>
     <div id="vcf-status"></div>`;
   const input = $("#vcf-file", body);
   $("#vcf-pick", body).addEventListener("click", () => input.click());
@@ -703,7 +703,7 @@ function renderPersonDetail(id) {
   app.innerHTML = `
     <div class="view">
       <div class="nav-bar">
-        <button class="nav-back" id="back">← People</button>
+        <button class="nav-back" id="back">${icon("back")}People</button>
         <div class="nav-title small" style="flex:1"></div>
         <button class="nav-action" id="edit">Edit</button>
       </div>
@@ -711,7 +711,7 @@ function renderPersonDetail(id) {
         <div class="profile-hero">
           ${avatarHtml(c.name, c.color, 72, false, c.avatar_url)}
           <h2>${esc(c.name)}</h2>
-          <div class="sub">${c.archived ? "📦 Archived · " : ""}${c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet"}</div>
+          <div class="sub">${c.archived ? icon("box") + " Archived · " : ""}${c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet"}</div>
         </div>
         <div style="padding:0 32px"><button class="btn" id="message" style="width:100%">Message</button></div>
         <div class="group-caption">Channels</div>
@@ -725,7 +725,7 @@ function renderPersonDetail(id) {
         <div style="padding:8px 32px 32px;display:flex;flex-direction:column;gap:10px">
           ${c.archived
             ? `<button class="btn" id="unarchive" style="width:100%">Unarchive person</button>`
-            : `<button class="btn" id="archive" style="width:100%">📦 Archive person</button>`}
+            : `<button class="btn" id="archive" style="width:100%">${icon("box")}Archive person</button>`}
           <button class="btn danger" id="del" style="width:100%">Remove person</button>
         </div>
       </div>
@@ -864,7 +864,7 @@ function renderNewGroup() {
   const draw = () => {
     app.innerHTML = `
     <div class="view">
-      <div class="nav-bar"><button class="nav-back" id="back">← People</button><div class="nav-title small" style="flex:1">New group</div>
+      <div class="nav-bar"><button class="nav-back" id="back">${icon("back")}People</button><div class="nav-title small" style="flex:1">New group</div>
         <button class="nav-action" id="create" ${picked.size ? "" : "disabled"}>Create</button></div>
       <div class="scroll">
         <div style="padding:16px 16px 0"><div class="field"><label>Group name</label><input class="text-input" id="g-name" placeholder="Weekend crew" maxlength="60"></div>
@@ -963,7 +963,7 @@ function renderSettings() {
           <div class="group-row">${dot(st.imap)}<div class="rlabel"><div class="t1">Inbox (IMAP)</div><div class="t2">${st.imap ? esc(s.imap.host) : "Not configured"}</div></div></div>
           <div class="group-row">${dot(st.matrix)}<div class="rlabel"><div class="t1">Matrix</div><div class="t2">${st.matrix ? esc(s.matrix.homeserver) : "Not configured"}</div></div></div>
         </div>
-        <div style="padding:4px 32px 0"><button class="btn secondary" id="poll" style="width:100%">↻ Check for new messages</button></div>
+        <div style="padding:4px 32px 0"><button class="btn secondary" id="poll" style="width:100%">${icon("retry")} Check for new messages</button></div>
         ${st.lastPoll && (st.lastPoll.mail || st.lastPoll.matrix) ? `<div class="hint" style="text-align:center">Last check — mail: ${st.lastPoll.mail ? fmtTime(st.lastPoll.mail) : "—"} · matrix: ${st.lastPoll.matrix ? fmtTime(st.lastPoll.matrix) : "—"}</div>` : ""}
 
         <div class="group-caption">Email sending · SMTP</div>
@@ -1024,8 +1024,8 @@ function renderSettings() {
     $(btnId).addEventListener("click", async () => {
       const el = $(resId);
       el.className = "test-result"; el.textContent = "Testing…";
-      try { await saveAll(true); await api("/api/settings/test", { method: "POST", body: JSON.stringify({ service }) }); el.className = "test-result ok"; el.textContent = "✓ Connected"; }
-      catch (e) { el.className = "test-result err"; el.textContent = "✕ " + e.message; }
+      try { await saveAll(true); await api("/api/settings/test", { method: "POST", body: JSON.stringify({ service }) }); el.className = "test-result ok"; el.innerHTML = icon("check") + " Connected"; }
+      catch (e) { el.className = "test-result err"; el.innerHTML = icon("close") + " " + esc(e.message); }
     });
   };
   test("#t-smtp", "#r-smtp", "smtp");
@@ -1123,7 +1123,7 @@ async function route() {
     }
   } catch (e) {
     $("#app").innerHTML = `<div class="view"><div class="nav-bar"><div class="nav-title">Relay</div></div>
-      <div class="empty"><div class="glyph">⚠️</div><h3>Couldn't load</h3><p>${esc(e.message)}</p></div></div>`;
+      <div class="empty">${icon("warn", "big")}<h3>Couldn't load</h3><p>${esc(e.message)}</p></div></div>`;
   }
 }
 

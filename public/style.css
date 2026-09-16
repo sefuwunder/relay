@@ -135,8 +135,26 @@ body {
 .toast.error { background: rgba(160, 30, 24, 0.94); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(-8px) scale(0.95); } to { opacity: 1; transform: none; } }
 
+/* ---------- postmodern icon set ---------- */
+.ic { display: inline-flex; width: 1.25em; height: 1.25em; flex-shrink: 0; vertical-align: -0.28em; }
+.ic svg { width: 100%; height: 100%; display: block; }
+.ic svg .a { fill: var(--blue); }
+.ic svg .g { fill: var(--green); }
+.ic svg .p { fill: var(--purple); }
+.ic svg .o { fill: var(--orange); }
+.ic svg .w { fill: #fff; }
+.ic svg .sa { stroke: var(--blue); fill: none; }
+.tab .ic { width: 26px; height: 26px; }
+.empty .ic.big { width: 54px; height: 54px; margin-bottom: 12px; }
+.person-card.add .ic.big { width: 34px; height: 34px; }
+.pick-row .check .ic { width: 14px; height: 14px; }
+.nav-back .ic, .nav-action .ic { width: 1.15em; height: 1.15em; vertical-align: -0.22em; }
+.chan-pill .ic { width: 1.35em; height: 1.35em; vertical-align: -0.3em; margin-right: 2px; }
+.seg .ic { margin-right: 2px; }
+.send-btn .ic { width: 20px; height: 20px; }
+.btn .ic { margin-right: 6px; }
+
 .empty { text-align: center; color: var(--label-3); padding: 48px 24px; }
-.empty .glyph { font-size: 44px; margin-bottom: 12px; }
 .empty h3 { margin: 0 0 6px; color: var(--label-2); font-size: 18px; }
 .empty p { margin: 0; font-size: 15px; line-height: 1.45; }
 
@@ -145,9 +163,8 @@ body {
   display: flex; background: var(--tabbar); backdrop-filter: blur(24px) saturate(1.8); -webkit-backdrop-filter: blur(24px) saturate(1.8);
   border-top: 1px solid var(--hairline); padding: 6px 8px calc(8px + env(safe-area-inset-bottom)); z-index: 5;
 }
-.tab { flex: 1; background: none; border: none; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 6px 0 4px; color: var(--label-3); font-size: 10px; font-weight: 500; border-radius: 12px; transition: transform 0.12s ease; position: relative; }
+.tab { flex: 1; background: none; border: none; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 0 4px; color: var(--label-3); font-size: 11px; font-weight: 500; border-radius: 12px; transition: transform 0.12s ease; position: relative; }
 .tab:active { transform: scale(0.94); }
-.tab .glyph { font-size: 22px; line-height: 1; }
 .tab.active { color: var(--blue); }
 .tab .badge { position: absolute; top: 2px; right: calc(50% - 22px); background: var(--red); color: #fff; font-size: 11px; font-weight: 700; min-width: 18px; height: 18px; border-radius: 9px; display: flex; align-items: center; justify-content: center; padding: 0 5px; }
 
@@ -288,7 +305,6 @@ body {
 .person-card .pname { font-size: 16px; font-weight: 700; }
 .person-card .chan-dots { display: flex; gap: 6px; }
 .person-card.add { border: 1.5px dashed var(--hairline); background: transparent; box-shadow: none; color: var(--label-3); }
-.person-card.add .glyph { font-size: 30px; }
 .person-card.add:disabled { opacity: 0.45; }
 
 /* contact detail */
