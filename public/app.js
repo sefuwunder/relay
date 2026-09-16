@@ -269,8 +269,10 @@ async function sendMsg() {
     renderChatDetail();
   } catch (e) {
     toast(e.message, true);
+  } finally {
     state.sending = false;
-    $("#send").disabled = false;
+    const btn = $("#send");
+    if (btn) btn.disabled = false;
   }
 }
 
