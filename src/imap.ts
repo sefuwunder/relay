@@ -379,7 +379,7 @@ async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<
 // mail (e.g. Google Voice forwards) needs the whole text/plain part present
 // to base64-decode cleanly.
 const TEXT_FETCH_BYTES = 8192;
-async function fetchSnippets(conn: Conn, tag: string, uids: string[]): Promise<Map<string, string>> {
+async function fetchSnippets(conn: Conn, tag: string, uids: string[], maxChars = 280): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   try {
     const lines = await conn.cmd(tag, `UID FETCH ${uids.join(",")} (UID BODY.PEEK[TEXT]<0.${TEXT_FETCH_BYTES}>)`);
@@ -402,7 +402,7 @@ async function fetchSnippets(conn: Conn, tag: string, uids: string[]): Promise<M
         if (hm) text = text.slice(hm.index! + hm[0].length);
       }
       text = stripGvFooter(text);
-      text = text.replace(/\s+/g, " ").trim().slice(0, 280);
+      text = text.replace(/\s+/g, " ").trim().slice(0, maxChars);
       if (text) out.set(um[1], text);
     };
     for (const line of lines) {
@@ -438,6 +438,17 @@ async function fetchTextPlain(conn: Conn, tag: string, uid: string, maxChars: nu
     return text.replace(/\s+/g, " ").trim().slice(0, maxChars);
   } catch {
     return "";
+  }
+}
+
+/** Fetch up to maxChars of decoded plain text for one INBOX UID; "" on any failure. */
+export async function fetchInboxBody(cfg0: ImapConfig, uid: string, maxChars = 4000): Promise<string> {
+  const { conn } = await connectAndLogin(cfg0);
+  try {
+    await conn.cmd("r001", "SELECT INBOX");
+    return await fetchTextPlain(conn, "r002", uid, maxChars);
+  } finally {
+    conn.close();
   }
 }
 
@@ -553,7 +564,8 @@ export interface UnseenMail {
   from: string;
   subject: string;
   date: string;
-  snippet: string;
+  snippet: string; // 280-char preview for list views
+  body: string;    // fuller decoded text (4000 chars) for stored messages
   returnPath: string;
   messageId: string; // ENVELOPE message-id — used to thread SMS replies
 }
@@ -566,17 +578,22 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
     if (!uids.length) return [];
     const picked = uids.slice(0, Math.min(limit, 50));
     const envs = await fetchEnvelopes(conn, "b002", picked);
-    const snips = await fetchSnippets(conn, "b003", picked);
+    // One batched fetch sized for stored bodies (4000 chars); the 280-char
+    // list preview is just a prefix of it. (The poller used to store the
+    // 280-char snippet as the whole message body, truncating longer mail.)
+    const bodies = await fetchSnippets(conn, "b003", picked, 4000);
     const rps = await fetchReturnPaths(conn, "b004", picked);
     const mails: UnseenMail[] = [];
     for (const uid of picked) {
       const e = envs.get(uid) || { from: "", subject: "", date: "", messageId: "" };
+      const body = bodies.get(uid) || "";
       mails.push({
         uid,
         from: e.from,
         subject: e.subject || "(no subject)",
         date: e.date,
-        snippet: snips.get(uid) || "",
+        snippet: body.slice(0, 280),
+        body,
         returnPath: rps.get(uid) || "",
         messageId: e.messageId || "",
       });

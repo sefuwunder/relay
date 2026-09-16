@@ -10,7 +10,7 @@ import {
   type Contact, type Conversation, type Channel,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, stripGvFooter, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, stripGvFooter, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -77,6 +77,33 @@ await bootSettings();
     }
   }
   if (scrubbed) console.log(`scrubbed GV footers from ${scrubbed} stored SMS message(s)`);
+}
+
+// One-time repair: re-fetch full bodies for inbound mail/SMS stored truncated
+// at the old 280-char snippet cap (the poller used to save the list preview
+// as the message body). Idempotent — only rows exactly 280 chars long match,
+// and repaired rows no longer match. A UID that no longer resolves is left alone.
+if (imapReady()) {
+  const db = getDb();
+  const rows = db.query(
+    `SELECT id, external_id, channel FROM messages
+     WHERE direction = 'in' AND channel IN ('email', 'sms')
+     AND external_id LIKE 'mail:%' AND LENGTH(body) = 280`
+  ).all() as { id: string; external_id: string; channel: string }[];
+  let repaired = 0;
+  for (const r of rows) {
+    const uid = r.external_id.slice(5);
+    if (!/^\d+$/.test(uid)) continue;
+    try {
+      let full = await fetchInboxBody(settings.imap, uid, 4000);
+      if (r.channel === "sms") full = stripGvFooter(full);
+      if (full && full.length > 280) {
+        db.query("UPDATE messages SET body = ? WHERE id = ?").run(full, r.id);
+        repaired++;
+      }
+    } catch { /* stale UID — leave the row alone */ }
+  }
+  if (repaired) console.log(`repaired ${repaired} truncated email/SMS bodie(s)`);
 }
 
 // ---------- helpers ----------
@@ -338,7 +365,7 @@ async function pollMail() {
       const gvNum = gvNumberFrom(rawFrom, m.subject || "", m.returnPath || "");
       let contact: Contact | null = null;
       let channel: Channel = "email";
-      let body = m.snippet || "";
+      let body = m.body || "";
       let subject = m.subject || "";
       if (gvNum) {
         const digits = gvNum; // already normalized to 10 digits
