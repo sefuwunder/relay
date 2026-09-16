@@ -779,13 +779,15 @@ export function parseGvNumber(rawFrom: string): string {
 
 /**
  * Strip the Google Voice email footer from an inbound SMS body.
- * GV forwards arrive as e.g. "hey mom YOUR ACCOUNT <https://voice.google.com>
- * HELP CENTER <...> HELP FORUM <...> ..." — everything from YOUR ACCOUNT on
- * is boilerplate, not the message.
+ * GV forwards arrive as e.g. "hey mom\n\nTo respond to this text message,
+ * reply to this email or visit Google Voice. ... YOUR ACCOUNT
+ * <https://voice.google.com> HELP CENTER <...> ..." — everything from the
+ * "To respond to this text message" line on is boilerplate, not the message.
  */
 export function stripGvFooter(body: string): string {
   const noLead = (body || "").replace(/^\s*<\s*https?:\/\/voice\.google\.com\s*>\s*/i, "");
-  return noLead.replace(/\s*YOUR ACCOUNT\s*<\s*https?:\/\/voice\.google\.com\s*>[\s\S]*$/i, "").trim();
+  const noAccount = noLead.replace(/\s*YOUR ACCOUNT\s*<\s*https?:\/\/voice\.google\.com\s*>[\s\S]*$/i, "");
+  return noAccount.replace(/\s*To respond to this text message[\s\S]*$/i, "").trim();
 }
 
 /**

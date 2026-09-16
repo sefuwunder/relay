@@ -57,6 +57,32 @@ function avatarHtml(name, color, size, group, url) {
   return `<div class="avatar a${size}${group ? " group" : ""}" style="background:linear-gradient(135deg, ${color}, ${color}cc)">${esc(initials(name))}${url ? `<img src="${esc(url)}" alt="" loading="lazy" onerror="this.remove()">` : ""}</div>`;
 }
 
+// Long-message truncation: bubbles collapse past TRUNC_LEN chars; tapping
+// "more"/"less" expands in place. Per-message expanded state survives
+// re-renders while the chat is open.
+const TRUNC_LEN = 500;
+const expandedIds = new Set();
+
+function bubbleText(m) {
+  const text = String(m.body ?? "");
+  const expanded = expandedIds.has(String(m.id));
+  if (text.length <= TRUNC_LEN) return esc(text);
+  const label = expanded ? "less" : "more";
+  const shown = expanded ? text : text.slice(0, TRUNC_LEN) + "…";
+  return `${esc(shown)} <button class="more" data-mid="${esc(m.id)}">${label}</button>`;
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button.more");
+  if (!btn || !$("#msgs")) return;
+  const id = String(btn.dataset.mid || "");
+  const m = state.messages.find((x) => String(x.id) === id);
+  if (!m) return;
+  if (expandedIds.has(id)) expandedIds.delete(id); else expandedIds.add(id);
+  const span = btn.closest(".bubble-text");
+  if (span) span.innerHTML = bubbleText(m);
+});
+
 function chanPill(ch) {
   const m = CHAN_META[ch];
   if (!m) return "";
@@ -190,7 +216,7 @@ function renderChatDetail() {
     const out = m.direction === "out";
     body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
-      <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}${esc(m.body)}</div>
+      <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span></div>
       <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span>` : ""}</div>
     </div>`;
   }

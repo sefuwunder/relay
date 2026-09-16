@@ -204,6 +204,12 @@ body {
 .msg .subject { font-size: 13px; font-weight: 700; margin-bottom: 4px; opacity: 0.85; }
 .msg .meta-line { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 11px; color: var(--label-3); }
 .msg.failed .bubble { filter: grayscale(0.4); opacity: 0.75; }
+.bubble-text .more {
+  background: none; border: none; padding: 0; margin: 0;
+  font: inherit; font-weight: 600; color: inherit; opacity: 0.75;
+  cursor: pointer; text-decoration: underline; text-underline-offset: 2px;
+}
+.bubble-text .more:hover { opacity: 1; }
 .sender-name { font-size: 12px; font-weight: 600; color: var(--label-2); margin: 0 4px 2px; }
 
 /* channel picker */

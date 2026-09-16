@@ -59,6 +59,26 @@ async function saveSettings() {
 openDb(`${DATA_DIR}/relay.db`);
 await bootSettings();
 
+// One-time sweep: scrub GV footer boilerplate out of inbound SMS bodies
+// stored before stripGvFooter learned the "To respond to this text message"
+// variant. Idempotent — runs to zero matches on later boots.
+{
+  const db = getDb();
+  const rows = db.query(
+    `SELECT id, body FROM messages WHERE channel = 'sms' AND direction = 'in'
+     AND (body LIKE '%To respond to this text message%' OR body LIKE '%YOUR ACCOUNT <https://voice.google.com>%')`
+  ).all() as { id: string; body: string }[];
+  let scrubbed = 0;
+  for (const r of rows) {
+    const clean = stripGvFooter(r.body);
+    if (clean !== r.body) {
+      db.query("UPDATE messages SET body = ? WHERE id = ?").run(clean || "(empty SMS)", r.id);
+      scrubbed++;
+    }
+  }
+  if (scrubbed) console.log(`scrubbed GV footers from ${scrubbed} stored SMS message(s)`);
+}
+
 // ---------- helpers ----------
 
 function json(v: unknown, status = 200): Response {
