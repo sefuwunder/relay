@@ -182,6 +182,19 @@ export function avatarUrl(email: string): string | null {
   return `https://www.gravatar.com/avatar/${createHash("md5").update(e).digest("hex")}?s=128&d=404`;
 }
 
+/** Effective avatar: the contact's custom photo wins, then Gravatar. */
+export function avatarFor(c: { photo?: string; email?: string }): string | null {
+  return (c.photo && /^data:image\/(jpeg|png|webp|gif);base64,/.test(c.photo)) ? c.photo : avatarUrl(c.email || "");
+}
+
+/** Validate an uploaded contact photo: image data URL, downscaled client-side, ~400KB cap. */
+function cleanPhoto(v: unknown): string | null {
+  const s = String(v ?? "");
+  if (!s) return "";
+  if (s.length > 550000) return null;
+  return /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(s) ? s : null;
+}
+
 export function contactChannels(c: Contact): Channel[] {
   const out: Channel[] = [];
   if (c.email) out.push("email");
@@ -579,7 +592,7 @@ const server = (Bun as any).serve({
 
       // ----- contacts -----
       if (path === "/api/contacts" && method === "GET") {
-        const withMeta = (c: Contact) => ({ ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarUrl(c.email) });
+        const withMeta = (c: Contact) => ({ ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarFor(c) });
         return json({
           contacts: listActiveContacts().map(withMeta),
           archived: listArchivedContacts().map(withMeta),
@@ -590,6 +603,8 @@ const server = (Bun as any).serve({
         const b = await readBody(req);
         const name = String(b.name || "").trim();
         if (!name) return json({ error: "Give them a name." }, 400);
+        const photo = cleanPhoto(b.photo);
+        if (photo === null) return json({ error: "That photo didn't work — try a JPEG, PNG, WebP or GIF." }, 400);
         const c = createContact({
           name,
           email: String(b.email || "").trim().toLowerCase(),
@@ -598,6 +613,7 @@ const server = (Bun as any).serve({
           matrix_room_id: String(b.matrix_room_id || "").trim(),
           color: String(b.color || "") || pickColor(name),
           notes: String(b.notes || "").trim(),
+          photo: photo || "",
         });
         dmFor(c.id);
         return json({ contact: c }, 201);
@@ -609,7 +625,7 @@ const server = (Bun as any).serve({
           if (method === "GET") {
             const c = getContact(id);
             if (!c) return json({ error: "not found" }, 404);
-            return json({ contact: { ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarUrl(c.email) } });
+            return json({ contact: { ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarFor(c) } });
           }
           if (method === "PATCH") {
             const b = await readBody(req);
@@ -618,6 +634,11 @@ const server = (Bun as any).serve({
               if (k in b) patch[k] = String(b[k] ?? "").trim();
             }
             if ("archived" in b) patch.archived = b.archived === true || b.archived === 1 || b.archived === "1" ? 1 : 0;
+            if ("photo" in b) {
+              const photo = cleanPhoto(b.photo);
+              if (photo === null) return json({ error: "That photo didn't work — try a JPEG, PNG, WebP or GIF." }, 400);
+              patch.photo = photo;
+            }
             if (patch.email) patch.email = patch.email.toLowerCase();
             if (patch.name !== undefined && !patch.name) return json({ error: "Give them a name." }, 400);
             const cur = getContact(id);
@@ -646,7 +667,7 @@ const server = (Bun as any).serve({
             avatar_color: c.is_group ? "#8e8e93" : members[0]?.color || "#8e8e93",
             member_count: c.member_count, last_body: c.last_body || "", last_at: c.last_at || c.created_at,
             last_channel: c.last_channel || "", last_direction: c.last_direction || "", unread: c.unread,
-            members: members.map((x) => ({ id: x.id, name: x.name, color: x.color, avatar_url: avatarUrl(x.email) })),
+            members: members.map((x) => ({ id: x.id, name: x.name, color: x.color, avatar_url: avatarFor(x) })),
             hidden: !c.is_group && members.length > 0 && members.every((x) => x.archived === 1),
           };
         }).filter((c) => !c.hidden).map(({ hidden, ...c }) => c);
@@ -671,7 +692,7 @@ const server = (Bun as any).serve({
               conversation: {
                 ...conv, is_group: !!conv.is_group,
                 title: conv.is_group ? conv.name : members[0]?.name || "Conversation",
-                members: members.map((x) => ({ ...x, channels: contactChannels(x), avatar_url: avatarUrl(x.email) })),
+                members: members.map((x) => ({ ...x, channels: contactChannels(x), avatar_url: avatarFor(x) })),
                 channels: conversationChannels(conv, members),
                 hints: channelHints(conv, members),
               },

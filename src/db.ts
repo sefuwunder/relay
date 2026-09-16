@@ -17,6 +17,7 @@ export interface Contact {
   matrix_room_id: string;
   color: string;
   notes: string;
+  photo: string; // custom avatar data URL; falls back to Gravatar when empty
   archived: number;
   created_at: string;
 }
@@ -99,6 +100,10 @@ export function openDb(path: string): Database {
   if (!cols.some((c) => c.name === "archived")) {
     db.exec("ALTER TABLE contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
   }
+  // Migration: custom contact photo (older DBs lack the column).
+  if (!cols.some((c) => c.name === "photo")) {
+    db.exec("ALTER TABLE contacts ADD COLUMN photo TEXT NOT NULL DEFAULT ''");
+  }
   return db;
 }
 
@@ -141,10 +146,10 @@ export function countActiveContacts(): number {
 
 export function createContact(c: Omit<Contact, "id" | "created_at" | "archived"> & { archived?: number }): Contact {
   if (countActiveContacts() >= MAX_PEOPLE) throw new Error(`Relay keeps things small — ${MAX_PEOPLE} contacts maximum.`);
-  const row: Contact = { ...c, archived: c.archived ? 1 : 0, id: uid(), created_at: now() };
+  const row: Contact = { photo: "", ...c, archived: c.archived ? 1 : 0, id: uid(), created_at: now() };
   db.query(
-    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.archived, row.created_at);
+    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, photo, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.photo, row.archived, row.created_at);
   return row;
 }
 
@@ -154,8 +159,8 @@ export function updateContact(id: string, patch: Partial<Omit<Contact, "id" | "c
   const next = { ...cur, ...patch };
   if ("archived" in patch) next.archived = patch.archived ? 1 : 0;
   db.query(
-    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ?, archived = ? WHERE id = ?"
-  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, next.archived, id);
+    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ?, photo = ?, archived = ? WHERE id = ?"
+  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, next.photo, next.archived, id);
   return next;
 }
 

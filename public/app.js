@@ -50,7 +50,8 @@ function toast(msg, isErr) {
 }
 
 function initials(name) {
-  return name.trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
+  // Array.from: emoji are surrogate pairs — w[0] would slice one in half and render tofu.
+  return name.trim().split(/\s+/).slice(0, 2).map((w) => Array.from(w)[0]).join("").toUpperCase() || "?";
 }
 
 function avatarHtml(name, color, size, group, url) {
@@ -387,6 +388,7 @@ function openImportSheet() {
   document.body.appendChild(scrim);
   const close = () => scrim.remove();
   scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+
   const body = $("#imp-body", scrim);
   const setTab = (t) => {
     $$("#imp-tabs button", scrim).forEach((b) => b.classList.toggle("on", b.dataset.tab === t));
@@ -712,13 +714,25 @@ function renderPersonDetail(id) {
 // ---------- contact sheet (new/edit) ----------
 
 function openContactSheet(existing) {
-  const c = existing || { name: "", email: "", gv_number: "", matrix_id: "", matrix_room_id: "", notes: "" };
+  const c = existing || { name: "", email: "", gv_number: "", matrix_id: "", matrix_room_id: "", notes: "", photo: "", color: "#8e8e93" };
+  let photoData = c.photo || "";
   const scrim = document.createElement("div");
   scrim.className = "sheet-scrim";
   scrim.innerHTML = `
     <div class="sheet" role="dialog" aria-modal="true">
       <div class="grabber"></div>
       <h3>${existing ? "Edit person" : "Add person"}</h3>
+      <div class="photo-row">
+        <div id="f-photo-preview">${avatarHtml(c.name || "?", c.color || "#8e8e93", 72, false, photoData || null)}</div>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn secondary small" id="pick-photo" type="button">Choose photo</button>
+            <button class="btn secondary small" id="clear-photo" type="button">Remove</button>
+          </div>
+          <div class="hint">A custom photo replaces the Gravatar image everywhere.</div>
+        </div>
+        <input type="file" id="f-photo-file" accept="image/*" style="display:none">
+      </div>
       <div class="field"><label>Name</label><input class="text-input" id="f-name" value="${esc(c.name)}" placeholder="Ada Lovelace" maxlength="60"></div>
       <div class="field"><label>Email</label><input class="text-input" id="f-email" value="${esc(c.email)}" placeholder="ada@example.com" inputmode="email"></div>
       <div class="field"><label>Google Voice number</label><input class="text-input" id="f-gv" value="${esc(c.gv_number)}" placeholder="5551234567" inputmode="tel">
@@ -735,6 +749,34 @@ function openContactSheet(existing) {
   document.body.appendChild(scrim);
   const close = () => scrim.remove();
   scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+
+  const refreshPreview = () => {
+    $("#f-photo-preview", scrim).innerHTML = avatarHtml($("#f-name", scrim).value || "?", c.color || "#8e8e93", 72, false, photoData || null);
+  };
+  $("#f-name", scrim).addEventListener("input", refreshPreview);
+  $("#pick-photo", scrim).addEventListener("click", () => $("#f-photo-file", scrim).click());
+  $("#clear-photo", scrim).addEventListener("click", () => { photoData = ""; refreshPreview(); });
+  $("#f-photo-file", scrim).addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    if (!/^image\//.test(f.type || "")) { toast("Pick an image file.", true); return; }
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const S = 256, scale = Math.min(1, S / Math.max(img.width, img.height));
+        const cv = document.createElement("canvas");
+        cv.width = Math.max(1, Math.round(img.width * scale));
+        cv.height = Math.max(1, Math.round(img.height * scale));
+        cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+        photoData = cv.toDataURL("image/jpeg", 0.82);
+        refreshPreview();
+      } catch { toast("Couldn't read that image.", true); }
+      URL.revokeObjectURL(img.src);
+    };
+    img.onerror = () => toast("Couldn't read that image.", true);
+    img.src = URL.createObjectURL(f);
+    e.target.value = "";
+  });
 
   $("#pick-room", scrim).addEventListener("click", async () => {
     try {
@@ -756,6 +798,7 @@ function openContactSheet(existing) {
       matrix_id: $("#f-mxid", scrim).value.trim(),
       matrix_room_id: $("#f-room", scrim).value.trim(),
       notes: $("#f-notes", scrim).value.trim(),
+      photo: photoData,
     };
     if (!vals.name) { toast("Give them a name.", true); return; }
     try {

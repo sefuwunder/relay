@@ -118,6 +118,8 @@ body {
 .text-input:focus, .text-area:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(10,132,255,0.18); }
 .text-area { min-height: 76px; resize: vertical; }
 .hint { font-size: 13px; color: var(--label-3); margin: 6px 4px 0; line-height: 1.4; }
+.photo-row { display: flex; align-items: center; gap: 14px; margin: 4px 0 14px; }
+.photo-row .hint { margin-top: 8px; }
 
 .toast {
   background: rgba(28, 28, 30, 0.92); color: #fff; font-size: 15px; font-weight: 500;
