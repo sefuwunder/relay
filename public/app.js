@@ -157,7 +157,7 @@ function renderChats() {
               <div class="top"><span class="name">${esc(c.title)}</span><span class="time">${fmtTime(c.last_at)}</span></div>
               <div class="preview">
                 ${c.last_channel ? chanPill(c.last_channel) : ""}
-                <span style="overflow:hidden;text-overflow:ellipsis">${esc(c.last_body || (c.is_group ? `${c.member_count + 1} people` : "Say hello 👋"))}</span>
+                <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.last_body || (c.is_group ? `${c.member_count + 1} people` : "Say hello 👋"))}</span>
               </div>
             </div>
             ${c.unread ? `<span class="unread-dot">${c.unread}</span>` : ""}

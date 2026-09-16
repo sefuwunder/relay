@@ -189,7 +189,7 @@ body {
 .msg.out { align-self: flex-end; align-items: flex-end; }
 .msg.in { align-self: flex-start; align-items: flex-start; }
 .bubble {
-  padding: 10px 14px; border-radius: 20px; font-size: 16px; line-height: 1.4; word-wrap: break-word; white-space: pre-wrap;
+  padding: 10px 14px; border-radius: 20px; font-size: 16px; line-height: 1.4; overflow-wrap: anywhere; white-space: pre-wrap;
   position: relative; overflow: hidden;
 }
 .msg.out .bubble {

@@ -838,10 +838,10 @@ const server = (Bun as any).serve({
       const filePath = "public" + (path === "/" ? "/index.html" : path);
       const file = (Bun as any).file(filePath);
       if (await file.exists()) {
-        return new Response(file, { headers: { "Content-Type": contentType(filePath) } });
+        return new Response(file, { headers: { "Content-Type": contentType(filePath), "Cache-Control": "no-cache" } });
       }
       if (!path.startsWith("/api/")) {
-        return new Response((Bun as any).file("public/index.html"), { headers: { "Content-Type": "text/html" } });
+        return new Response((Bun as any).file("public/index.html"), { headers: { "Content-Type": "text/html", "Cache-Control": "no-cache" } });
       }
       return json({ error: "not found" }, 404);
     } catch (e) {
