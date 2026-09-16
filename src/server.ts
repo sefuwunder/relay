@@ -7,7 +7,7 @@ import {
   listContacts, listActiveContacts, listArchivedContacts, getContact, createContact, updateContact, deleteContact, countActiveContacts,
   getConversation, conversationMembers, dmFor, createGroup, listConversations, markRead,
   listMessages, insertMessage, hasExternalId, kvGet, kvSet, MAX_PEOPLE,
-  type Contact, type Conversation, type Channel,
+  type Contact, type Conversation, type Channel, type Message,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
 import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, type ImapConfig } from "./imap";
@@ -299,7 +299,7 @@ function gvReplyFor(gvNumber: string): { messageId: string; from: string; subjec
   return null;
 }
 
-async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string, inReplyToMsgId?: string) {
+async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string, inReplyToMsgId?: string, retryOfId?: string) {
   const conv = getConversation(convId);
   if (!conv) throw new Error("Conversation not found.");
   const members = conversationMembers(convId);
@@ -322,7 +322,7 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
       }
     }
     await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo });
-    return insertMessage({ conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", status: "sent" });
+    return recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", status: "sent" });
   }
   if (channel === "sms") {
     // Google Voice only delivers mail sent as a *reply* to its last forward
@@ -358,12 +358,19 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
       }
     }
     await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo });
-    return insertMessage({ conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: "", status: "sent" });
+    return recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: "", status: "sent" });
   }
   // matrix
   const roomId = conv.is_group ? conv.matrix_room_id : members[0].matrix_room_id;
   const eventId = await matrixSend(settings.matrix, roomId, text);
-  return insertMessage({ conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: `matrix:${eventId}`, status: "sent" });
+  return recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: `matrix:${eventId}`, status: "sent" });
+}
+
+// On a retry, flip the original failed row to sent instead of inserting a duplicate.
+function recordSent(retryOfId: string | undefined, rec: Omit<Message, "id" | "created_at" | "message_id">): Message {
+  if (!retryOfId) return insertMessage(rec);
+  getDb().query("UPDATE messages SET channel = ?, direction = 'out', body = ?, subject = ?, external_id = ?, status = 'sent' WHERE id = ?").run(rec.channel, rec.body, rec.subject, rec.external_id, retryOfId);
+  return getDb().query("SELECT * FROM messages WHERE id = ?").get(retryOfId) as Message;
 }
 
 // ---------- polling ----------
@@ -762,6 +769,23 @@ const server = (Bun as any).serve({
         }
       }
       {
+        // Retry a failed outbound message: re-send with its original
+        // channel/body and flip the same row to sent (no duplicate bubble).
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/messages\/([^/]+)\/retry$/);
+        if (m && method === "POST") {
+          const id = decodeURIComponent(m[1]);
+          const mid = decodeURIComponent(m[2]);
+          const row = getDb().query("SELECT * FROM messages WHERE id = ? AND conversation_id = ?").get(mid, id) as Message | undefined;
+          if (!row || row.direction !== "out" || row.status !== "failed") return json({ error: "That message can't be retried." }, 400);
+          try {
+            const msg = await sendConversationMessage(id, row.channel as Channel, row.body, row.subject || "", undefined, row.id);
+            return json({ message: msg || row });
+          } catch (e) {
+            return atErr(e);
+          }
+        }
+      }
+      {
         const m = path.match(/^\/api\/conversations\/([^/]+)\/messages$/);
         if (m) {
           const id = decodeURIComponent(m[1]);
@@ -781,10 +805,17 @@ const server = (Bun as any).serve({
               return json({ message: msg }, 201);
             } catch (e) {
               // Record the failed attempt so nothing silently vanishes.
+              let failedMsg = null;
               try {
-                insertMessage({ conversation_id: id, channel, direction: "out", body: String(b.body || ""), subject: String(b.subject || ""), external_id: "", status: "failed" });
+                failedMsg = insertMessage({ conversation_id: id, channel, direction: "out", body: String(b.body || ""), subject: String(b.subject || ""), external_id: "", status: "failed" });
               } catch { /* noop */ }
-              return atErr(e);
+              const res = atErr(e);
+              if (failedMsg) {
+                // Hand the failed record back so the UI can show it (with Retry) right away.
+                const body = await res.json().catch(() => ({}));
+                return json({ ...body, failed_message: failedMsg }, res.status);
+              }
+              return res;
             }
           }
         }

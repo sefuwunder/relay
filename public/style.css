@@ -249,6 +249,12 @@ body {
 }
 .msg:hover .reply-btn, .reply-btn:focus-visible { opacity: 1; }
 .reply-btn:hover { text-decoration: underline; }
+.retry-btn {
+  background: none; border: none; padding: 0; margin: 0 0 0 6px; cursor: pointer;
+  font: inherit; font-size: 11px; font-weight: 700; color: var(--red);
+}
+.retry-btn:hover { text-decoration: underline; }
+.retry-btn:disabled { cursor: default; opacity: 0.6; text-decoration: none; }
 .reply-bar {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: var(--label-2);

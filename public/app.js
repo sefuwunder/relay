@@ -38,7 +38,11 @@ async function api(path, opts = {}) {
   });
   let body = null;
   try { body = await res.json(); } catch { /* noop */ }
-  if (!res.ok) throw new Error((body && body.error) || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error((body && body.error) || `Request failed (${res.status})`);
+    if (body && body.failed_message) err.failed_message = body.failed_message;
+    throw err;
+  }
   return body;
 }
 
@@ -221,7 +225,7 @@ function renderChatDetail() {
     body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
       <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span></div>
-      <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">↩ Reply</button>` : ""}</div>
+      <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span><button class="retry-btn" data-retry="${m.id}" title="Try sending again">↻ Retry</button>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">↩ Reply</button>` : ""}</div>
     </div>`;
   }
 
@@ -278,6 +282,7 @@ function renderChatDetail() {
     const target = state.messages.find((m) => m.id === b.dataset.reply);
     if (target) { state.replyTo = target; renderChatDetail(); $("#draft")?.focus(); }
   }));
+  $$("#msgs [data-retry]").forEach((b) => b.addEventListener("click", () => retryMsg(b.dataset.retry)));
   const rc = $("#reply-cancel");
   if (rc) rc.addEventListener("click", () => { state.replyTo = null; renderChatDetail(); });
 
@@ -308,12 +313,36 @@ async function sendMsg() {
     state.replyTo = null;
     renderChatDetail();
   } catch (e) {
-    toast(e.message, true);
+    if (e.failed_message) {
+      state.messages.push(e.failed_message);
+      state.replyTo = null;
+      renderChatDetail();
+      toast(e.message, true);
+    } else {
+      toast(e.message, true);
+    }
   } finally {
     state.sending = false;
     const btn = $("#send");
     if (btn) btn.disabled = false;
   }
+}
+
+async function retryMsg(id) {
+  const conv = state.conv;
+  const m = state.messages.find((x) => x.id === id);
+  if (!conv || !m || m.status !== "failed") return;
+  const btn = $(`#msgs [data-retry="${id}"]`);
+  if (btn) { btn.disabled = true; btn.textContent = "Retrying…"; }
+  try {
+    const r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages/" + encodeURIComponent(id) + "/retry", { method: "POST" });
+    const i = state.messages.findIndex((x) => x.id === id);
+    if (i >= 0) state.messages[i] = r.message;
+    toast("Message sent.");
+  } catch (e) {
+    toast(e.message || "Still failing to send.", true);
+  }
+  renderChatDetail();
 }
 
 async function refreshChat() {
