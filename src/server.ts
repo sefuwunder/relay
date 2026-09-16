@@ -619,8 +619,9 @@ const server = (Bun as any).serve({
             member_count: c.member_count, last_body: c.last_body || "", last_at: c.last_at || c.created_at,
             last_channel: c.last_channel || "", last_direction: c.last_direction || "", unread: c.unread,
             members: members.map((x) => ({ id: x.id, name: x.name, color: x.color })),
+            hidden: !c.is_group && members.length > 0 && members.every((x) => x.archived === 1),
           };
-        });
+        }).filter((c) => !c.hidden).map(({ hidden, ...c }) => c);
         return json({ conversations: convs });
       }
       if (path === "/api/conversations" && method === "POST") {
