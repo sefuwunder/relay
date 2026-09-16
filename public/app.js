@@ -53,8 +53,8 @@ function initials(name) {
   return name.trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
 }
 
-function avatarHtml(name, color, size, group) {
-  return `<div class="avatar a${size}${group ? " group" : ""}" style="background:linear-gradient(135deg, ${color}, ${color}cc)">${esc(initials(name))}</div>`;
+function avatarHtml(name, color, size, group, url) {
+  return `<div class="avatar a${size}${group ? " group" : ""}" style="background:linear-gradient(135deg, ${color}, ${color}cc)">${esc(initials(name))}${url ? `<img src="${esc(url)}" alt="" loading="lazy" onerror="this.remove()">` : ""}</div>`;
 }
 
 function chanPill(ch) {
@@ -124,7 +124,7 @@ function renderChats() {
       <div class="scroll">
         ${list.length ? list.map((c) => `
           <button class="chat-row" data-id="${c.id}">
-            ${avatarHtml(c.title, c.avatar_color, 48, c.is_group)}
+            ${avatarHtml(c.title, c.avatar_color, 48, c.is_group, c.is_group ? null : c.members[0]?.avatar_url)}
             <div class="meta">
               <div class="top"><span class="name">${esc(c.title)}</span><span class="time">${fmtTime(c.last_at)}</span></div>
               <div class="preview">
@@ -201,7 +201,7 @@ function renderChatDetail() {
     <div class="view">
       <div class="nav-bar">
         <button class="nav-back" id="back">‹ Chats</button>
-        ${avatarHtml(conv.title, conv.is_group ? "#8e8e93" : (conv.members[0]?.color || "#8e8e93"), 48, conv.is_group)}
+        ${avatarHtml(conv.title, conv.is_group ? "#8e8e93" : (conv.members[0]?.color || "#8e8e93"), 48, conv.is_group, conv.is_group ? null : conv.members[0]?.avatar_url)}
         <div style="flex:1;min-width:0">
           <div class="nav-title small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(conv.title)}</div>
           <div style="font-size:12px;color:var(--label-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(memberNames)}${conv.is_group ? " · " + (conv.members.length + 1) + "/8" : ""}</div>
@@ -311,7 +311,7 @@ function renderPeople() {
       <div class="scroll"><div class="people-grid">
         ${state.contacts.map((c) => `
           <button class="person-card card" data-id="${c.id}">
-            ${avatarHtml(c.name, c.color, 72)}
+            ${avatarHtml(c.name, c.color, 72, false, c.avatar_url)}
             <div class="pname">${esc(c.name)}</div>
             <div class="chan-dots">${["email", "sms", "matrix"].map((ch) =>
               `<span class="chan-dot ${ch}" style="${c.channels.includes(ch) ? "" : "opacity:.18;filter:grayscale(1)"}" title="${CHAN_META[ch].label}"></span>`).join("")}</div>
@@ -327,7 +327,7 @@ function renderPeople() {
       <div class="ios-group card">
         ${state.archivedContacts.map((c) => `
           <button class="ios-row arch-row" data-id="${c.id}">
-            ${avatarHtml(c.name, c.color, 40)}
+            ${avatarHtml(c.name, c.color, 40, false, c.avatar_url)}
             <div class="rlabel"><div class="t1">${esc(c.name)}</div><div class="t2">Archived — tap to restore</div></div>
             <span class="arch-badge">📦</span>
           </button>`).join("")}
@@ -435,7 +435,7 @@ async function openAttachSheet(item, onDone) {
   scrim.innerHTML = `<div class="sheet"><div class="grabber"></div><h3>Add number to\u2026</h3>
     <p class="hint" style="text-align:center;margin:0 0 10px">${esc(item.name || fmtPhone(item.gv_number))} \u00B7 ${esc(fmtPhone(item.gv_number))}</p>
     <div class="ios-group card" style="margin:0;max-height:40vh;overflow-y:auto">
-      ${targets.map((c) => `<button class="attach-row" data-id="${esc(c.id)}">${avatarHtml(c.name, c.color, 40)}<span class="pname" style="font-size:15px">${esc(c.name)}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${esc([c.email, fmtPhone(c.gv_number)].filter(Boolean).join(" \u00B7 ") || "No number yet")}</span></span></button>`).join("") || `<div class="empty"><p>No other contacts yet.</p></div>`}
+      ${targets.map((c) => `<button class="attach-row" data-id="${esc(c.id)}">${avatarHtml(c.name, c.color, 40, false, c.avatar_url)}<span class="pname" style="font-size:15px">${esc(c.name)}<br><span style="font-size:12px;color:var(--label-3);font-weight:400">${esc([c.email, fmtPhone(c.gv_number)].filter(Boolean).join(" \u00B7 ") || "No number yet")}</span></span></button>`).join("") || `<div class="empty"><p>No other contacts yet.</p></div>`}
     </div>
     <button class="btn-quiet" id="attach-cancel">Cancel</button></div>`;
   document.body.appendChild(scrim);
@@ -550,7 +550,7 @@ function renderPersonDetail(id) {
       </div>
       <div class="scroll">
         <div class="profile-hero">
-          ${avatarHtml(c.name, c.color, 72)}
+          ${avatarHtml(c.name, c.color, 72, false, c.avatar_url)}
           <h2>${esc(c.name)}</h2>
           <div class="sub">${c.archived ? "📦 Archived · " : ""}${c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet"}</div>
         </div>
@@ -673,7 +673,7 @@ function renderNewGroup() {
         <div class="ios-group card">
           ${state.contacts.map((c) => `
             <div class="pick-row${picked.has(c.id) ? " on" : ""}" data-id="${c.id}">
-              <span class="check">✓</span>${avatarHtml(c.name, c.color, 48)}<span class="pname">${esc(c.name)}</span>
+              <span class="check">✓</span>${avatarHtml(c.name, c.color, 48, false, c.avatar_url)}<span class="pname">${esc(c.name)}</span>
             </div>`).join("") || `<div class="empty"><p>Add people first.</p></div>`}
         </div>
         <div class="hint" style="padding:0 20px 24px">Only channels every member has set up can be used in the group.</div>

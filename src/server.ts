@@ -16,6 +16,7 @@ import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
   type GoogleSettings,
 } from "./google";
+import { createHash } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3006);
 const DATA_DIR = "./data";
@@ -154,6 +155,13 @@ function atErr(e: unknown): Response {
 
 
 /** Which channels a contact has addresses for (regardless of service config). */
+/** Public avatar for an email address via Gravatar (d=404 so missing ones 404). */
+export function avatarUrl(email: string): string | null {
+  const e = email.trim().toLowerCase();
+  if (!e || !e.includes("@")) return null;
+  return `https://www.gravatar.com/avatar/${createHash("md5").update(e).digest("hex")}?s=128&d=404`;
+}
+
 export function contactChannels(c: Contact): Channel[] {
   const out: Channel[] = [];
   if (c.email) out.push("email");
@@ -551,7 +559,7 @@ const server = (Bun as any).serve({
 
       // ----- contacts -----
       if (path === "/api/contacts" && method === "GET") {
-        const withMeta = (c: Contact) => ({ ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id });
+        const withMeta = (c: Contact) => ({ ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarUrl(c.email) });
         return json({
           contacts: listActiveContacts().map(withMeta),
           archived: listArchivedContacts().map(withMeta),
@@ -581,7 +589,7 @@ const server = (Bun as any).serve({
           if (method === "GET") {
             const c = getContact(id);
             if (!c) return json({ error: "not found" }, 404);
-            return json({ contact: { ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id } });
+            return json({ contact: { ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarUrl(c.email) } });
           }
           if (method === "PATCH") {
             const b = await readBody(req);
@@ -618,7 +626,7 @@ const server = (Bun as any).serve({
             avatar_color: c.is_group ? "#8e8e93" : members[0]?.color || "#8e8e93",
             member_count: c.member_count, last_body: c.last_body || "", last_at: c.last_at || c.created_at,
             last_channel: c.last_channel || "", last_direction: c.last_direction || "", unread: c.unread,
-            members: members.map((x) => ({ id: x.id, name: x.name, color: x.color })),
+            members: members.map((x) => ({ id: x.id, name: x.name, color: x.color, avatar_url: avatarUrl(x.email) })),
             hidden: !c.is_group && members.length > 0 && members.every((x) => x.archived === 1),
           };
         }).filter((c) => !c.hidden).map(({ hidden, ...c }) => c);
@@ -643,7 +651,7 @@ const server = (Bun as any).serve({
               conversation: {
                 ...conv, is_group: !!conv.is_group,
                 title: conv.is_group ? conv.name : members[0]?.name || "Conversation",
-                members: members.map((x) => ({ ...x, channels: contactChannels(x) })),
+                members: members.map((x) => ({ ...x, channels: contactChannels(x), avatar_url: avatarUrl(x.email) })),
                 channels: conversationChannels(conv, members),
                 hints: channelHints(conv, members),
               },
