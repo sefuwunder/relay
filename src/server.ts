@@ -287,7 +287,7 @@ export function channelHints(conv: Conversation, members: Contact[]): Record<Cha
     if (noSms.length) hints.sms = `No Google Voice number for: ${noSms.join(", ")}.`;
   }
   if (!matrixReady()) {
-    hints.matrix = "Add Matrix in Settings to chat over Matrix.";
+    hints.matrix = "Add Matrix in Settings to message over Matrix.";
   } else if (conv.is_group) {
     if (!conv.matrix_room_id) hints.matrix = "Pick a Matrix room for this group in its settings.";
   } else {
@@ -850,7 +850,7 @@ const server = (Bun as any).serve({
         }
       }
 
-      // Pre-populate an empty 1:1 chat with the last email conversation.
+      // Pre-populate an empty 1:1 conversation with the last email conversation.
       {
         const m = path.match(/^\/api\/conversations\/([^/]+)\/seed-email$/);
         if (m && method === "POST") {

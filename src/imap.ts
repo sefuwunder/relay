@@ -479,7 +479,7 @@ export interface EmailContext {
 
 /**
  * Newest email (inbox or sent) involving `email`, used to pre-populate an
- * empty chat with the last email conversation. Read-only: SELECT/EXAMINE and
+ * empty conversation with the last email conversation. Read-only: SELECT/EXAMINE and
  * BODY.PEEK fetches never set \\Seen.
  */
 export async function latestEmailWith(cfg0: ImapConfig, email: string, maxBodyChars = 1500): Promise<EmailContext | null> {

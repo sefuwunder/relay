@@ -1,6 +1,6 @@
 # Relay
 
-A small, glossy, iOS-style messaging app for your inner circle — up to **8 people**, up to **8 per group**. Tap a person, pick a channel, send.
+A small, clean, modern messaging app for your inner circle — up to **8 people**, up to **8 per group**. Tap a person, pick a channel, send. The UI is OS-agnostic glass: calm, inviting, professional.
 
 ## Channels (per contact, per message)
 
@@ -70,7 +70,7 @@ Google tokens are stored in the gitignored `./data/config.json` next to your oth
 | POST | `/api/settings/test` | `{service: smtp\|imap\|matrix}` |
 | GET | `/api/matrix/rooms` | joined rooms for picking DM rooms |
 | GET/POST | `/api/contacts` | max 8 enforced |
-| GET/PATCH/DELETE | `/api/contacts/:id` | delete removes their 1:1 chats |
+| GET/PATCH/DELETE | `/api/contacts/:id` | delete removes their 1:1 conversations |
 | GET/POST | `/api/conversations` | POST creates a group |
 | GET/PATCH/DELETE | `/api/conversations/:id` | detail includes `channels` + `hints` |
 | GET/POST | `/api/conversations/:id/messages` | POST `{channel, body, subject?}` |
