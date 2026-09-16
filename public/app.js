@@ -352,7 +352,7 @@ function openImportSheet() {
     <div class="sheet" role="dialog" aria-modal="true">
       <div class="grabber"></div><h3>Add people</h3>
       <div class="seg" id="imp-tabs" style="margin-bottom:12px">
-        <button data-tab="sent" class="on">\u2709\uFE0F Sent mail</button><button data-tab="sms">\uD83D\uDCAC SMS</button><button data-tab="google">\uD83D\uDD35 Google</button>
+        <button data-tab="sent" class="on">\u2709\uFE0F Sent mail</button><button data-tab="sms">\uD83D\uDCAC SMS</button><button data-tab="google">\uD83D\uDD35 Google</button><button data-tab="vcf">\uD83D\uDCC7 vCard</button>
       </div>
       <div id="imp-body"></div>
     </div>`;
@@ -362,7 +362,7 @@ function openImportSheet() {
   const body = $("#imp-body", scrim);
   const setTab = (t) => {
     $$("#imp-tabs button", scrim).forEach((b) => b.classList.toggle("on", b.dataset.tab === t));
-    if (t === "sent") drawSentTab(body, close); else if (t === "sms") drawSmsTab(body, close); else drawGoogleTab(body, close);
+    if (t === "sent") drawSentTab(body, close); else if (t === "sms") drawSmsTab(body, close); else if (t === "vcf") drawVcfTab(body, close); else drawGoogleTab(body, close);
   };
   $$("#imp-tabs button", scrim).forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
   setTab("sent");
@@ -530,6 +530,93 @@ async function drawGoogleTab(body, close) {
       <div style="margin-top:14px"><button class="btn" id="imp-settings">Open Settings</button></div></div>`;
     $("#imp-settings", body).addEventListener("click", () => { close(); location.hash = "#/settings"; });
   }
+}
+
+// ---------- vCard (.vcf) import ----------
+
+// Unescape vCard text values: \, \; \n and \\.
+function unescapeVcf(s) {
+  return s.replace(/\\([\\,;nN])/g, (_, c) => (c === "n" || c === "N" ? "\n" : c));
+}
+
+// Decode quoted-printable (vCard 2.1 ENCODING=QUOTED-PRINTABLE), UTF-8 aware.
+function qpDecodeVcf(s) {
+  const bytes = [];
+  const clean = s.replace(/=\r?\n/g, "");
+  for (let i = 0; i < clean.length; i++) {
+    if (clean[i] === "=" && /^[0-9A-Fa-f]{2}$/.test(clean.substr(i + 1, 2))) {
+      bytes.push(parseInt(clean.substr(i + 1, 2), 16)); i += 2;
+    } else bytes.push(clean.charCodeAt(i) & 0xff);
+  }
+  try { return new TextDecoder("utf-8").decode(new Uint8Array(bytes)); } catch { return clean; }
+}
+
+/** Parse vCard 2.1/3.0/4.0 text into [{name, email, gv_number, sub}]. Runs on-device. */
+function parseVcf(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const unfolded = [];
+  for (const ln of lines) {
+    if (/^[ \t]/.test(ln) && unfolded.length) unfolded[unfolded.length - 1] += ln.slice(1);
+    else unfolded.push(ln);
+  }
+  const cards = [];
+  let cur = null;
+  for (const ln of unfolded) {
+    const up = ln.toUpperCase();
+    if (up === "BEGIN:VCARD") { cur = { names: [], emails: [], tels: [] }; continue; }
+    if (up === "END:VCARD") { if (cur) cards.push(cur); cur = null; continue; }
+    if (!cur) continue;
+    const m = ln.match(/^([^:;]+)((?:;[^:]*)*):([\s\S]*)$/);
+    if (!m) continue;
+    const key = m[1].toUpperCase(), params = m[2].toUpperCase();
+    let val = m[3];
+    if (/QUOTED-PRINTABLE/.test(params)) val = qpDecodeVcf(val);
+    val = unescapeVcf(val).trim();
+    if (!val) continue;
+    if (key === "FN") cur.names.push({ v: val, pref: /PREF/.test(params) });
+    else if (key === "N") {
+      // N:Family;Given;Middle;Prefix;Suffix
+      const p = val.split(";").map((s) => s.trim());
+      const full = [p[3], p[1], p[2], p[0], p[4]].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+      if (full) cur.names.push({ v: full, pref: /PREF/.test(params) });
+    }
+    else if (key === "EMAIL") cur.emails.push({ v: val.toLowerCase(), pref: /PREF/.test(params) });
+    else if (key === "TEL") cur.tels.push({ v: val, pref: /PREF/.test(params), cell: /CELL|MOBILE/.test(params) });
+  }
+  const pick = (arr) => (arr.find((a) => a.pref) || arr.find((a) => a.cell) || arr[0]);
+  return cards.map((c) => {
+    const name = (pick(c.names) || {}).v || "";
+    const email = (pick(c.emails) || {}).v || "";
+    const tel = (pick(c.tels) || {}).v || "";
+    const label = name || email || tel;
+    if (!label) return null;
+    return { name: label, email, gv_number: tel, sub: [email, tel].filter(Boolean).join(" · ") };
+  }).filter(Boolean);
+}
+
+function drawVcfTab(body, close) {
+  body.innerHTML = `
+    <div class="hint" style="margin-bottom:12px">Pick a <b>.vcf</b> vCard file — from iCloud, a Google Contacts export, or anywhere else. It's parsed on this device; nothing is uploaded.</div>
+    <input type="file" id="vcf-file" accept=".vcf,.vcard,text/vcard" style="display:none">
+    <button class="btn" id="vcf-pick" style="width:100%">\uD83D\uDCC7 Choose vCard file…</button>
+    <div id="vcf-status"></div>`;
+  const input = $("#vcf-file", body);
+  $("#vcf-pick", body).addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    const status = $("#vcf-status", body);
+    try {
+      const items = parseVcf(await f.text());
+      if (!items.length) {
+        status.innerHTML = `<div class="empty"><p>No contacts found in that file.</p></div>`;
+        return;
+      }
+      contactPicker(body, close, items, `Parsed ${items.length} contact${items.length === 1 ? "" : "s"} from ${esc(f.name)} — pick who to add.`);
+    } catch (e) {
+      status.innerHTML = `<div class="empty"><p>Couldn't read that file.</p></div>`;
+    }
+  });
 }
 
 function renderPersonDetail(id) {
