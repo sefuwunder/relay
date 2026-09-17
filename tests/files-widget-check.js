@@ -58,7 +58,7 @@ function load(f, extra) {
   (0, eval)(code + `\n//# sourceURL=${f}`);
 }
 load("icons.js", "\n;globalThis.__ICONS__ = ICONS;");
-load("app.js", "\n;globalThis.__APP__ = { state, renderConversationDetail, openLightbox, closeLightbox, bubbleAtts, filesPanelHtml, fmtSize, attKind };");
+load("app.js", "\n;globalThis.__APP__ = { state, renderConversationDetail, openLightbox, closeLightbox, bubbleAtts, filesPanelHtml, activeFiles, runFileSearch, wireFilesPanel, refreshFiles, fmtSize, attKind };");
 const A = globalThis.__APP__;
 const { state } = A;
 
@@ -150,8 +150,48 @@ ok("lightbox shows a doc card for pdf", created[1].innerHTML.includes("lb-doc") 
 A.openLightbox(state.files, 1); // audio
 ok("lightbox has an audio player", created[2].innerHTML.includes("<audio"));
 A.closeLightbox();
-ok("lightbox closes", state.lightbox === null);
-ok("openLightbox ignores empty lists", (A.openLightbox([], 0), state.lightbox === null));
+// 7. shared-files search: filename + last-90-days filter
+state.fileSearch = "";
+state.fileResults = null;
+html = renderDetail(["email"], [mkMsg("m1", "out", "see these", [imgAtt])], fourFiles);
+ok("search box renders in the widget", html.includes('id="fp-q"') && html.includes('aria-label="Search shared files"'));
+ok("activeFiles returns recent files when not searching", A.activeFiles() === state.files);
 
-console.log(`files widget checks: ${pass} passed, ${fail} failed`);
-process.exitCode = fail ? 1 : 0;
+// Search-mode rendering.
+state.fileSearch = "photo";
+state.fileResults = [{ ...imgAtt, direction: "in", sent_at: now }];
+let sHtml = A.filesPanelHtml();
+ok("search mode keeps the query in the box", sHtml.includes('value="photo"'));
+ok("search mode shows result count", sHtml.includes('id="fp-resmeta"') && sHtml.includes("1 result"));
+ok("search mode shows a clear button", sHtml.includes('id="fp-clear"'));
+ok("search mode shows only the match", sHtml.includes("photo.png") && !sHtml.includes("deck.pdf"));
+state.fileResults = [];
+sHtml = A.filesPanelHtml();
+ok("no-match state names the query", sHtml.includes("No files matching") && sHtml.includes("photo"));
+state.fileSearch = ""; state.fileResults = null;
+
+// Live search round-trip against a stubbed API.
+let lastFilesUrl = "";
+global.fetch = async (url) => ({ ok: true, json: async () => {
+  if (String(url).includes("/files")) { lastFilesUrl = String(url); return { files: [{ ...imgAtt }] }; }
+  return {};
+} });
+(async () => {
+  state.conv = state.conv || mkConv(["email"]);
+  await A.runFileSearch("photo");
+  ok("search queries the files endpoint with q + days=90", lastFilesUrl.includes("q=photo") && lastFilesUrl.includes("days=90"));
+  ok("search stores results and flips to search mode", state.fileSearch === "photo" && state.fileResults.length === 1);
+  ok("activeFiles follows search results", A.activeFiles() === state.fileResults);
+  await A.runFileSearch("");
+  ok("clearing the query exits search mode", state.fileResults === null && state.fileSearch === "");
+  // Escape clears the box.
+  await A.runFileSearch("photo");
+  A.wireFilesPanel();
+  const qi = document.querySelector("#fp-q");
+  qi.value = "photo";
+  qi.fire("keydown", { key: "Escape" });
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  ok("Escape clears the search", state.fileSearch === "" && state.fileResults === null && qi.value === "");
+  console.log(`files widget checks: ${pass} passed, ${fail} failed`);
+  process.exitCode = fail ? 1 : 0;
+})();

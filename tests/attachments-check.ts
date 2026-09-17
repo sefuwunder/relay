@@ -38,6 +38,33 @@ function ok(cond: unknown, label: string) {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// ---------- 1b. attachment search (filename + 90-day window) ----------
+{
+  const dir = mkdtempSync(join(tmpdir(), "relay-attsearch-"));
+  const db = await import("../src/db.ts");
+  db.openDb(join(dir, "relay.db"));
+  const c = db.createContact({ name: "File Friend", email: "friend@example.com", gv_number: "", matrix_id: "", matrix_room_id: "", color: "#0a84ff", notes: "" });
+  const conv = db.dmFor(c.id);
+  const fresh = db.insertMessage({ conversation_id: conv.id, channel: "email", direction: "out", body: "new", subject: "s", external_id: "", status: "sent" });
+  const old = db.insertMessage({ conversation_id: conv.id, channel: "email", direction: "out", body: "old", subject: "s", external_id: "", status: "sent" });
+  // Backdate one message 100 days so it falls outside the default window.
+  db.getDb().query("UPDATE messages SET created_at = datetime('now', '-100 days') WHERE id = ?").run(old.id);
+  const fa = db.insertAttachment({ message_id: fresh.id, filename: "flyer-final.png", mime: "image/png", size: 10 });
+  db.insertAttachment({ message_id: fresh.id, filename: "100%-done.txt", mime: "text/plain", size: 10 });
+  const oa = db.insertAttachment({ message_id: old.id, filename: "flyer-draft.png", mime: "image/png", size: 10 });
+
+  const hit = db.searchConversationAttachments(conv.id, "flyer");
+  ok(hit.length === 1 && hit[0].id === fa.id, "search finds the recent filename match");
+  ok(db.searchConversationAttachments(conv.id, "FLYER").length === 1, "search is case-insensitive");
+  ok(db.searchConversationAttachments(conv.id, "flyer", 120).length === 2, "a wider day window includes the 100-day-old file");
+  ok(db.searchConversationAttachments(conv.id, "flyer", 120).some((x) => x.id === oa.id), "old match carries its attachment id");
+  ok(db.searchConversationAttachments(conv.id, "nope").length === 0, "search with no match is empty");
+  ok(db.searchConversationAttachments(conv.id, "%").length === 1, "LIKE wildcards in the query match literally");
+  ok(db.searchConversationAttachments(conv.id, "flyer", 0).length === 1, "days clamps to at least 1");
+  ok(db.searchConversationAttachments(conv.id, "flyer", 9999).length === 2, "days clamps to at most 365");
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ---------- 2. SMTP MIME with attachments ----------
 {
   const smtp = await import("../src/smtp.ts");
@@ -116,6 +143,18 @@ function ok(cond: unknown, label: string) {
     const fj = await (await fetch(base + `/api/conversations/${convId}/files?limit=30`)).json();
     ok(fj.files && fj.files.length === 2, "files endpoint lists both attachments");
     ok(fj.files.every((f: any) => f.filename), "files endpoint returns filenames");
+
+    // Search: filename filter over the last 90 days.
+    const sj = await (await fetch(base + `/api/conversations/${convId}/files?q=photo`)).json();
+    ok(sj.files.length === 1 && sj.files[0].filename === "photo.png", "files search filters by filename");
+    ok(sj.q === "photo" && sj.days === 90, "files search echoes q and the default 90-day window");
+    const sj2 = await (await fetch(base + `/api/conversations/${convId}/files?q=PHOTO`)).json();
+    ok(sj2.files.length === 1, "files search is case-insensitive");
+    const sj3 = await (await fetch(base + `/api/conversations/${convId}/files?q=zzz-no-match`)).json();
+    ok(sj3.files.length === 0, "files search with no match is empty");
+    const sj4 = await (await fetch(base + `/api/conversations/${convId}/files?q=&limit=30`)).json();
+    ok(sj4.files.length === 2 && !("q" in sj4), "empty q falls back to the plain recent-files list");
+    ok((await fetch(base + `/api/conversations/nope/files?q=x`)).status === 404, "files search on unknown conversation is 404");
 
     // Download round-trip.
     const dl = await fetch(base + `/api/attachments/${fm.attachments[0].id}`);

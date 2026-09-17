@@ -317,6 +317,25 @@ export function listConversationAttachments(convId: string, limit = 30): (Attach
 }
 
 /**
+ * Search a conversation's attachments by filename, scoped to the last
+ * `days` days (default 90). Case-insensitive substring match; LIKE wildcards
+ * in the query are escaped so they match literally.
+ */
+export function searchConversationAttachments(convId: string, q: string, days = 90, limit = 30): (Attachment & { direction: string; sent_at: string })[] {
+  const like = "%" + q.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+  const daysInt = Math.max(1, Math.min(365, Math.floor(Number(days) || 90)));
+  return db.query(`
+    SELECT a.*, m.direction AS direction, m.created_at AS sent_at
+    FROM attachments a JOIN messages m ON m.id = a.message_id
+    WHERE m.conversation_id = ?
+      AND a.filename LIKE ? ESCAPE '\\'
+      AND m.created_at >= datetime('now', '-' || ? || ' days')
+    ORDER BY m.created_at DESC, a.created_at DESC
+    LIMIT ?
+  `).all(convId, like, daysInt, limit) as (Attachment & { direction: string; sent_at: string })[];
+}
+
+/**
  * Delete every message in a conversation (plus members + the conversation row).
  * Returns the attachment ids removed, so the caller can delete their files.
  */

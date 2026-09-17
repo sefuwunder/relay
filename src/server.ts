@@ -7,7 +7,7 @@ import {
   listContacts, listActiveContacts, listArchivedContacts, getContact, createContact, updateContact, deleteContact, countActiveContacts,
   getConversation, conversationMembers, dmFor, createGroup, listConversations, markRead,
   listMessages, insertMessage, hasExternalId, kvGet, kvSet, MAX_PEOPLE,
-  insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, deleteConversationData,
+  insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, searchConversationAttachments, deleteConversationData,
   type Contact, type Conversation, type Channel, type Message, type Attachment,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig, type MailAttachment } from "./smtp";
@@ -1016,6 +1016,11 @@ const server = (Bun as any).serve({
           const id = decodeURIComponent(m[1]);
           if (!getConversation(id)) return json({ error: "not found" }, 404);
           const limit = Math.min(Number(url.searchParams.get("limit") || 30), 100);
+          const q = (url.searchParams.get("q") || "").trim().slice(0, 80);
+          if (q) {
+            const days = Math.max(1, Math.min(365, Number(url.searchParams.get("days")) || 90));
+            return json({ files: searchConversationAttachments(id, q, days, limit), q, days });
+          }
           return json({ files: listConversationAttachments(id, limit) });
         }
       }

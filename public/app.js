@@ -32,6 +32,8 @@ const state = {
   files: [],           // recently shared files in the open conversation
   pendingFiles: [],    // File objects staged in the composer
   filesOpen: false,    // shared-files drawer (narrow screens)
+  fileSearch: "",      // shared-files widget search query (last 90 days)
+  fileResults: null,   // search matches; null = browsing recent files
   lightbox: null,      // { files, index } when the preview overlay is open
   dropDraft: false,    // set before re-rendering after a successful send
   notify: (() => { try { return localStorage.getItem("relay_notify") === "1"; } catch { return false; } })(),
@@ -377,6 +379,8 @@ async function loadConversation(id) {
   state.replyTo = null;
   state.pendingFiles = [];
   state.filesOpen = false;
+  state.fileSearch = "";
+  state.fileResults = null;
   try {
     const f = await api("/api/conversations/" + encodeURIComponent(id) + "/files?limit=30");
     state.files = f.files || [];
@@ -404,25 +408,98 @@ function selectedChannel() {
   return conv.channels[0];
 }
 
+/** Files currently shown in the widget: search matches, or recent files. */
+function activeFiles() { return state.fileResults || state.files; }
+
+/** Refresh the widget list, honoring an active search. */
+async function refreshFiles() {
+  if (!state.conv) return;
+  try {
+    if (state.fileSearch) {
+      const f = await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/files?limit=30&days=90&q=" + encodeURIComponent(state.fileSearch));
+      state.fileResults = f.files || [];
+    } else {
+      const f = await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/files?limit=30");
+      state.files = f.files || [];
+      state.fileResults = null;
+    }
+  } catch { /* widget keeps its old list */ }
+}
+
 /** Shared-files widget: sidebar on wide screens, slide-over drawer on narrow. */
 function filesPanelHtml() {
-  const files = state.files;
+  const searching = state.fileResults !== null;
+  const files = activeFiles();
+  const q = state.fileSearch;
+  const tiles = files.map((f, i) => {
+    const kind = attKind(f.mime);
+    const prev = kind === "image"
+      ? `<span class="ft-prev"><img src="${attachUrl(f.id)}" alt="" loading="lazy"></span>`
+      : `<span class="ft-prev ft-ic ft-${kind}">${icon(attIconName(kind))}</span>`;
+    return `<button class="file-tile" data-ftile="${i}" title="${esc(f.filename || "file")}">
+      ${prev}
+      <span class="ft-name">${esc(f.filename || "file")}</span>
+      <span class="ft-meta">${esc(fmtSize(f.size))}${f.sent_at ? " · " + esc(fmtTime(f.sent_at)) : ""}</span>
+    </button>`;
+  }).join("");
+  const body = files.length ? `<div class="fp-grid" id="fp-body">${tiles}</div>`
+    : searching ? `<div class="fp-empty" id="fp-body">${icon("files", "big")}<p>No files matching &ldquo;${esc(q)}&rdquo;<br>in the last 90 days.</p></div>`
+    : `<div class="fp-empty" id="fp-body">${icon("files", "big")}<p>No files shared yet.<br>Attach one from the Email channel.</p></div>`;
   return `
     <aside class="files-panel" id="files-panel" aria-label="Shared files">
       <div class="fp-head">${icon("files")}<span class="fp-title">Shared files</span>${files.length ? `<span class="fp-count">${files.length}</span>` : ""}<button class="fp-close" id="fp-close" aria-label="Close shared files">${icon("close")}</button></div>
-      ${files.length ? `<div class="fp-grid">${files.map((f, i) => {
-        const kind = attKind(f.mime);
-        const prev = kind === "image"
-          ? `<span class="ft-prev"><img src="${attachUrl(f.id)}" alt="" loading="lazy"></span>`
-          : `<span class="ft-prev ft-ic ft-${kind}">${icon(attIconName(kind))}</span>`;
-        return `<button class="file-tile" data-ftile="${i}" title="${esc(f.filename || "file")}">
-          ${prev}
-          <span class="ft-name">${esc(f.filename || "file")}</span>
-          <span class="ft-meta">${esc(fmtSize(f.size))}${f.sent_at ? " · " + esc(fmtTime(f.sent_at)) : ""}</span>
-        </button>`;
-      }).join("")}</div>`
-      : `<div class="fp-empty">${icon("files", "big")}<p>No files shared yet.<br>Attach one from the Email channel.</p></div>`}
+      <div class="fp-search">
+        <input id="fp-q" type="search" placeholder="Search files&hellip;" value="${esc(q)}" autocomplete="off" aria-label="Search shared files">
+        ${searching ? `<button class="fp-x" id="fp-clear" aria-label="Clear search" title="Clear search">${icon("close")}</button>` : ""}
+      </div>
+      ${searching ? `<div class="fp-resmeta" id="fp-resmeta">${files.length ? `${files.length} result${files.length === 1 ? "" : "s"}` : "No matches"} for &ldquo;${esc(q)}&rdquo; &middot; last 90 days</div>` : ""}
+      ${body}
     </aside>`;
+}
+
+/** Re-render just the widget body + meta after a search, keeping input focus. */
+function renderFileResults() {
+  const panel = $("#files-panel");
+  if (!panel || !state.conv) return;
+  panel.outerHTML = filesPanelHtml();
+  wireFilesPanel();
+  const q = $("#fp-q");
+  if (q) { q.focus(); const n = q.value.length; try { q.setSelectionRange(n, n); } catch { /* noop */ } }
+}
+
+let fileSearchTimer = 0;
+async function runFileSearch(q) {
+  state.fileSearch = q;
+  if (!q) { state.fileResults = null; }
+  else {
+    try {
+      const f = await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/files?limit=30&days=90&q=" + encodeURIComponent(q));
+      // Ignore stale responses if the user kept typing or switched conversations.
+      if (state.fileSearch === q && state.conv) state.fileResults = f.files || [];
+      else return;
+    } catch { state.fileResults = []; }
+  }
+  renderFileResults();
+}
+
+/** Wire the widget's toggle, tiles, and search box. Safe to call after a panel re-render. */
+function wireFilesPanel() {
+  $$("#files-panel [data-ftile]").forEach((t) => t.addEventListener("click", () => openLightbox(activeFiles(), Number(t.dataset.ftile))));
+  const qi = $("#fp-q");
+  if (qi) {
+    qi.addEventListener("input", () => {
+      clearTimeout(fileSearchTimer);
+      fileSearchTimer = setTimeout(() => runFileSearch(qi.value.trim()), 250);
+    });
+    qi.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { qi.value = ""; runFileSearch(""); }
+      else if (e.key === "Enter") { clearTimeout(fileSearchTimer); runFileSearch(qi.value.trim()); }
+    });
+    // Native search-field clear (e.g. keyboard gesture) exits search mode too.
+    qi.addEventListener("search", () => { if (!qi.value) runFileSearch(""); });
+  }
+  const clr = $("#fp-clear");
+  if (clr) clr.addEventListener("click", () => runFileSearch(""));
 }
 
 function renderConversationDetail() {
@@ -498,11 +575,11 @@ function renderConversationDetail() {
   $("#files-toggle").addEventListener("click", () => { state.filesOpen = !state.filesOpen; renderConversationDetail(); });
   const fpc = $("#fp-close");
   if (fpc) fpc.addEventListener("click", () => { state.filesOpen = false; renderConversationDetail(); });
-  $$("#files-panel [data-ftile]").forEach((t) => t.addEventListener("click", () => openLightbox(state.files, Number(t.dataset.ftile))));
+  wireFilesPanel();
   $$("#msgs [data-att]").forEach((b) => b.addEventListener("click", () => {
     const id = b.dataset.att;
-    const i = state.files.findIndex((f) => String(f.id) === String(id));
-    if (i >= 0) openLightbox(state.files, i);
+    const i = activeFiles().findIndex((f) => String(f.id) === String(id));
+    if (i >= 0) openLightbox(activeFiles(), i);
     else {
       const m = state.messages.flatMap((x) => x.attachments || []).find((a) => String(a.id) === String(id));
       if (m) openLightbox([{ id: m.id, filename: m.filename, mime: m.mime, size: m.size }], 0);
@@ -600,10 +677,7 @@ async function sendMsg() {
     state.replyTo = null;
     state.pendingFiles = [];
     state.dropDraft = true; // the send consumed the draft — don't restore it
-    try {
-      const f = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/files?limit=30");
-      state.files = f.files || [];
-    } catch { /* files widget keeps its old list */ }
+    await refreshFiles();
     renderConversationDetail();
   } catch (e) {
     if (e.failed_message) {
@@ -611,10 +685,7 @@ async function sendMsg() {
       state.replyTo = null;
       state.pendingFiles = [];
       state.dropDraft = true;
-      try {
-        const f = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/files?limit=30");
-        state.files = f.files || [];
-      } catch { /* noop */ }
+      await refreshFiles();
       renderConversationDetail();
       toast(e.message, true);
     } else {
@@ -652,10 +723,7 @@ async function refreshConversation() {
     const before = state.messages.length;
     state.messages = m.messages || [];
     if (state.messages.length !== before) {
-      try {
-        const f = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/files?limit=30");
-        state.files = f.files || [];
-      } catch { /* files widget keeps its old list */ }
+      await refreshFiles();
       const sc = $("#msgs");
       const nearBottom = sc && (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120);
       renderConversationDetail();

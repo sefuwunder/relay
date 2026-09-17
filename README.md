@@ -20,6 +20,7 @@ The 📎 paperclip in the composer appears on the Email channel. Pick up to **10
 
 - Images get inline thumbnails, video and audio get inline players, everything else becomes a download chip — both in the thread and in the **Shared files** widget.
 - The widget lives in the conversation header (badge shows the count): on wide screens (≥1100px) it docks as a permanent right-hand panel; on smaller screens it opens as a slide-over drawer. Tiles show a preview, name, size, and time; tapping one opens a full preview lightbox (image / video / audio / document) with prev/next, download, and keyboard navigation (←/→/Esc).
+- A **search box** at the top of the widget searches the conversation's attachments by filename over the **last 90 days** (case-insensitive, debounced, newest-first; Esc or ✕ clears). `GET /api/conversations/:id/files` accepts `q` and `days` (1–365, default 90) to drive it.
 - Files go out as real MIME attachments on the email (`multipart/mixed`, base64). SMS and Matrix reject attachments with a clear error for now.
 - Failed sends keep their files, so **Retry** re-sends the original attachments. Deleting a conversation removes its files from disk too.
 
