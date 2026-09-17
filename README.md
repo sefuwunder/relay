@@ -14,6 +14,19 @@ Opening an empty 1:1 chat pre-populates its first message from the last email co
 
 A channel only appears when the service is configured in Settings **and** every participant has that channel's address. Hints explain what's missing.
 
+## File attachments (Email channel)
+
+The 📎 paperclip in the composer appears on the Email channel. Pick up to **10 files** per message, **25 MB** each:
+
+- Images get inline thumbnails, video and audio get inline players, everything else becomes a download chip — both in the thread and in the **Shared files** widget.
+- The widget lives in the conversation header (badge shows the count): on wide screens (≥1100px) it docks as a permanent right-hand panel; on smaller screens it opens as a slide-over drawer. Tiles show a preview, name, size, and time; tapping one opens a full preview lightbox (image / video / audio / document) with prev/next, download, and keyboard navigation (←/→/Esc).
+- Files go out as real MIME attachments on the email (`multipart/mixed`, base64). SMS and Matrix reject attachments with a clear error for now.
+- Failed sends keep their files, so **Retry** re-sends the original attachments. Deleting a conversation removes its files from disk too.
+
+## Wide-screen reflow
+
+Stretch the window and the UI opens up: at ≥1100px the conversation view gains the persistent Shared files panel while the thread uses the rest; at ≥1400px the People grid goes six-wide. Everything stays glass, and animations still respect `prefers-reduced-motion`.
+
 ## Quick start
 
 ```bash
@@ -73,7 +86,10 @@ Google tokens are stored in the gitignored `./data/config.json` next to your oth
 | GET/PATCH/DELETE | `/api/contacts/:id` | delete removes their 1:1 conversations |
 | GET/POST | `/api/conversations` | POST creates a group |
 | GET/PATCH/DELETE | `/api/conversations/:id` | detail includes `channels` + `hints` |
-| GET/POST | `/api/conversations/:id/messages` | POST `{channel, body, subject?}` |
+| GET/POST | `/api/conversations/:id/messages` | POST `{channel, body, subject?}`; multipart `files[]` for attachments (email only) |
+| POST | `/api/conversations/:id/messages/:mid/retry` | re-sends a failed message with its stored attachments |
+| GET | `/api/conversations/:id/files` | recently shared files (newest first) for the widget |
+| GET | `/api/attachments/:id` | download / inline preview of one file |
 | POST | `/api/conversations/:id/read` | clears unread |
 | POST | `/api/poll` | poll mail + Matrix now |
 

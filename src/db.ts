@@ -22,6 +22,8 @@ export interface Contact {
   created_at: string;
 }
 
+export const MAX_PEOPLE = 8;
+
 export interface Conversation {
   id: string;
   name: string;
@@ -45,7 +47,14 @@ export interface Message {
   created_at: string;
 }
 
-export const MAX_PEOPLE = 8;
+export interface Attachment {
+  id: string;
+  message_id: string;
+  filename: string;
+  mime: string;
+  size: number;
+  created_at: string;
+}
 
 let db: Database;
 
@@ -93,6 +102,15 @@ export function openDb(path: string): Database {
     );
     CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_ext ON messages(external_id);
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL,
+      filename TEXT NOT NULL DEFAULT '',
+      mime TEXT NOT NULL DEFAULT '',
+      size INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_attachments_msg ON attachments(message_id);
     CREATE TABLE IF NOT EXISTS kv (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL DEFAULT ''
@@ -172,19 +190,20 @@ export function updateContact(id: string, patch: Partial<Omit<Contact, "id" | "c
   return next;
 }
 
-export function deleteContact(id: string): void {
+export function deleteContact(id: string): string[] {
   // Delete 1:1 conversations with this contact; remove them from groups.
+  // Returns attachment ids removed, so the caller can delete their files.
+  const removed: string[] = [];
   const convs = db.query("SELECT c.id, c.is_group FROM conversations c JOIN members m ON m.conversation_id = c.id WHERE m.contact_id = ?").all(id) as { id: string; is_group: number }[];
   for (const c of convs) {
     if (c.is_group) {
       db.query("DELETE FROM members WHERE conversation_id = ? AND contact_id = ?").run(c.id, id);
     } else {
-      db.query("DELETE FROM messages WHERE conversation_id = ?").run(c.id);
-      db.query("DELETE FROM members WHERE conversation_id = ?").run(c.id);
-      db.query("DELETE FROM conversations WHERE id = ?").run(c.id);
+      removed.push(...deleteConversationData(c.id));
     }
   }
   db.query("DELETE FROM contacts WHERE id = ?").run(id);
+  return removed;
 }
 
 // ---------- conversations ----------
@@ -262,6 +281,55 @@ export function insertMessage(m: Omit<Message, "id" | "created_at" | "message_id
 
 export function hasExternalId(externalId: string): boolean {
   return !!(db.query("SELECT 1 FROM messages WHERE external_id = ? LIMIT 1").get(externalId) as any);
+}
+
+// ---------- attachments ----------
+
+/** File bytes live on disk under <data>/attachments/<id>; this is the metadata. */
+export function insertAttachment(a: { message_id: string; filename: string; mime: string; size: number }): Attachment {
+  const row: Attachment = { ...a, id: uid(), created_at: now() };
+  db.query(
+    "INSERT INTO attachments (id, message_id, filename, mime, size, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(row.id, row.message_id, row.filename, row.mime, row.size, row.created_at);
+  return row;
+}
+
+export function getAttachment(id: string): Attachment | null {
+  return (db.query("SELECT * FROM attachments WHERE id = ?").get(id) as Attachment) || null;
+}
+
+/** All attachments for a set of message ids, in one query. */
+export function listAttachmentsForMessages(messageIds: string[]): Attachment[] {
+  if (!messageIds.length) return [];
+  const placeholders = messageIds.map(() => "?").join(",");
+  return db.query(`SELECT * FROM attachments WHERE message_id IN (${placeholders}) ORDER BY created_at, rowid`).all(...messageIds) as Attachment[];
+}
+
+/** Newest files shared in a conversation, for the shared-files widget. */
+export function listConversationAttachments(convId: string, limit = 30): (Attachment & { direction: string; sent_at: string })[] {
+  return db.query(`
+    SELECT a.*, m.direction AS direction, m.created_at AS sent_at
+    FROM attachments a JOIN messages m ON m.id = a.message_id
+    WHERE m.conversation_id = ?
+    ORDER BY m.created_at DESC, a.created_at DESC
+    LIMIT ?
+  `).all(convId, limit) as (Attachment & { direction: string; sent_at: string })[];
+}
+
+/**
+ * Delete every message in a conversation (plus members + the conversation row).
+ * Returns the attachment ids removed, so the caller can delete their files.
+ */
+export function deleteConversationData(convId: string): string[] {
+  const atts = db.query(
+    "SELECT a.id AS id FROM attachments a JOIN messages m ON m.id = a.message_id WHERE m.conversation_id = ?"
+  ).all(convId) as { id: string }[];
+  const ids = atts.map((a) => a.id);
+  db.query("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)").run(convId);
+  db.query("DELETE FROM messages WHERE conversation_id = ?").run(convId);
+  db.query("DELETE FROM members WHERE conversation_id = ?").run(convId);
+  db.query("DELETE FROM conversations WHERE id = ?").run(convId);
+  return ids;
 }
 
 // ---------- kv ----------

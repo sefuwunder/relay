@@ -7,9 +7,10 @@ import {
   listContacts, listActiveContacts, listArchivedContacts, getContact, createContact, updateContact, deleteContact, countActiveContacts,
   getConversation, conversationMembers, dmFor, createGroup, listConversations, markRead,
   listMessages, insertMessage, hasExternalId, kvGet, kvSet, MAX_PEOPLE,
-  type Contact, type Conversation, type Channel, type Message,
+  insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, deleteConversationData,
+  type Contact, type Conversation, type Channel, type Message, type Attachment,
 } from "./db";
-import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig } from "./smtp";
+import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig, type MailAttachment } from "./smtp";
 import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
@@ -20,6 +21,92 @@ import { createHash } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3006);
 const DATA_DIR = "./data";
+const ATTACH_DIR = `${DATA_DIR}/attachments`;
+
+/** File attachments: metadata in SQLite, bytes on disk under ./data/attachments/<id>. */
+function attachmentPath(id: string): string {
+  return `${ATTACH_DIR}/${id}`;
+}
+
+async function saveMessageAttachments(messageId: string, files: MailAttachment[]): Promise<Attachment[]> {
+  const saved: Attachment[] = [];
+  await (Bun as any).write(ATTACH_DIR + "/.keep", ""); // ensure the dir exists
+  try {
+    for (const f of files) {
+      const row = insertAttachment({
+        message_id: messageId,
+        filename: (f.filename || "file").slice(0, 120),
+        mime: (f.mime || "application/octet-stream").slice(0, 120),
+        size: f.data.length,
+      });
+      await (Bun as any).write(attachmentPath(row.id), f.data);
+      saved.push(row);
+    }
+  } catch (e) {
+    // Roll back this batch so a half-written set never leaves orphan rows
+    // (or rows pointing at missing bytes) behind.
+    for (const row of saved) {
+      try { getDb().query("DELETE FROM attachments WHERE id = ?").run(row.id); } catch { /* noop */ }
+    }
+    await removeAttachmentFiles(saved.map((r) => r.id));
+    throw e;
+  }
+  return saved;
+}
+
+async function removeAttachmentFiles(ids: string[]): Promise<void> {
+  const { unlink } = await import("node:fs/promises");
+  for (const id of ids) {
+    try { await unlink(attachmentPath(id)); } catch { /* already gone */ }
+  }
+}
+
+// Attachment upload limits.
+const MAX_FILES_PER_MESSAGE = 10;
+const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25 MB per file
+
+/** Embed each message's file metadata (no bytes) for the UI. */
+function withAttachments<T extends Message>(msgs: T[]): (T & { attachments: Attachment[] })[] {
+  const all = listAttachmentsForMessages(msgs.map((m) => m.id));
+  const byMsg = new Map<string, Attachment[]>();
+  for (const a of all) {
+    const list = byMsg.get(a.message_id) || [];
+    list.push(a);
+    byMsg.set(a.message_id, list);
+  }
+  return msgs.map((m) => ({ ...m, attachments: byMsg.get(m.id) || [] }));
+}
+
+/** Sanitize an uploaded filename for storage + MIME headers. */
+function cleanUploadName(name: string): string {
+  const base = (name || "file").split(/[\\/]/).pop() || "file";
+  return base.replace(/[\r\n"]/g, "").slice(0, 120) || "file";
+}
+
+/** Parse a message POST body: JSON as before, or multipart/form-data with files. */
+async function readMessageBody(req: Request): Promise<{ fields: any; files: MailAttachment[] }> {
+  const ct = req.headers.get("content-type") || "";
+  if (ct.includes("multipart/form-data")) {
+    const form = await req.formData();
+    const fields: any = {};
+    const files: MailAttachment[] = [];
+    for (const [key, value] of form.entries()) {
+      if (typeof value === "string") {
+        fields[key] = value;
+      } else if (value && typeof (value as any).arrayBuffer === "function") {
+        const file = value as unknown as { name: string; type: string; size: number; arrayBuffer(): Promise<ArrayBuffer> };
+        const data = Buffer.from(await file.arrayBuffer());
+        if (data.length > MAX_FILE_BYTES) {
+          throw new Error(`"${cleanUploadName(file.name)}" is too big — 25 MB max per file.`);
+        }
+        files.push({ filename: cleanUploadName(file.name), mime: file.type || "application/octet-stream", data });
+      }
+    }
+    if (files.length > MAX_FILES_PER_MESSAGE) throw new Error(`At most ${MAX_FILES_PER_MESSAGE} files per message.`);
+    return { fields, files };
+  }
+  return { fields: await readBody(req), files: [] };
+}
 
 interface Settings {
   smtp: SmtpConfig;
@@ -320,14 +407,17 @@ function gvReplyFor(gvNumber: string): { messageId: string; from: string; subjec
   return null;
 }
 
-async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string, inReplyToMsgId?: string, retryOfId?: string) {
+async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string, inReplyToMsgId?: string, retryOfId?: string, attachments: MailAttachment[] = []) {
   const conv = getConversation(convId);
   if (!conv) throw new Error("Conversation not found.");
   const members = conversationMembers(convId);
   const text = body.trim();
-  if (!text) throw new Error("Write a message first.");
+  if (!text && !attachments.length) throw new Error("Write a message first.");
   const ok = conversationChannels(conv, members);
   if (!ok.includes(channel)) throw new Error(`That channel isn't available here right now.`);
+  if (attachments.length && channel !== "email") {
+    throw new Error("Files can only be sent by email for now.");
+  }
 
   if (channel === "email") {
     const to = members.map((m) => m.email);
@@ -342,8 +432,20 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
         subj = "Re: " + String(orig.subject || subj).replace(/^Re:\s*/i, "");
       }
     }
-    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo });
-    return recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", status: "sent" });
+    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo, attachments });
+    const sent = recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", status: "sent" });
+    if (attachments.length && !retryOfId) {
+      // Persist file rows now that the send succeeded. (On failure the
+      // caller persists them against the failed row so Retry still has them.)
+      // If persistence itself fails after a good send, don't report failure —
+      // the mail went out with the files; only the local copy is lost.
+      try {
+        await saveMessageAttachments(sent.id, attachments);
+      } catch (e) {
+        console.log(`warning: sent message ${sent.id} but could not store its attachments: ${(e as Error).message}`);
+      }
+    }
+    return sent;
   }
   if (channel === "sms") {
     // Google Voice only delivers mail sent as a *reply* to its last forward
@@ -728,7 +830,8 @@ const server = (Bun as any).serve({
             return json({ contact: c });
           }
           if (method === "DELETE") {
-            deleteContact(id);
+            const removed = deleteContact(id);
+            await removeAttachmentFiles(removed);
             return json({ ok: true });
           }
         }
@@ -783,9 +886,8 @@ const server = (Bun as any).serve({
             return json({ conversation: conv });
           }
           if (method === "DELETE") {
-            getDb().query("DELETE FROM messages WHERE conversation_id = ?").run(id);
-            getDb().query("DELETE FROM members WHERE conversation_id = ?").run(id);
-            getDb().query("DELETE FROM conversations WHERE id = ?").run(id);
+            const removed = deleteConversationData(id);
+            await removeAttachmentFiles(removed);
             return json({ ok: true });
           }
         }
@@ -800,8 +902,15 @@ const server = (Bun as any).serve({
           const row = getDb().query("SELECT * FROM messages WHERE id = ? AND conversation_id = ?").get(mid, id) as Message | undefined;
           if (!row || row.direction !== "out" || row.status !== "failed") return json({ error: "That message can't be retried." }, 400);
           try {
-            const msg = await sendConversationMessage(id, row.channel as Channel, row.body, row.subject || "", undefined, row.id);
-            return json({ message: msg || row });
+            // Re-attach the failed message's stored files so they go out again.
+            const stored = listAttachmentsForMessages([row.id]);
+            const files: MailAttachment[] = [];
+            for (const a of stored) {
+              const data = Buffer.from(await (Bun as any).file(attachmentPath(a.id)).arrayBuffer());
+              if (data.length) files.push({ filename: a.filename, mime: a.mime, data });
+            }
+            const msg = await sendConversationMessage(id, row.channel as Channel, row.body, row.subject || "", undefined, row.id, files);
+            return json({ message: { ...msg, attachments: stored } });
           } catch (e) {
             return atErr(e);
           }
@@ -816,26 +925,37 @@ const server = (Bun as any).serve({
             const limit = Math.min(Number(url.searchParams.get("limit") || 100), 200);
             const before = url.searchParams.get("before") || undefined;
             const msgs = listMessages(id, limit, before).reverse();
-            return json({ messages: msgs });
+            return json({ messages: withAttachments(msgs) });
           }
           if (method === "POST") {
-            const b = await readBody(req);
+            let fields: any;
+            let files: MailAttachment[];
+            try {
+              ({ fields, files } = await readMessageBody(req));
+            } catch (e) {
+              return json({ error: errMsg(e) }, 400);
+            }
+            const b = fields;
             const channel = b.channel as Channel;
             if (!["email", "sms", "matrix"].includes(channel)) return json({ error: "Pick a channel." }, 400);
+            if (files.length && channel !== "email") {
+              return json({ error: "Files can only be sent by email for now — switch to the Email channel to attach them." }, 400);
+            }
             try {
-              const msg = await sendConversationMessage(id, channel, String(b.body || ""), String(b.subject || ""), typeof b.in_reply_to === "string" ? b.in_reply_to : undefined);
-              return json({ message: msg }, 201);
+              const msg = await sendConversationMessage(id, channel, String(b.body || ""), String(b.subject || ""), typeof b.in_reply_to === "string" ? b.in_reply_to : undefined, undefined, files);
+              return json({ message: withAttachments([msg])[0] }, 201);
             } catch (e) {
               // Record the failed attempt so nothing silently vanishes.
               let failedMsg = null;
               try {
                 failedMsg = insertMessage({ conversation_id: id, channel, direction: "out", body: String(b.body || ""), subject: String(b.subject || ""), external_id: "", status: "failed" });
+                if (files.length) await saveMessageAttachments(failedMsg.id, files);
               } catch { /* noop */ }
               const res = atErr(e);
               if (failedMsg) {
                 // Hand the failed record back so the UI can show it (with Retry) right away.
                 const body = await res.json().catch(() => ({}));
-                return json({ ...body, failed_message: failedMsg }, res.status);
+                return json({ ...body, failed_message: withAttachments([failedMsg])[0] }, res.status);
               }
               return res;
             }
@@ -885,6 +1005,40 @@ const server = (Bun as any).serve({
       if (path === "/api/poll" && method === "POST") {
         await Promise.all([pollMail(), pollMatrixOnce()]);
         return json({ ok: true, lastPoll });
+      }
+
+      // ----- shared files -----
+
+      // Recently shared files in a conversation, newest first — feeds the widget.
+      {
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/files$/);
+        if (m && method === "GET") {
+          const id = decodeURIComponent(m[1]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          const limit = Math.min(Number(url.searchParams.get("limit") || 30), 100);
+          return json({ files: listConversationAttachments(id, limit) });
+        }
+      }
+
+      // Download / preview a single attachment. The id comes from the DB row,
+      // so there is no path traversal: bytes are read from ./data/attachments/<id>.
+      {
+        const m = path.match(/^\/api\/attachments\/([^/]+)$/);
+        if (m && method === "GET") {
+          const att = getAttachment(decodeURIComponent(m[1]));
+          if (!att) return json({ error: "not found" }, 404);
+          const file = (Bun as any).file(attachmentPath(att.id));
+          if (!(await file.exists())) return json({ error: "file missing" }, 404);
+          const safeName = att.filename.replace(/[\r\n"]/g, "");
+          return new Response(file, {
+            headers: {
+              "Content-Type": att.mime || "application/octet-stream",
+              "Content-Length": String(att.size),
+              "Content-Disposition": `inline; filename="${safeName}"`,
+              "Cache-Control": "private, max-age=86400",
+            },
+          });
+        }
       }
 
       // ----- static -----

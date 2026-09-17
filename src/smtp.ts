@@ -122,6 +122,13 @@ class SmtpConn {
   }
 }
 
+export interface MailAttachment {
+  filename: string;
+  mime: string;
+  /** Raw file bytes. */
+  data: Buffer;
+}
+
 export interface SendMailOpts {
   to: string[];
   subject: string;
@@ -129,13 +136,25 @@ export interface SendMailOpts {
   /** Message-ID to thread under (In-Reply-To + References). Used for SMS:
       Google Voice only delivers mail sent as a reply to its last forward. */
   inReplyTo?: string;
+  /** Files to attach. Only honored on the email channel — SMS/Matrix sends
+      never receive attachments. */
+  attachments?: MailAttachment[];
 }
 
 function dotStuff(text: string): string {
   return text.split("\n").map((l) => (l.startsWith(".") ? "." + l : l)).join("\r\n");
 }
 
-function buildMessage(cfg: SmtpConfig, opts: SendMailOpts): string {
+/** Strip anything that could break a MIME header line. */
+function cleanFilename(name: string): string {
+  return (name || "file").replace(/[\r\n"]/g, "").slice(0, 120) || "file";
+}
+
+function b64Chunked(buf: Buffer): string {
+  return buf.toString("base64").replace(/.{76}/g, "$&\r\n");
+}
+
+export function buildMessage(cfg: SmtpConfig, opts: SendMailOpts): string {
   const fromName = cfg.fromName ? `"${cfg.fromName.replace(/"/g, "")}" ` : "";
   const headers = [
     `From: ${fromName}<${cfg.from}>`,
@@ -143,14 +162,34 @@ function buildMessage(cfg: SmtpConfig, opts: SendMailOpts): string {
     `Subject: ${opts.subject.replace(/[\r\n]/g, " ")}`,
     `Date: ${new Date().toUTCString()}`,
     "MIME-Version: 1.0",
-    'Content-Type: text/plain; charset="utf-8"',
-    "Content-Transfer-Encoding: 8bit",
     "X-Mailer: Relay",
   ];
   if (opts.inReplyTo) {
     headers.push(`In-Reply-To: ${opts.inReplyTo}`, `References: ${opts.inReplyTo}`);
   }
-  return headers.join("\r\n") + "\r\n\r\n" + dotStuff(opts.text.replace(/\r?\n/g, "\n"));
+  const attachments = (opts.attachments || []).filter((a) => a.data && a.data.length > 0);
+  if (!attachments.length) {
+    headers.push('Content-Type: text/plain; charset="utf-8"', "Content-Transfer-Encoding: 8bit");
+    return headers.join("\r\n") + "\r\n\r\n" + dotStuff(opts.text.replace(/\r?\n/g, "\n"));
+  }
+  const boundary = `relay-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+  const parts = [
+    `--${boundary}\r\nContent-Type: text/plain; charset="utf-8"\r\nContent-Transfer-Encoding: 8bit\r\n\r\n` +
+      dotStuff(opts.text.replace(/\r?\n/g, "\n")),
+  ];
+  for (const a of attachments) {
+    const filename = cleanFilename(a.filename);
+    const mime = (a.mime || "application/octet-stream").replace(/[\r\n;]/g, "");
+    parts.push(
+      `--${boundary}\r\n` +
+        `Content-Type: ${mime}; name="${filename}"\r\n` +
+        "Content-Transfer-Encoding: base64\r\n" +
+        `Content-Disposition: attachment; filename="${filename}"\r\n\r\n` +
+        b64Chunked(a.data)
+    );
+  }
+  return headers.join("\r\n") + "\r\n\r\n" + parts.join("\r\n") + `\r\n--${boundary}--\r\n`;
 }
 
 export async function sendMail(cfg0: SmtpConfig, opts: SendMailOpts): Promise<{ ok: true }> {

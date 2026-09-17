@@ -87,6 +87,31 @@ const ICONS = {
     '<line x1="12" y1="18.5" x2="12" y2="22"/><line x1="7.4" y1="16.6" x2="5" y2="19"/>' +
     '<line x1="5.5" y1="12" x2="2" y2="12"/><line x1="7.4" y1="7.4" x2="5" y2="5"/></g>' +
     '<circle cx="12" cy="12" r="3.6" class="a"/>',
+  paperclip:
+    '<path d="M9 12.6l6.8-6.8a2.6 2.6 0 0 1 3.7 3.7l-8.3 8.3a4.6 4.6 0 0 1-6.5-6.5l7.2-7.2a6.6 6.6 0 0 1 9.3 9.3l-7.7 7.7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>',
+  files:
+    '<rect x="7" y="7" width="13" height="13" rx="3" fill="currentColor"/>' +
+    '<rect x="9.5" y="10" width="8" height="2" rx="1" class="w" opacity=".8"/>' +
+    '<rect x="9.5" y="13.4" width="5.5" height="2" rx="1" class="w" opacity=".55"/>' +
+    '<path d="M7 8.5V6a2 2 0 0 1 2-2h8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>',
+  file:
+    '<path d="M6 3h8l4 4v14H6z" fill="currentColor"/>' +
+    '<path d="M14 3v4h4" fill="none" class="w" stroke-width="2" stroke-linejoin="round" opacity=".7"/>',
+  image:
+    '<rect x="3" y="5" width="18" height="14" rx="2.5" fill="currentColor"/>' +
+    '<circle cx="9" cy="10" r="1.8" class="w"/>' +
+    '<path d="M5 17.5l4.5-4.5 3 3 2.5-2.5 4 4z" class="w"/>',
+  video:
+    '<rect x="2.5" y="6" width="19" height="12" rx="3" fill="currentColor"/>' +
+    '<path d="M10.5 9.8v4.4L14.8 12z" class="w"/>',
+  audio:
+    '<g stroke="currentColor" stroke-width="2.6" stroke-linecap="round">' +
+    '<line x1="5" y1="10" x2="5" y2="14"/><line x1="9.5" y1="7" x2="9.5" y2="17"/>' +
+    '<line x1="14" y1="10.5" x2="14" y2="13.5"/><line x1="18.5" y1="8" x2="18.5" y2="16"/></g>',
+  chevL:
+    '<path d="M14.5 5L8 12l6.5 7" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>',
+  chevR:
+    '<path d="M9.5 5L16 12l-6.5 7" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>',
 };
 
 /** Inline SVG icon. `size` is an extra class (e.g. "big"). Decorative: hidden from AT. */

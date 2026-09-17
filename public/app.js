@@ -29,13 +29,19 @@ const state = {
   sending: false,
   replyTo: null,       // message being replied to in-thread (email)
   timer: null,
+  files: [],           // recently shared files in the open conversation
+  pendingFiles: [],    // File objects staged in the composer
+  filesOpen: false,    // shared-files drawer (narrow screens)
+  lightbox: null,      // { files, index } when the preview overlay is open
+  dropDraft: false,    // set before re-rendering after a successful send
   notify: (() => { try { return localStorage.getItem("relay_notify") === "1"; } catch { return false; } })(),
 };
 
 async function api(path, opts = {}) {
+  const isForm = typeof FormData !== "undefined" && opts.body instanceof FormData;
   const res = await fetch(path, {
     ...opts,
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+    headers: { ...(isForm ? {} : { "Content-Type": "application/json" }), ...(opts.headers || {}) },
   });
   let body = null;
   try { body = await res.json(); } catch { /* noop */ }
@@ -95,6 +101,116 @@ function chanPill(ch) {
   if (!m) return "";
   return `<span class="chan-pill ${ch}">${icon(m.ic)}${m.label}</span>`;
 }
+
+// ---------- shared files ----------
+
+function fmtSize(n) {
+  n = Number(n || 0);
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+function attKind(mime) {
+  mime = String(mime || "");
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return "file";
+}
+
+function attIconName(kind) {
+  return kind === "image" ? "image" : kind === "video" ? "video" : kind === "audio" ? "audio" : "file";
+}
+
+function attachUrl(id) {
+  return "/api/attachments/" + encodeURIComponent(id);
+}
+
+/** Attachment chips inside a message bubble. Images get an inline thumbnail
+    that opens the lightbox; video/audio get small players; the rest are
+    download chips. */
+function bubbleAtts(m) {
+  const atts = m.attachments || [];
+  if (!atts.length) return "";
+  return `<div class="att-list">${atts.map((a) => {
+    const kind = attKind(a.mime);
+    const url = attachUrl(a.id);
+    const label = esc(a.filename || "file");
+    if (kind === "image") {
+      return `<button class="att att-img" data-att="${esc(a.id)}" title="${label}"><img src="${url}" alt="${label}" loading="lazy"></button>`;
+    }
+    if (kind === "video") {
+      return `<video class="att att-vid" src="${url}" controls preload="metadata" playsinline></video>`;
+    }
+    if (kind === "audio") {
+      return `<audio class="att att-aud" src="${url}" controls preload="metadata"></audio>`;
+    }
+    return `<a class="att att-file" href="${url}" target="_blank" rel="noopener" title="${label} — ${esc(fmtSize(a.size))}">${icon(attIconName(kind))}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></a>`;
+  }).join("")}</div>`;
+}
+
+/** Open the preview lightbox over a file list at the given index. */
+function openLightbox(files, index) {
+  if (!files || !files.length) return;
+  state.lightbox = { files, index: Math.max(0, Math.min(index, files.length - 1)) };
+  renderLightbox();
+}
+
+function closeLightbox() {
+  state.lightbox = null;
+  const lb = $("#lightbox");
+  if (lb) lb.remove();
+}
+
+function renderLightbox() {
+  const lb0 = $("#lightbox");
+  if (lb0) lb0.remove();
+  const L = state.lightbox;
+  if (!L) return;
+  const f = L.files[L.index];
+  const kind = attKind(f.mime);
+  const url = attachUrl(f.id);
+  let stage = "";
+  if (kind === "image") {
+    stage = `<img class="lb-img" src="${url}" alt="${esc(f.filename || "file")}">`;
+  } else if (kind === "video") {
+    stage = `<video class="lb-vid" src="${url}" controls preload="metadata" playsinline></video>`;
+  } else if (kind === "audio") {
+    stage = `<div class="lb-audio-wrap">${icon("audio", "big")}<audio class="lb-aud" src="${url}" controls preload="metadata"></audio></div>`;
+  } else {
+    stage = `<div class="lb-doc">${icon(attIconName(kind), "big")}<div class="lb-doc-name">${esc(f.filename || "file")}</div><div class="lb-doc-size">${esc(fmtSize(f.size))}</div></div>`;
+  }
+  const wrap = document.createElement("div");
+  wrap.id = "lightbox";
+  wrap.innerHTML = `
+    <div class="lb-scrim" id="lb-scrim"></div>
+    <div class="lb-box" role="dialog" aria-modal="true" aria-label="${esc(f.filename || "file")}">
+      <button class="lb-close" id="lb-close" aria-label="Close preview">${icon("close")}</button>
+      ${L.files.length > 1 ? `<button class="lb-nav lb-prev" id="lb-prev" aria-label="Previous file">${icon("chevL")}</button>
+      <button class="lb-nav lb-next" id="lb-next" aria-label="Next file">${icon("chevR")}</button>` : ""}
+      <div class="lb-stage">${stage}</div>
+      <div class="lb-cap">
+        <div class="lb-cap-name">${esc(f.filename || "file")}</div>
+        <div class="lb-cap-meta">${esc(fmtSize(f.size))}${f.sent_at ? " · " + esc(fmtTime(f.sent_at)) : ""}</div>
+        <a class="lb-dl" href="${url}" target="_blank" rel="noopener" download="${esc(f.filename || "file")}">${icon("tray")}Download</a>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  $("#lb-close").addEventListener("click", closeLightbox);
+  $("#lb-scrim").addEventListener("click", closeLightbox);
+  const prev = $("#lb-prev"), next = $("#lb-next");
+  if (prev) prev.addEventListener("click", (e) => { e.stopPropagation(); state.lightbox.index = (L.index - 1 + L.files.length) % L.files.length; renderLightbox(); });
+  if (next) next.addEventListener("click", (e) => { e.stopPropagation(); state.lightbox.index = (L.index + 1) % L.files.length; renderLightbox(); });
+}
+
+document.addEventListener("keydown", (e) => {
+  const L = state.lightbox;
+  if (!L) return;
+  if (e.key === "Escape") closeLightbox();
+  else if (e.key === "ArrowLeft" && L.files.length > 1) { state.lightbox.index = (L.index - 1 + L.files.length) % L.files.length; renderLightbox(); }
+  else if (e.key === "ArrowRight" && L.files.length > 1) { state.lightbox.index = (L.index + 1) % L.files.length; renderLightbox(); }
+});
 
 function fmtTime(iso) {
   if (!iso) return "";
@@ -259,6 +375,12 @@ async function loadConversation(id) {
   const m = await api("/api/conversations/" + encodeURIComponent(id) + "/messages?limit=100");
   state.messages = m.messages || [];
   state.replyTo = null;
+  state.pendingFiles = [];
+  state.filesOpen = false;
+  try {
+    const f = await api("/api/conversations/" + encodeURIComponent(id) + "/files?limit=30");
+    state.files = f.files || [];
+  } catch { state.files = []; }
   if (!state.messages.length && state.conv && !state.conv.is_group) {
     // Empty conversation: pre-populate the first message from the last email exchange.
     api("/api/conversations/" + encodeURIComponent(id) + "/seed-email", { method: "POST" })
@@ -282,9 +404,33 @@ function selectedChannel() {
   return conv.channels[0];
 }
 
+/** Shared-files widget: sidebar on wide screens, slide-over drawer on narrow. */
+function filesPanelHtml() {
+  const files = state.files;
+  return `
+    <aside class="files-panel" id="files-panel" aria-label="Shared files">
+      <div class="fp-head">${icon("files")}<span class="fp-title">Shared files</span>${files.length ? `<span class="fp-count">${files.length}</span>` : ""}<button class="fp-close" id="fp-close" aria-label="Close shared files">${icon("close")}</button></div>
+      ${files.length ? `<div class="fp-grid">${files.map((f, i) => {
+        const kind = attKind(f.mime);
+        const prev = kind === "image"
+          ? `<span class="ft-prev"><img src="${attachUrl(f.id)}" alt="" loading="lazy"></span>`
+          : `<span class="ft-prev ft-ic ft-${kind}">${icon(attIconName(kind))}</span>`;
+        return `<button class="file-tile" data-ftile="${i}" title="${esc(f.filename || "file")}">
+          ${prev}
+          <span class="ft-name">${esc(f.filename || "file")}</span>
+          <span class="ft-meta">${esc(fmtSize(f.size))}${f.sent_at ? " · " + esc(fmtTime(f.sent_at)) : ""}</span>
+        </button>`;
+      }).join("")}</div>`
+      : `<div class="fp-empty">${icon("files", "big")}<p>No files shared yet.<br>Attach one from the Email channel.</p></div>`}
+    </aside>`;
+}
+
 function renderConversationDetail() {
   const conv = state.conv;
   if (!conv) { location.hash = "#/conversations"; return; }
+  // Preserve the in-progress draft across re-renders (file picks, refreshes).
+  const keepDraft = $("#draft") ? $("#draft").value : "";
+  const keepSubj = $("#subject") ? $("#subject").value : "";
   const ch = selectedChannel();
   const memberNames = conv.members.map((m) => m.name).join(", ");
   const app = $("#app");
@@ -298,39 +444,49 @@ function renderConversationDetail() {
     const canReply = m.channel === "email" && !out && m.message_id;
     body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
-      <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span></div>
+      <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span>${bubbleAtts(m)}</div>
       <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span><button class="retry-btn" data-retry="${m.id}" title="Try sending again">${icon("retry")}Retry</button>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">${icon("reply")}Reply</button>` : ""}</div>
     </div>`;
   }
 
   const hints = Object.entries(conv.hints || {}).filter(([, v]) => v).map(([, v]) => esc(v));
+  const pending = state.pendingFiles;
 
   app.innerHTML = `
-    <div class="view">
-      <div class="nav-bar">
-        <button class="nav-back" id="back">${icon("back")}Conversations</button>
-        ${avatarHtml(conv.title, conv.is_group ? "#8e8e93" : (conv.members[0]?.color || "#8e8e93"), 48, conv.is_group, conv.is_group ? null : conv.members[0]?.avatar_url)}
-        <div style="flex:1;min-width:0">
-          <div class="nav-title small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(conv.title)}</div>
-          <div style="font-size:12px;color:var(--label-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(memberNames)}${conv.is_group ? " · " + (conv.members.length + 1) + "/8" : ""}</div>
+    <div class="view conv-view">
+      <div class="conv-layout${state.filesOpen ? " files-open" : ""}">
+        <div class="conv-main">
+          <div class="nav-bar">
+            <button class="nav-back" id="back">${icon("back")}Conversations</button>
+            ${avatarHtml(conv.title, conv.is_group ? "#8e8e93" : (conv.members[0]?.color || "#8e8e93"), 48, conv.is_group, conv.is_group ? null : conv.members[0]?.avatar_url)}
+            <div style="flex:1;min-width:0">
+              <div class="nav-title small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(conv.title)}</div>
+              <div style="font-size:12px;color:var(--label-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(memberNames)}${conv.is_group ? " · " + (conv.members.length + 1) + "/8" : ""}</div>
+            </div>
+            <button class="nav-action files-toggle" id="files-toggle" aria-label="Shared files" title="Shared files">${icon("files")}${state.files.length ? `<span class="ft-badge">${state.files.length}</span>` : ""}</button>
+            ${conv.is_group ? `<button class="nav-action" id="grp-edit">Edit</button>` : ""}
+          </div>
+          <div class="msg-scroll" id="msgs">${body || `<div class="empty">${icon("send", "big")}<h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
+          <div class="chan-bar">
+            ${conv.channels.length ? `
+              <div class="seg" id="seg">${conv.channels.map((c) =>
+                `<button data-ch="${c}" class="${c === ch ? "on" : ""}">${icon(CHAN_META[c].ic)}${CHAN_META[c].label}</button>`).join("")}</div>
+              ${hints.length ? `<div class="chan-hint">${hints.join(" ")}</div>` : ""}`
+            : `<div class="chan-hint">No channels available yet. ${hints.join(" ") || "Add contact details in the People tab."}</div>`}
+          </div>
+          <div class="composer">
+              ${state.replyTo ? `<div class="reply-bar"><span>${icon("reply")}Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply" aria-label="Cancel reply">${icon("close")}</button></div>` : ""}
+            <div class="grow">
+              ${pending.length ? `<div class="pending-files" id="pending">${pending.map((f, i) => `
+                <span class="pchip">${icon(attIconName(attKind(f.type)))}<span class="pchip-name">${esc(f.name)}</span><span class="pchip-size">${esc(fmtSize(f.size))}</span><button class="pchip-x" data-pchip="${i}" aria-label="Remove ${esc(f.name)}">${icon("close")}</button></span>`).join("")}</div>` : ""}
+              <div class="subject-line${ch === "email" && !state.replyTo ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
+              <textarea id="draft" rows="1" placeholder="Message ${ch ? CHAN_META[ch].label : ""}…"></textarea>
+            </div>
+            ${ch === "email" ? `<button class="attach-btn" id="attach" aria-label="Attach files" title="Attach files (25 MB max each)">${icon("paperclip")}</button><input type="file" id="filepick" multiple hidden>` : ""}
+            <button class="send-btn" id="send" aria-label="Send" ${ch ? "" : "disabled"}>${icon("send")}</button>
+          </div>
         </div>
-        ${conv.is_group ? `<button class="nav-action" id="grp-edit">Edit</button>` : ""}
-      </div>
-      <div class="msg-scroll" id="msgs">${body || `<div class="empty">${icon("send", "big")}<h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
-      <div class="chan-bar">
-        ${conv.channels.length ? `
-          <div class="seg" id="seg">${conv.channels.map((c) =>
-            `<button data-ch="${c}" class="${c === ch ? "on" : ""}">${icon(CHAN_META[c].ic)}${CHAN_META[c].label}</button>`).join("")}</div>
-          ${hints.length ? `<div class="chan-hint">${hints.join(" ")}</div>` : ""}`
-        : `<div class="chan-hint">No channels available yet. ${hints.join(" ") || "Add contact details in the People tab."}</div>`}
-      </div>
-      <div class="composer">
-          ${state.replyTo ? `<div class="reply-bar"><span>${icon("reply")}Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply" aria-label="Cancel reply">${icon("close")}</button></div>` : ""}
-        <div class="grow">
-          <div class="subject-line${ch === "email" && !state.replyTo ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
-          <textarea id="draft" rows="1" placeholder="Message ${ch ? CHAN_META[ch].label : ""}…"></textarea>
-        </div>
-        <button class="send-btn" id="send" aria-label="Send" ${ch ? "" : "disabled"}>${icon("send")}</button>
+        ${filesPanelHtml()}
       </div>
     </div>`;
 
@@ -338,10 +494,48 @@ function renderConversationDetail() {
   const ge = $("#grp-edit");
   if (ge) ge.addEventListener("click", () => openGroupSheet(conv));
 
+  // Shared-files widget: toggle + tiles + bubble thumbnails.
+  $("#files-toggle").addEventListener("click", () => { state.filesOpen = !state.filesOpen; renderConversationDetail(); });
+  const fpc = $("#fp-close");
+  if (fpc) fpc.addEventListener("click", () => { state.filesOpen = false; renderConversationDetail(); });
+  $$("#files-panel [data-ftile]").forEach((t) => t.addEventListener("click", () => openLightbox(state.files, Number(t.dataset.ftile))));
+  $$("#msgs [data-att]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.att;
+    const i = state.files.findIndex((f) => String(f.id) === String(id));
+    if (i >= 0) openLightbox(state.files, i);
+    else {
+      const m = state.messages.flatMap((x) => x.attachments || []).find((a) => String(a.id) === String(id));
+      if (m) openLightbox([{ id: m.id, filename: m.filename, mime: m.mime, size: m.size }], 0);
+    }
+  }));
+
   $$("#seg button").forEach((b) => b.addEventListener("click", () => {
     state.chanSel[conv.id] = b.dataset.ch;
     localStorage.setItem("relay_chan_" + conv.id, b.dataset.ch);
     state.replyTo = null; // replies only thread on email
+    renderConversationDetail();
+    $("#draft").focus();
+  }));
+
+  // Attachments (email channel only).
+  const attachBtn = $("#attach");
+  const filepick = $("#filepick");
+  if (attachBtn && filepick) {
+    attachBtn.addEventListener("click", () => filepick.click());
+    filepick.addEventListener("change", () => {
+      const picked = Array.from(filepick.files || []);
+      for (const f of picked) {
+        if (state.pendingFiles.length >= 10) { toast("At most 10 files per message.", true); break; }
+        if (f.size > 25 * 1024 * 1024) { toast(`"${f.name}" is too big — 25 MB max per file.`, true); continue; }
+        state.pendingFiles.push(f);
+      }
+      filepick.value = "";
+      renderConversationDetail();
+      $("#draft").focus();
+    });
+  }
+  $$("#pending [data-pchip]").forEach((b) => b.addEventListener("click", () => {
+    state.pendingFiles.splice(Number(b.dataset.pchip), 1);
     renderConversationDetail();
     $("#draft").focus();
   }));
@@ -360,10 +554,16 @@ function renderConversationDetail() {
   const rc = $("#reply-cancel");
   if (rc) rc.addEventListener("click", () => { state.replyTo = null; renderConversationDetail(); });
 
+  // Restore the in-progress draft (unless the send just cleared it).
+  if (!state.dropDraft) {
+    if (keepDraft) { draft.value = keepDraft; draft.style.height = "auto"; draft.style.height = Math.min(draft.scrollHeight, 120) + "px"; }
+    if (keepSubj && $("#subject")) $("#subject").value = keepSubj;
+  }
+  state.dropDraft = false;
+
   const sc = $("#msgs");
   sc.scrollTop = sc.scrollHeight;
 }
-
 function senderName(m) {
   // Best-effort: match inbound message to a member via external hints is unreliable;
   // show the conversation title for DMs, generic for groups handled by caller.
@@ -375,21 +575,46 @@ async function sendMsg() {
   const ch = selectedChannel();
   if (!conv || !ch || state.sending) return;
   const body = $("#draft").value;
-  if (!body.trim()) return;
+  const files = state.pendingFiles.slice();
+  if (!body.trim() && !files.length) return;
+  if (files.length && ch !== "email") { toast("Files can only be sent by email — switch channels or remove them.", true); return; }
   state.sending = true;
   $("#send").disabled = true;
   try {
-    const r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages", {
-      method: "POST",
-      body: JSON.stringify({ channel: ch, body, subject: ch === "email" ? ($("#subject")?.value || "") : "", in_reply_to: state.replyTo ? state.replyTo.id : undefined }),
-    });
+    let r;
+    if (files.length) {
+      const form = new FormData();
+      form.set("channel", ch);
+      form.set("body", body);
+      form.set("subject", ch === "email" ? ($("#subject")?.value || "") : "");
+      if (state.replyTo) form.set("in_reply_to", state.replyTo.id);
+      for (const f of files) form.append("files", f, f.name);
+      r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages", { method: "POST", body: form });
+    } else {
+      r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages", {
+        method: "POST",
+        body: JSON.stringify({ channel: ch, body, subject: ch === "email" ? ($("#subject")?.value || "") : "", in_reply_to: state.replyTo ? state.replyTo.id : undefined }),
+      });
+    }
     state.messages.push(r.message);
     state.replyTo = null;
+    state.pendingFiles = [];
+    state.dropDraft = true; // the send consumed the draft — don't restore it
+    try {
+      const f = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/files?limit=30");
+      state.files = f.files || [];
+    } catch { /* files widget keeps its old list */ }
     renderConversationDetail();
   } catch (e) {
     if (e.failed_message) {
       state.messages.push(e.failed_message);
       state.replyTo = null;
+      state.pendingFiles = [];
+      state.dropDraft = true;
+      try {
+        const f = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/files?limit=30");
+        state.files = f.files || [];
+      } catch { /* noop */ }
       renderConversationDetail();
       toast(e.message, true);
     } else {
@@ -427,6 +652,10 @@ async function refreshConversation() {
     const before = state.messages.length;
     state.messages = m.messages || [];
     if (state.messages.length !== before) {
+      try {
+        const f = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/files?limit=30");
+        state.files = f.files || [];
+      } catch { /* files widget keeps its old list */ }
       const sc = $("#msgs");
       const nearBottom = sc && (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120);
       renderConversationDetail();
