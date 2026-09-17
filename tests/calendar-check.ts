@@ -66,6 +66,28 @@ function ok(cond: any, msg: string) {
   ok(parseIcs("definitely not an ics file").length === 0, "parseIcs returns [] on garbage");
   ok(parseIcs("").length === 0, "parseIcs returns [] on empty input");
   ok(newEventUid() !== newEventUid(), "newEventUid is unique");
+
+  // ORGANIZER extraction + REPLY with PARTSTAT.
+  const withOrg = buildIcs({
+    uid: "o1@relay", summary: "Org test",
+    startsAt: new Date("2026-09-18T10:00:00Z"), endsAt: new Date("2026-09-18T11:00:00Z"),
+    organizer: "pal@example.com", organizerName: "Pal",
+  });
+  const parsedOrg = parseIcs(withOrg);
+  ok(parsedOrg.length === 1 && parsedOrg[0].organizer === "pal@example.com", "parseIcs extracts the ORGANIZER email");
+  ok(parseIcs("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:n@r\r\nDTSTART:20260918T100000Z\r\nSUMMARY:X\r\nEND:VEVENT\r\nEND:VCALENDAR")[0].organizer === "",
+    "parseIcs leaves organizer empty when absent");
+  const reply = buildIcs({
+    uid: "o1@relay", summary: "Org test",
+    startsAt: new Date("2026-09-18T10:00:00Z"), endsAt: new Date("2026-09-18T11:00:00Z"),
+    organizer: "pal@example.com",
+    attendees: [{ email: "me@example.com", partstat: "ACCEPTED" }],
+    method: "REPLY",
+  });
+  ok(reply.includes("METHOD:REPLY"), "buildIcs writes METHOD:REPLY");
+  ok(reply.includes("ATTENDEE;CN=me@example.com;PARTSTAT=ACCEPTED:mailto:me@example.com"),
+    "buildIcs renders ATTENDEE with PARTSTAT");
+  ok(reply.includes("ORGANIZER:mailto:pal@example.com"), "REPLY keeps the ORGANIZER");
 }
 
 // ---------- 2. appointment db helpers ----------
@@ -221,7 +243,8 @@ function startFakeImap(boxes: Map<string, Map<string, FakeMsg>>) {
   const smtpCaptured: string[] = [];
   const smtp = startFakeSmtp(smtpCaptured);
   const inbox = new Map<string, FakeMsg>();
-  const imap = startFakeImap(new Map([["INBOX", inbox], ["Sent", new Map()]]));
+  const sentBox = new Map<string, FakeMsg>();
+  const imap = startFakeImap(new Map([["INBOX", inbox], ["Sent", sentBox]]));
 
   const dir = mkdtempSync(join(tmpdir(), "relay-cal-"));
   const { execSync, spawn } = await import("node:child_process");
@@ -317,6 +340,7 @@ function startFakeImap(boxes: Map<string, Map<string, FakeMsg>>) {
       uid: "inbound-1@relay", summary: "Coffee catch-up",
       startsAt: new Date("2026-09-24T15:00:00Z"), endsAt: new Date("2026-09-24T15:30:00Z"),
       location: "Blue Room", description: "bring ideas",
+      organizer: "pal@example.com", organizerName: "Pal",
     });
     const raw = [
       "From: pal@example.com", "To: me@example.com", "Subject: Invitation: Coffee catch-up",
@@ -344,6 +368,116 @@ function startFakeImap(boxes: Map<string, Map<string, FakeMsg>>) {
     await post("/api/poll", {});
     const diary3 = await (await fetch(base + `/api/conversations/${convId}/appointments`)).json();
     ok((diary3.appointments || []).length === 3, "re-poll does not duplicate the inbound appointment");
+
+    // --- RSVP: real METHOD:REPLY ---
+    const inboundAppt = diary3.appointments.find((a: any) => a.uid === "inbound-1@relay");
+    ok(!!inboundAppt && inboundAppt.organizer === "pal@example.com", "inbound appointment records the organizer");
+    const smtpBefore = smtpCaptured.length;
+    const rsvp = await post(`/api/conversations/${convId}/appointments/${inboundAppt.id}/rsvp`, { response: "accepted" });
+    ok(rsvp.status === 200, `rsvp returns 200 (got ${rsvp.status})`);
+    ok(rsvp.json.rsvp === true, "rsvp reports the reply was sent");
+    ok(rsvp.json.appointment?.status === "accepted", "rsvp flips the diary status");
+    ok(!!rsvp.json.message && rsvp.json.message.direction === "out", "rsvp records an outbound thread message");
+    ok(rsvp.json.message.subject === "Accepted: Coffee catch-up", `rsvp subjects the reply (${rsvp.json.message.subject})`);
+    ok(smtpCaptured.length === smtpBefore + 1, "rsvp triggers one SMTP send");
+    const rsvpMail = smtpCaptured[smtpCaptured.length - 1];
+    ok(rsvpMail.includes("To: pal@example.com"), "rsvp goes to the organizer");
+    ok(rsvpMail.includes("Content-Type: text/calendar"), "rsvp carries a text/calendar part");
+    const rAfter = rsvpMail.split("Content-Type: text/calendar")[1] || "";
+    const rB64 = (rAfter.split("\r\n\r\n")[1] || "").split("\r\n--")[0].replace(/\s+/g, "");
+    const rDecoded = Buffer.from(rB64, "base64").toString("utf8");
+    ok(rDecoded.includes("METHOD:REPLY"), "rsvp ics uses METHOD:REPLY");
+    ok(rDecoded.includes("PARTSTAT=ACCEPTED"), "rsvp ics marks the attendee ACCEPTED");
+    ok(rDecoded.includes("mailto:me@example.com"), "rsvp ics names the user as the attendee");
+    ok(rDecoded.includes("UID:inbound-1@relay"), "rsvp ics reuses the invitation UID");
+    // The RSVP shows up in the thread.
+    const mj2 = await (await fetch(base + `/api/conversations/${convId}/messages?limit=30`)).json();
+    ok((mj2.messages || []).some((m: any) => m.subject === "Accepted: Coffee catch-up" && m.direction === "out"),
+      "rsvp message lands in the thread");
+
+    // Decline path on a second inbound invite.
+    const inboundIcs2 = buildIcs({
+      uid: "inbound-2@relay", summary: "Dinner",
+      startsAt: new Date("2026-09-25T19:00:00Z"), endsAt: new Date("2026-09-25T20:00:00Z"),
+      organizer: "pal@example.com",
+    });
+    const raw2 = [
+      "From: pal@example.com", "To: me@example.com", "Subject: Invitation: Dinner",
+      "Message-ID: <dinner-in@example.com>", "MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="b2"', "",
+      "--b2", "Content-Type: text/plain", "", "Join us!", "",
+      "--b2", 'Content-Type: text/calendar; name="invite.ics"',
+      "Content-Transfer-Encoding: base64", 'Content-Disposition: attachment; filename="invite.ics"', "",
+      Buffer.from(inboundIcs2, "utf8").toString("base64"), "--b2--", "",
+    ].join("\r\n");
+    inbox.set("22", {
+      size: Buffer.byteLength(raw2), raw: raw2, text: "Join us!",
+      envelope: envelope({ date: "Thu, 17 Sep 2026 14:00:00 +0000", subject: "Invitation: Dinner", from: "pal@example.com", to: ["me@example.com"], messageId: "<dinner-in@example.com>" }),
+      internaldate: "17-Sep-2026 14:00:00 +0000",
+    });
+    await post("/api/poll", {});
+    const diary4 = await (await fetch(base + `/api/conversations/${convId}/appointments`)).json();
+    const dinnerAppt = diary4.appointments.find((a: any) => a.uid === "inbound-2@relay");
+    const dec = await post(`/api/conversations/${convId}/appointments/${dinnerAppt.id}/rsvp`, { response: "declined" });
+    ok(dec.status === 200 && dec.json.rsvp === true && dec.json.appointment?.status === "declined",
+      "decline sends the RSVP and flips the status");
+    const dAfter = smtpCaptured[smtpCaptured.length - 1].split("Content-Type: text/calendar")[1] || "";
+    const dDecoded = Buffer.from(((dAfter.split("\r\n\r\n")[1] || "").split("\r\n--")[0].replace(/\s+/g, "")), "base64").toString("utf8");
+    ok(dDecoded.includes("PARTSTAT=DECLINED") && dDecoded.includes("METHOD:REPLY"), "decline ics marks PARTSTAT:DECLINED");
+
+    // No organizer (or self as organizer): local diary update, no email.
+    const noOrgIcs = buildIcs({
+      uid: "inbound-3@relay", summary: "Mystery event",
+      startsAt: new Date("2026-09-26T12:00:00Z"), endsAt: new Date("2026-09-26T13:00:00Z"),
+    });
+    const raw3 = [
+      "From: pal@example.com", "To: me@example.com", "Subject: Invitation: Mystery event",
+      "Message-ID: <mystery-in@example.com>", "MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="b3"', "",
+      "--b3", "Content-Type: text/plain", "", "Surprise!", "",
+      "--b3", 'Content-Type: text/calendar; name="invite.ics"',
+      "Content-Transfer-Encoding: base64", 'Content-Disposition: attachment; filename="invite.ics"', "",
+      Buffer.from(noOrgIcs, "utf8").toString("base64"), "--b3--", "",
+    ].join("\r\n");
+    inbox.set("23", {
+      size: Buffer.byteLength(raw3), raw: raw3, text: "Surprise!",
+      envelope: envelope({ date: "Thu, 17 Sep 2026 15:00:00 +0000", subject: "Invitation: Mystery event", from: "pal@example.com", to: ["me@example.com"], messageId: "<mystery-in@example.com>" }),
+      internaldate: "17-Sep-2026 15:00:00 +0000",
+    });
+    await post("/api/poll", {});
+    const diary5 = await (await fetch(base + `/api/conversations/${convId}/appointments`)).json();
+    const mysteryAppt = diary5.appointments.find((a: any) => a.uid === "inbound-3@relay");
+    const smtpBeforeNoOrg = smtpCaptured.length;
+    const noOrg = await post(`/api/conversations/${convId}/appointments/${mysteryAppt.id}/rsvp`, { response: "accepted" });
+    ok(noOrg.status === 200 && noOrg.json.rsvp === false && noOrg.json.appointment?.status === "accepted",
+      "rsvp without an organizer updates locally and sends nothing");
+    ok(smtpCaptured.length === smtpBeforeNoOrg, "no SMTP send without an organizer");
+    // An invitation we sent ourselves never emails us back.
+    const selfRsvp = await post(`/api/conversations/${convId}/appointments/${apptId}/rsvp`, { response: "declined" });
+    ok(selfRsvp.status === 200 && selfRsvp.json.rsvp === false, "rsvp to our own invite stays local");
+    ok(smtpCaptured.length === smtpBeforeNoOrg, "no SMTP send to ourselves");
+
+    // Validation.
+    const rsvpBad = await post(`/api/conversations/${convId}/appointments/${mysteryAppt.id}/rsvp`, { response: "maybe" });
+    ok(rsvpBad.status === 400, "rsvp rejects a bogus response");
+    const rsvpGone = await post(`/api/conversations/${convId}/appointments/nope/rsvp`, { response: "accepted" });
+    ok(rsvpGone.status === 404, "rsvp 404s on an unknown appointment");
+    const rsvpConvGone = await post(`/api/conversations/nope/appointments/${mysteryAppt.id}/rsvp`, { response: "accepted" });
+    ok(rsvpConvGone.status === 404, "rsvp 404s on an unknown conversation");
+
+    // The Sent-folder copy of the RSVP is recognized by Message-ID, not duplicated.
+    const rsvpMid = rsvp.json.message.message_id as string;
+    ok(!!rsvpMid, "rsvp message stores its Message-ID");
+    const mjBefore = (await (await fetch(base + `/api/conversations/${convId}/messages?limit=100`)).json()).messages.length;
+    sentBox.set("1", {
+      size: Buffer.byteLength(rsvpMail), raw: rsvpMail, text: "Accepted: Coffee catch-up",
+      envelope: envelope({ date: "Thu, 17 Sep 2026 16:00:00 +0000", subject: "Accepted: Coffee catch-up", from: "me@example.com", to: ["pal@example.com"], messageId: rsvpMid }),
+      internaldate: "17-Sep-2026 16:00:00 +0000",
+    });
+    await post("/api/poll", {});
+    const mjAfter = (await (await fetch(base + `/api/conversations/${convId}/messages?limit=100`)).json()).messages.length;
+    ok(mjAfter === mjBefore, "Sent-folder copy of the RSVP is deduped by Message-ID");
+    const diary6 = await (await fetch(base + `/api/conversations/${convId}/appointments`)).json();
+    ok(diary6.appointments.filter((a: any) => a.uid === "inbound-1@relay").length === 1,
+      "Sent-folder RSVP copy does not duplicate the appointment");
 
     // --- diary isolation between conversations ---
     const diaryOther = await (await fetch(base + `/api/conversations/${conv2}/appointments`)).json();

@@ -112,6 +112,7 @@ async function ingestCalendarAttachments(messageId: string, convId: string, dire
         ends_at: ev.dtend,
         location: ev.location,
         description: ev.description,
+        organizer: ev.organizer,
         status: direction === "in" ? "received" : "sent",
       });
     }
@@ -1271,6 +1272,67 @@ const server = (Bun as any).serve({
             return json({ error: "Pick accepted, declined, or cancelled." }, 400);
           }
           return json({ appointment: setAppointmentStatus(apptId, status) });
+        }
+      }
+      {
+        // RSVP to an invitation: updates the diary and, when the invitation
+        // names an organizer, emails them a real METHOD:REPLY .ics.
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/appointments\/([^/]+)\/rsvp$/);
+        if (m && method === "POST") {
+          const id = decodeURIComponent(m[1]);
+          const apptId = decodeURIComponent(m[2]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          const appt = getAppointment(apptId);
+          if (!appt || appt.conversation_id !== id) return json({ error: "not found" }, 404);
+          let body: any = {};
+          try {
+            body = await readBody(req);
+          } catch { /* noop */ }
+          const response = String(body.response || "");
+          if (!["accepted", "declined"].includes(response)) {
+            return json({ error: "Pick accepted or declined." }, 400);
+          }
+          const updated = setAppointmentStatus(apptId, response);
+          const organizer = (appt.organizer || "").trim();
+          const selfAddr = (settings.smtp.from || "").trim().toLowerCase();
+          // Nobody to reply to (or we'd be replying to ourselves): local
+          // diary update only.
+          if (!organizer || organizer.toLowerCase() === selfAddr) {
+            return json({ appointment: updated, message: null, rsvp: false });
+          }
+          const partstat = response === "accepted" ? "ACCEPTED" : "DECLINED";
+          const verb = response === "accepted" ? "Accepted" : "Declined";
+          const ics = buildIcs({
+            uid: appt.uid || newEventUid(),
+            summary: appt.title,
+            startsAt: new Date(appt.starts_at),
+            endsAt: new Date(appt.ends_at),
+            location: appt.location || undefined,
+            organizer,
+            attendees: [{ email: settings.smtp.from, partstat }],
+            method: "REPLY",
+          });
+          const mid = newMessageId();
+          const text = `${verb}: ${appt.title}`;
+          try {
+            await sendMail(settings.smtp, {
+              to: [organizer],
+              subject: `${verb}: ${appt.title}`,
+              text,
+              messageId: mid,
+              attachments: [{ filename: "reply.ics", mime: "text/calendar", data: Buffer.from(ics, "utf8") }],
+            });
+          } catch (e) {
+            // The diary still records the user's decision; the reply just
+            // didn't go out.
+            return json({ appointment: updated, message: null, rsvp: false, rsvp_error: errMsg(e) });
+          }
+          const msg = insertMessage({
+            conversation_id: id, channel: "email", direction: "out",
+            body: text, subject: `${verb}: ${appt.title}`,
+            external_id: "", message_id: mid, status: "sent",
+          });
+          return json({ appointment: updated, message: withAttachments([msg])[0], rsvp: true });
         }
       }
       {

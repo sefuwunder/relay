@@ -709,21 +709,27 @@ function renderSidePanel() {
   wireDiaryPanel();
 }
 
-/** Accept or decline an invitation from its card. */
+/** Accept or decline an invitation from its card: sends a real METHOD:REPLY
+    RSVP email to the organizer when one is known. */
 async function setApptStatus(id, status) {
   const conv = state.conv;
   if (!conv) return;
+  const rsvp = status === "accepted" || status === "declined";
   try {
-    const r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/appointments/" + encodeURIComponent(id) + "/status", {
+    const r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/appointments/" + encodeURIComponent(id) +
+      (rsvp ? "/rsvp" : "/status"), {
       method: "POST",
-      body: JSON.stringify({ status }),
+      body: JSON.stringify(rsvp ? { response: status } : { status }),
     });
     for (const m of state.messages) {
       if (m.appointment && String(m.appointment.id) === String(id)) m.appointment = r.appointment;
     }
+    if (r.message) state.messages.push(r.message);
     await refreshDiary();
     renderConversationDetail();
-    toast(status === "accepted" ? "Invitation accepted." : status === "declined" ? "Invitation declined." : "Invitation updated.");
+    if (r.rsvp_error) toast("Saved, but the RSVP email couldn't be sent: " + r.rsvp_error, true);
+    else if (rsvp) toast(r.rsvp ? "RSVP sent — invitation " + status + "." : "Invitation " + status + " (no organizer to reply to).");
+    else toast(status === "cancelled" ? "Invitation cancelled." : "Invitation updated.");
   } catch (e) {
     toast(e.message || "Couldn't update the invitation.", true);
   }

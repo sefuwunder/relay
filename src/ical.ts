@@ -9,6 +9,8 @@ export interface CalEvent {
   dtend: string;
   location: string;
   description: string;
+  /** Organizer email (mailto: stripped), "" when the event names none. */
+  organizer: string;
   method: string;
 }
 
@@ -57,7 +59,8 @@ export interface BuildIcsOpts {
   description?: string;
   organizer?: string;
   organizerName?: string;
-  attendees?: string[];
+  /** Attendees: plain emails, or objects when a PARTSTAT is needed (RSVP). */
+  attendees?: (string | { email: string; partstat?: string })[];
   method?: "REQUEST" | "REPLY" | "CANCEL";
 }
 
@@ -79,7 +82,11 @@ export function buildIcs(o: BuildIcsOpts): string {
   if (o.location) lines.push(`LOCATION:${escText(o.location)}`);
   if (o.description) lines.push(`DESCRIPTION:${escText(o.description)}`);
   if (o.organizer) lines.push(`ORGANIZER${o.organizerName ? `;CN=${escText(o.organizerName)}` : ""}:mailto:${o.organizer}`);
-  for (const a of o.attendees || []) lines.push(`ATTENDEE;CN=${escText(a)}:mailto:${a}`);
+  for (const a of o.attendees || []) {
+    const email = typeof a === "string" ? a : a.email;
+    const partstat = typeof a === "string" ? "" : a.partstat ? `;PARTSTAT=${a.partstat}` : "";
+    lines.push(`ATTENDEE;CN=${escText(email)}${partstat}:mailto:${email}`);
+  }
   lines.push("END:VEVENT", "END:VCALENDAR");
   return lines.map(foldLine).join("\r\n") + "\r\n";
 }
@@ -166,6 +173,7 @@ export function parseIcs(text: string): CalEvent[] {
             location: cur.location || "",
             description: cur.description || "",
             method: method || "REQUEST",
+            organizer: cur.organizer || "",
           });
         }
         cur = null;
@@ -178,6 +186,7 @@ export function parseIcs(text: string): CalEvent[] {
         } else if (prop === "DTEND") cur.dtend = parseIcsDate(params, value.trim());
         else if (prop === "LOCATION") cur.location = unescText(value);
         else if (prop === "DESCRIPTION") cur.description = unescText(value);
+        else if (prop === "ORGANIZER") cur.organizer = value.trim().replace(/^mailto:/i, "");
       }
     }
   } catch {
