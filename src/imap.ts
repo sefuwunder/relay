@@ -127,6 +127,15 @@ export function internalDateToIso(d: string): string {
   return `${m[3]}-${String(mon + 1).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
 }
 
+/** INTERNALDATE → full ISO UTC timestamp ("2026-09-17T12:00:00Z"); "" when unparseable. */
+export function internalDateTimeToIso(d: string): string {
+  const m = String(d || "").match(/(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return internalDateToIso(d);
+  const mon = MONTHS[m[2].slice(0, 1).toUpperCase() + m[2].slice(1).toLowerCase()];
+  if (mon === undefined) return internalDateToIso(d);
+  return `${m[3]}-${String(mon + 1).padStart(2, "0")}-${m[1].padStart(2, "0")}T${m[4]}:${m[5]}:${m[6]}Z`;
+}
+
 // ---------- connection ----------
 
 class Conn {
@@ -281,11 +290,11 @@ async function connectAndLogin(cfg0: ImapConfig): Promise<{ conn: Conn; cfg: Ima
   return { conn, cfg };
 }
 
-/** Connect, log in, select INBOX. Returns the open connection. */
-async function login(cfg0: ImapConfig): Promise<Conn> {
+/** Connect, log in, select a mailbox (INBOX by default). Returns the open connection. */
+async function login(cfg0: ImapConfig, mailbox = "INBOX"): Promise<Conn> {
   const { conn } = await connectAndLogin(cfg0);
   try {
-    await conn.cmd("a002", "SELECT INBOX");
+    await conn.cmd("a002", `SELECT ${qstr(mailbox)}`);
   } catch (e) {
     conn.close();
     throw e;
@@ -314,8 +323,15 @@ function parseSearchUids(lines: string[]): string[] {
 }
 
 // Fetch envelopes for a batch of UIDs; returns partial results on parse issues.
-async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<Map<string, { from: string; subject: string; date: string; messageId: string }>> {
-  const out = new Map<string, { from: string; subject: string; date: string; messageId: string }>();
+export interface MailEnvelope {
+  from: string; subject: string; date: string; messageId: string;
+  /** Recipient emails from the envelope to/cc lists. */
+  to: string[];
+  /** Full INTERNALDATE timestamp as ISO UTC ("" when unparseable). */
+  dateTime: string;
+}
+async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<Map<string, MailEnvelope>> {
+  const out = new Map<string, MailEnvelope>();
   const lines = await conn.cmd(tag, `UID FETCH ${uids.join(",")} (UID INTERNALDATE ENVELOPE)`);
   let cur: string[] = [];
   const flush = () => {
@@ -354,17 +370,24 @@ async function fetchEnvelopes(conn: Conn, tag: string, uids: string[]): Promise<
       env = v;
     }
     let from = "", subject = "", date = "", messageId = "";
+    let to: string[] = [];
+    let dateTime = "";
     if (Array.isArray(env)) {
       subject = decodeHeader(String(env[1] ?? "")).trim();
       const fromList = env[2];
       if (Array.isArray(fromList)) from = fromList.map(addrText).filter(Boolean).join(", ");
-      date = internalDateToIso(String(parts["INTERNALDATE"] ?? env[0] ?? ""));
+      const internalDate = String(parts["INTERNALDATE"] ?? env[0] ?? "");
+      date = internalDateToIso(internalDate);
+      dateTime = internalDateTimeToIso(internalDate);
       // ENVELOPE = (date subject from sender reply-to to cc bcc in-reply-to message-id)
       if (typeof env[9] === "string" && env[9].toUpperCase() !== "NIL") messageId = env[9].trim();
+      try { to = envelopeAddrs(env).map((a) => a.email); } catch { /* best effort */ }
     } else {
-      date = internalDateToIso(String(parts["INTERNALDATE"] ?? ""));
+      const internalDate = String(parts["INTERNALDATE"] ?? "");
+      date = internalDateToIso(internalDate);
+      dateTime = internalDateTimeToIso(internalDate);
     }
-    out.set(uid, { from, subject, date, messageId });
+    out.set(uid, { from, subject, date, messageId, to, dateTime });
   };
   for (const line of lines) {
     if (/^\* \d+ FETCH/i.test(line) && cur.length) flush();
@@ -599,7 +622,7 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
     const rps = await fetchReturnPaths(conn, "b004", picked);
     const mails: UnseenMail[] = [];
     for (const uid of picked) {
-      const e = envs.get(uid) || { from: "", subject: "", date: "", messageId: "" };
+      const e = envs.get(uid) || { from: "", subject: "", date: "", messageId: "", to: [] as string[], dateTime: "" };
       const body = bodies.get(uid) || "";
       mails.push({
         uid,
@@ -998,6 +1021,75 @@ export async function harvestSentContacts(
   }
 }
 
+// ---------- sent-mail import ----------
+
+export interface SentMailItem {
+  uid: string;
+  /** Recipient emails from the envelope to/cc lists. */
+  to: string[];
+  subject: string;
+  /** ISO timestamp from INTERNALDATE (falls back to the envelope date). */
+  date: string;
+  /** Full INTERNALDATE timestamp as ISO UTC ("" when unparseable). */
+  dateTime: string;
+  messageId: string;
+  /** Plain-text snippet, up to 4000 chars. */
+  body: string;
+}
+
+/**
+ * List sent mail newer than `lastUid` (UID watermark), or — on the first run
+ * (`lastUid == null`) — everything since `backfillDays` ago. Returns the
+ * mailbox that was scanned, the items (newest `max` only, to bound the first
+ * backfill), and the highest UID seen so the caller can advance its watermark.
+ * Read-only: EXAMINE never sets flags.
+ */
+export async function fetchSentMail(
+  cfg0: ImapConfig,
+  lastUid: number | null,
+  opts: { backfillDays?: number; max?: number } = {}
+): Promise<{ mailbox: string | null; items: SentMailItem[]; maxUid: number | null }> {
+  const backfillDays = opts.backfillDays ?? 90;
+  const max = Math.min(opts.max ?? 200, 500);
+  const { conn } = await connectAndLogin(cfg0);
+  try {
+    const sent = await findSentMailbox(conn);
+    if (!sent) return { mailbox: null, items: [], maxUid: null };
+    await conn.cmd("s001", `EXAMINE ${qstr(sent)}`);
+    let uids: string[];
+    if (lastUid !== null && Number.isFinite(lastUid)) {
+      uids = parseSearchUids(await conn.cmd("s002", `UID SEARCH UID ${Math.floor(lastUid) + 1}:*`));
+    } else {
+      const d = new Date(Date.now() - backfillDays * 86400_000);
+      const mon = Object.keys(MONTHS)[d.getMonth()];
+      const since = `${String(d.getDate()).padStart(2, "0")}-${mon}-${d.getFullYear()}`;
+      uids = parseSearchUids(await conn.cmd("s002", `UID SEARCH SINCE ${since}`));
+    }
+    if (!uids.length) return { mailbox: sent, items: [], maxUid: lastUid };
+    const maxUid = Math.max(...uids.map(Number));
+    const picked = uids.slice(-max);
+    const envs = await fetchEnvelopes(conn, "s003", picked);
+    const bodies = await fetchSnippets(conn, "s004", picked, 4000);
+    const items: SentMailItem[] = [];
+    for (const uid of picked) {
+      const e = envs.get(uid);
+      if (!e) continue;
+      items.push({
+        uid,
+        to: e.to,
+        subject: e.subject || "(no subject)",
+        date: e.dateTime || e.date,
+        dateTime: e.dateTime,
+        messageId: e.messageId || "",
+        body: bodies.get(uid) || "",
+      });
+    }
+    return { mailbox: sent, items, maxUid };
+  } finally {
+    conn.close();
+  }
+}
+
 // ---------- inbound attachment extraction ----------
 
 export interface InboundAttachment {
@@ -1186,15 +1278,15 @@ function extractLiteral(lines: string[]): string {
 }
 
 /**
- * Fetch attachments for the given UIDs (one IMAP connection). Messages over
- * INBOUND_FETCH_MAX are skipped; per message at most INBOUND_FILES_PER_MESSAGE
- * files of at most INBOUND_FILE_MAX bytes are returned. A failure on one
- * message never fails the batch.
+ * Fetch attachments for the given UIDs in `mailbox` (one IMAP connection).
+ * Messages over INBOUND_FETCH_MAX are skipped; per message at most
+ * INBOUND_FILES_PER_MESSAGE files of at most INBOUND_FILE_MAX bytes are
+ * returned. A failure on one message never fails the batch.
  */
-export async function fetchMailAttachments(cfg0: ImapConfig, uids: string[]): Promise<Map<string, InboundAttachment[]>> {
+export async function fetchMailAttachments(cfg0: ImapConfig, uids: string[], mailbox = "INBOX"): Promise<Map<string, InboundAttachment[]>> {
   const out = new Map<string, InboundAttachment[]>();
   if (!uids.length) return out;
-  const conn = await login(cfg0);
+  const conn = await login(cfg0, mailbox);
   try {
     const sizes = new Map<string, number>();
     try {

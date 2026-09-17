@@ -10,8 +10,8 @@ import {
   insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, searchConversationAttachments, deleteConversationData,
   type Contact, type Conversation, type Channel, type Message, type Attachment,
 } from "./db";
-import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig, type MailAttachment } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, type ImapConfig } from "./imap";
+import { sendMail, validateSmtp, gvGatewayAddress, newMessageId, type SmtpConfig, type MailAttachment } from "./smtp";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, type ImapConfig, type SentMailItem, type InboundAttachment } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -407,6 +407,16 @@ function gvReplyFor(gvNumber: string): { messageId: string; from: string; subjec
   return null;
 }
 
+/** Message-ID for an outbound send: reuse the failed row's on retry so the
+    Sent-folder copy stays recognizable as the same message. */
+function outboundMessageId(retryOfId?: string): string {
+  if (retryOfId) {
+    const row = getDb().query("SELECT message_id FROM messages WHERE id = ?").get(retryOfId) as { message_id?: string } | null;
+    if (row?.message_id) return row.message_id;
+  }
+  return newMessageId();
+}
+
 async function sendConversationMessage(convId: string, channel: Channel, body: string, subject: string, inReplyToMsgId?: string, retryOfId?: string, attachments: MailAttachment[] = []) {
   const conv = getConversation(convId);
   if (!conv) throw new Error("Conversation not found.");
@@ -432,8 +442,11 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
         subj = "Re: " + String(orig.subject || subj).replace(/^Re:\s*/i, "");
       }
     }
-    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo, attachments });
-    const sent = recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", status: "sent" });
+    // One Message-ID for both the wire and the local row, so the sent-mail
+    // import recognizes the Sent-folder copy as this same message.
+    const mid = outboundMessageId(retryOfId);
+    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo, messageId: mid, attachments });
+    const sent = recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: subj, external_id: "", message_id: mid, status: "sent" });
     if (attachments.length && !retryOfId) {
       // Persist file rows now that the send succeeded. (On failure the
       // caller persists them against the failed row so Retry still has them.)
@@ -480,8 +493,9 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
         if (rec.subject) subj = "Re: " + rec.subject.replace(/^Re:\s*/i, "");
       }
     }
-    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo });
-    return recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: "", status: "sent" });
+    const mid = outboundMessageId(retryOfId);
+    await sendMail(settings.smtp, { to, subject: subj, text, inReplyTo, messageId: mid });
+    return recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: "", message_id: mid, status: "sent" });
   }
   // matrix
   const roomId = conv.is_group ? conv.matrix_room_id : members[0].matrix_room_id;
@@ -490,9 +504,9 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
 }
 
 // On a retry, flip the original failed row to sent instead of inserting a duplicate.
-function recordSent(retryOfId: string | undefined, rec: Omit<Message, "id" | "created_at" | "message_id">): Message {
+function recordSent(retryOfId: string | undefined, rec: Omit<Message, "id" | "created_at"> & { created_at?: string }): Message {
   if (!retryOfId) return insertMessage(rec);
-  getDb().query("UPDATE messages SET channel = ?, direction = 'out', body = ?, subject = ?, external_id = ?, status = 'sent' WHERE id = ?").run(rec.channel, rec.body, rec.subject, rec.external_id, retryOfId);
+  getDb().query("UPDATE messages SET channel = ?, direction = 'out', body = ?, subject = ?, external_id = ?, message_id = ?, status = 'sent' WHERE id = ?").run(rec.channel, rec.body, rec.subject, rec.external_id, rec.message_id || "", retryOfId);
   return getDb().query("SELECT * FROM messages WHERE id = ?").get(retryOfId) as Message;
 }
 
@@ -558,9 +572,138 @@ async function pollMail() {
     }
     lastPoll.mail = new Date().toISOString();
     lastPoll.mailError = null;
+    // Sent-mail sync: pick up mail (and attachments) sent from outside Relay.
+    try {
+      await pollSentMail();
+    } catch (e) {
+      console.error("sent-mail poll failed:", e instanceof Error ? e.message : e);
+    }
   } catch (e) {
     lastPoll.mailError = errMsg(e);
   }
+}
+
+// ---------- sent-mail import ----------
+
+/** Normalize a subject for duplicate comparison: lowercase, strip Re:/Fwd:. */
+function normSubject(s: string): string {
+  return s.toLowerCase().replace(/^(re|fwd?):\s*/i, "").trim();
+}
+
+/**
+ * Conversation for a set of recipient contacts: the group whose members match
+ * exactly, else the first recipient's DM.
+ */
+function conversationForContacts(ids: string[]): Conversation {
+  if (ids.length === 1) return dmFor(ids[0]);
+  const want = [...new Set(ids)].sort().join(",");
+  for (const c of listConversations()) {
+    if (!c.is_group) continue;
+    const have = conversationMembers(c.id).map((m) => m.id).sort().join(",");
+    if (have === want) return c;
+  }
+  return dmFor(ids[0]);
+}
+
+/**
+ * A sent-folder message composed inside Relay before Message-IDs were stored
+ * has no message_id to match on. Find it fuzzily: same conversation, outbound
+ * email, matching subject, sent within ±15 minutes, same attachment filenames.
+ */
+function findSentDuplicate(convId: string, subject: string, dateIso: string, filenames: string[]): Message | null {
+  const t = Date.parse(dateIso);
+  if (!Number.isFinite(t)) return null;
+  const wantSubj = normSubject(subject);
+  const wantFiles = [...filenames].sort().join("\0");
+  const cands = getDb().query(
+    "SELECT * FROM messages WHERE conversation_id = ? AND direction = 'out' AND channel = 'email' AND (message_id IS NULL OR message_id = '') ORDER BY created_at DESC LIMIT 200"
+  ).all(convId) as Message[];
+  for (const c of cands) {
+    const ct = Date.parse(c.created_at);
+    if (!Number.isFinite(ct) || Math.abs(ct - t) > 15 * 60_000) continue;
+    if (normSubject(c.subject || "") !== wantSubj) continue;
+    const haveFiles = listAttachmentsForMessages([c.id]).map((a) => a.filename).sort().join("\0");
+    if (haveFiles !== wantFiles) continue;
+    return c;
+  }
+  return null;
+}
+
+async function importSentItem(
+  mailbox: string,
+  item: SentMailItem,
+  byEmail: Map<string, Contact>,
+  selfEmails: Set<string>
+): Promise<void> {
+  // Exact dedupe: already imported, or composed inside Relay (stored Message-ID).
+  if (item.messageId && getDb().query("SELECT 1 FROM messages WHERE message_id = ? LIMIT 1").get(item.messageId)) return;
+  const extId = `sentmail:${mailbox}:${item.uid}`;
+  if (hasExternalId(extId)) return;
+  const seen = new Set<string>();
+  const recipients: Contact[] = [];
+  for (const raw of item.to) {
+    const email = extractEmail(raw);
+    if (!email || selfEmails.has(email) || seen.has(email)) continue;
+    seen.add(email);
+    if (parseGvNumber(email)) continue; // SMS sends are already recorded by the composer
+    const c = byEmail.get(email);
+    if (c) recipients.push(c);
+  }
+  if (!recipients.length) return; // nobody we track
+  const conv = conversationForContacts(recipients.map((c) => c.id));
+  // Attachments ride on the message; fetch them first so the fuzzy duplicate
+  // check can compare filename sets.
+  let files: InboundAttachment[] = [];
+  try {
+    const attMap = await fetchMailAttachments(settings.imap, [item.uid], mailbox);
+    files = attMap.get(item.uid) || [];
+  } catch (e) {
+    console.error("sent-mail attachment fetch failed:", e instanceof Error ? e.message : e);
+  }
+  const dup = findSentDuplicate(conv.id, item.subject, item.date, files.map((f) => f.filename));
+  if (dup) {
+    // Backfill the Message-ID so future polls match exactly.
+    if (item.messageId) getDb().query("UPDATE messages SET message_id = ? WHERE id = ?").run(item.messageId, dup.id);
+    return;
+  }
+  const msg = insertMessage({
+    conversation_id: conv.id, channel: "email", direction: "out",
+    body: item.body || "(no text)", subject: item.subject,
+    external_id: extId, message_id: item.messageId || "",
+    status: "sent", created_at: item.date || undefined,
+  });
+  if (files.length) await saveMessageAttachments(msg.id, files);
+}
+
+/**
+ * Import mail sent from outside Relay (phone's mail app, desktop client, …)
+ * so threads, the Shared files widget, and filename search see it. Watermarked
+ * by UID per mailbox; the first run backfills up to 90 days (newest 200).
+ * One bad message never fails the batch; failures are logged, not thrown.
+ */
+async function pollSentMail(): Promise<void> {
+  const prevBox = kvGet("imap:sent:box") || "";
+  let resumeUid: number | null = null;
+  if (prevBox) {
+    const n = Number(kvGet("imap:sent:lastuid") || "");
+    if (Number.isFinite(n)) resumeUid = n;
+  }
+  const { mailbox, items, maxUid } = await fetchSentMail(settings.imap, prevBox ? resumeUid : null);
+  if (!mailbox) return; // no Sent folder found — nothing to do
+  if (items.length) {
+    const contacts = listContacts();
+    const byEmail = new Map(contacts.filter((c) => c.email).map((c) => [c.email!.toLowerCase(), c]));
+    const selfEmails = new Set([settings.imap.user, settings.smtp.from].filter(Boolean).map((s) => (s as string).toLowerCase()));
+    for (const item of items) {
+      try {
+        await importSentItem(mailbox, item, byEmail, selfEmails);
+      } catch (e) {
+        console.error("sent-mail import failed for uid", item.uid, e instanceof Error ? e.message : e);
+      }
+    }
+  }
+  kvSet("imap:sent:box", mailbox);
+  if (maxUid !== null) kvSet("imap:sent:lastuid", String(maxUid));
 }
 
 async function pollMatrixOnce() {
