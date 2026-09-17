@@ -27,6 +27,16 @@ The 📎 paperclip in the composer appears on the Email channel. Pick up to **10
 - **Sent-folder mail is imported too:** each poll also scans your IMAP **Sent** mailbox, so email you sent from your regular mail app appears in the matching Relay thread as an outbound message — and its attachments land in Shared files and the filename search. The first poll backfills up to the newest 200 messages from the last 90 days, then tracks a UID watermark so it only picks up new mail. Mail you composed inside Relay is matched by `Message-ID` (plus a subject/time/filename fallback for older messages) and never re-imported. Mail to untracked addresses is skipped.
 - Failed sends keep their files, so **Retry** re-sends the original attachments. Deleting a conversation removes its files from disk too.
 
+## Calendar invitations + weekly diary (Email channel)
+
+The 📅 calendar button in the Email composer opens an inline invitation form — title, start/end, optional location and notes. Sending attaches a real **`invite.ics`** (`text/calendar`, `METHOD:REQUEST`) to the email, so any calendar app can add it; the invitation is recorded in the conversation's diary either way.
+
+- Each conversation has a **weekly Diary widget** (badge shows this week's count): Sunday–Saturday with prev/next week and Today controls, time, location, notes, and status pills (sent / invitation / accepted / declined / cancelled).
+- Invitations render as **cards in the thread** — inbound ones you haven't answered show **Accept** and **Decline** buttons (stored locally per conversation).
+- Inbound `.ics` attachments from email replies are parsed into the diary automatically (UTC, floating, all-day, and `TZID` dates; missing end times default to +1 hour); events are deduplicated by ICS UID, and `.ics` files are hidden from Shared files so they only appear as appointments.
+- Sent-folder scanning ingests invitations your mail app sent too. New APIs: `GET /api/conversations/:id/appointments` and `POST /api/conversations/:id/appointments/:appointmentId/status` (`accepted` | `declined` | `cancelled`).
+- Like Shared files, the Diary docks as a permanent right-hand panel at ≥1100px and becomes a slide-over drawer on smaller screens — one panel area, switched by the header buttons.
+
 ## Wide-screen reflow
 
 Stretch the window and the UI opens up: at ≥1100px the conversation view gains the persistent Shared files panel while the thread uses the rest; at ≥1400px the People grid goes six-wide. Everything stays glass, and animations still respect `prefers-reduced-motion`.

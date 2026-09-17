@@ -112,6 +112,15 @@ const ICONS = {
     '<path d="M14.5 5L8 12l6.5 7" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>',
   chevR:
     '<path d="M9.5 5L16 12l-6.5 7" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>',
+  calendar:
+    '<rect x="3.5" y="5" width="17" height="15.5" rx="2.5" fill="none" stroke="currentColor" stroke-width="2.2"/>' +
+    '<line x1="3.5" y1="9.5" x2="20.5" y2="9.5" stroke="currentColor" stroke-width="2.2"/>' +
+    '<line x1="8" y1="2.8" x2="8" y2="6.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>' +
+    '<line x1="16" y1="2.8" x2="16" y2="6.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>' +
+    '<circle cx="12" cy="14.5" r="1.9" fill="currentColor"/>',
+  pin:
+    '<path d="M12 21s-6.5-6-6.5-10.5A6.5 6.5 0 0 1 12 4a6.5 6.5 0 0 1 6.5 6.5C18.5 15 12 21 12 21z" fill="none" stroke="currentColor" stroke-width="2.2"/>' +
+    '<circle cx="12" cy="10.5" r="2.2" fill="currentColor"/>',
 };
 
 /** Inline SVG icon. `size` is an extra class (e.g. "big"). Decorative: hidden from AT. */

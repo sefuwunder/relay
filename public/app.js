@@ -31,7 +31,12 @@ const state = {
   timer: null,
   files: [],           // recently shared files in the open conversation
   pendingFiles: [],    // File objects staged in the composer
-  filesOpen: false,    // shared-files drawer (narrow screens)
+  panel: null,         // side panel: "files" | "diary" | null
+  diary: [],           // appointments in the open conversation
+  diaryOffset: 0,      // week offset from the current week in the diary
+  eventForm: false,    // inline calendar-invitation form open in the composer
+  eventDraft: null,    // in-progress invitation field values
+  pendingEvent: null,  // validated invitation to send with the next message
   fileSearch: "",      // shared-files widget search query (last 90 days)
   fileResults: null,   // search matches; null = browsing recent files
   lightbox: null,      // { files, index } when the preview overlay is open
@@ -129,9 +134,44 @@ function attachUrl(id) {
   return "/api/attachments/" + encodeURIComponent(id);
 }
 
+/** "Thu, Sep 18 · 2:00 PM – 3:30 PM" from ISO UTC bounds. */
+function fmtApptRange(startsAt, endsAt) {
+  const s = new Date(startsAt), e = new Date(endsAt);
+  if (isNaN(s.getTime()) || isNaN(e.getTime())) return "";
+  const dateFmt = (d) => d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  const timeFmt = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if (s.toDateString() === e.toDateString()) return `${dateFmt(s)} · ${timeFmt(s)} – ${timeFmt(e)}`;
+  return `${dateFmt(s)} ${timeFmt(s)} – ${dateFmt(e)} ${timeFmt(e)}`;
+}
+
+/** Small status pill for an appointment. */
+function apptStatusChip(status) {
+  const labels = { sent: "sent", received: "invitation", accepted: "accepted", declined: "declined", cancelled: "cancelled" };
+  return `<span class="appt-status st-${esc(status || "")}">${esc(labels[status] || status || "")}</span>`;
+}
+
+/** Calendar invitation card rendered inline in the bubble. Inbound invites the
+    user hasn't answered get Accept / Decline buttons. */
+function inviteCard(m, a) {
+  const ap = m.appointment;
+  const title = ap ? ap.title : (a.filename || "Calendar invitation");
+  const when = ap ? fmtApptRange(ap.starts_at, ap.ends_at) : "";
+  const loc = ap && ap.location ? `<div class="inv-loc">${icon("pin")}<span>${esc(ap.location)}</span></div>` : "";
+  const desc = ap && ap.description ? `<div class="inv-desc">${esc(ap.description)}</div>` : "";
+  const status = ap ? apptStatusChip(ap.status) : "";
+  const actions = ap && m.direction === "in" && ap.status === "received"
+    ? `<div class="inv-actions"><button class="inv-btn accept" data-appt-accept="${esc(ap.id)}">Accept</button><button class="inv-btn decline" data-appt-decline="${esc(ap.id)}">Decline</button></div>`
+    : "";
+  return `<div class="invite-card">
+    <div class="inv-head">${icon("calendar")}<div class="inv-meta"><div class="inv-title">${esc(title)}</div>${when ? `<div class="inv-when">${when}</div>` : ""}</div>${status}</div>
+    ${loc}${desc}${actions}
+  </div>`;
+}
+
 /** Attachment chips inside a message bubble. Images are preview chips (no inline
     thumbnails — previews live in the Shared files widget); video/audio get
-    small players; the rest are download chips. */
+    small players; calendar invites render as invitation cards; the rest are
+    download chips. */
 function bubbleAtts(m) {
   const atts = m.attachments || [];
   if (!atts.length) return "";
@@ -139,6 +179,9 @@ function bubbleAtts(m) {
     const kind = attKind(a.mime);
     const url = attachUrl(a.id);
     const label = esc(a.filename || "file");
+    if (a.mime === "text/calendar" || /\.ics$/i.test(a.filename || "")) {
+      return inviteCard(m, a);
+    }
     if (kind === "image") {
       return `<button class="att att-file att-imgchip" data-att="${esc(a.id)}" title="${label} — ${esc(fmtSize(a.size))}">${icon("image")}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></button>`;
     }
@@ -378,13 +421,22 @@ async function loadConversation(id) {
   state.messages = m.messages || [];
   state.replyTo = null;
   state.pendingFiles = [];
-  state.filesOpen = false;
+  state.panel = null;
+  state.diary = [];
+  state.diaryOffset = 0;
+  state.eventForm = false;
+  state.eventDraft = null;
+  state.pendingEvent = null;
   state.fileSearch = "";
   state.fileResults = null;
   try {
     const f = await api("/api/conversations/" + encodeURIComponent(id) + "/files?limit=30");
-    state.files = f.files || [];
+    state.files = calFilesOut(f.files || []);
   } catch { state.files = []; }
+  try {
+    const d = await api("/api/conversations/" + encodeURIComponent(id) + "/appointments");
+    state.diary = d.appointments || [];
+  } catch { state.diary = []; }
   if (!state.messages.length && state.conv && !state.conv.is_group) {
     // Empty conversation: pre-populate the first message from the last email exchange.
     api("/api/conversations/" + encodeURIComponent(id) + "/seed-email", { method: "POST" })
@@ -411,19 +463,33 @@ function selectedChannel() {
 /** Files currently shown in the widget: search matches, or recent files. */
 function activeFiles() { return state.fileResults || state.files; }
 
+/** Invitations (.ics) are appointments, not shared files — keep them out of the widget. */
+function calFilesOut(files) {
+  return (files || []).filter((f) => f.mime !== "text/calendar" && !/\.ics$/i.test(f.filename || ""));
+}
+
 /** Refresh the widget list, honoring an active search. */
 async function refreshFiles() {
   if (!state.conv) return;
   try {
     if (state.fileSearch) {
       const f = await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/files?limit=30&days=90&q=" + encodeURIComponent(state.fileSearch));
-      state.fileResults = f.files || [];
+      state.fileResults = calFilesOut(f.files || []);
     } else {
       const f = await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/files?limit=30");
-      state.files = f.files || [];
+      state.files = calFilesOut(f.files || []);
       state.fileResults = null;
     }
   } catch { /* widget keeps its old list */ }
+}
+
+/** Refresh the diary's appointments for the open conversation. */
+async function refreshDiary() {
+  if (!state.conv) return;
+  try {
+    const d = await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/appointments");
+    state.diary = d.appointments || [];
+  } catch { /* diary keeps its old list */ }
 }
 
 /** Group image previews into per-message stacks for the widget. Returns display
@@ -497,7 +563,7 @@ function filesPanelHtml() {
 /** Re-render just the widget body + meta after a search, keeping input focus. */
 function renderFileResults() {
   const panel = $("#files-panel");
-  if (!panel || !state.conv) return;
+  if (!panel || !state.conv || state.panel !== "files") return;
   panel.outerHTML = filesPanelHtml();
   wireFilesPanel();
   const q = $("#fp-q");
@@ -546,6 +612,123 @@ function wireFilesPanel() {
   if (clr) clr.addEventListener("click", () => runFileSearch(""));
 }
 
+/** Sunday starting the diary's displayed week (offset from this week). */
+function diaryWeekStart() {
+  const now = new Date();
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  d.setDate(d.getDate() - d.getDay() + state.diaryOffset * 7);
+  return d;
+}
+
+/** Appointments starting inside the diary's displayed week. */
+function diaryWeekAppts() {
+  const start = diaryWeekStart();
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
+  return state.diary.filter((a) => {
+    const s = new Date(a.starts_at);
+    return s >= start && s < end;
+  }).sort((a, b) => String(a.starts_at).localeCompare(String(b.starts_at)));
+}
+
+/** Weekly appointment diary: one side-panel widget per conversation. */
+function diaryPanelHtml() {
+  const start = diaryWeekStart();
+  const end = new Date(start);
+  end.setDate(end.getDate() + 6);
+  const dFmt = (d, opts) => d.toLocaleDateString(undefined, opts);
+  const label = start.getMonth() === end.getMonth()
+    ? `${dFmt(start, { month: "short", day: "numeric" })} – ${end.getDate()}, ${end.getFullYear()}`
+    : `${dFmt(start, { month: "short", day: "numeric" })} – ${dFmt(end, { month: "short", day: "numeric", year: "numeric" })}`;
+  const todayStr = new Date().toDateString();
+  const week = diaryWeekAppts();
+  const byDay = new Map();
+  for (const a of week) {
+    const s = new Date(a.starts_at);
+    const key = `${s.getFullYear()}-${s.getMonth()}-${s.getDate()}`;
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(a);
+  }
+  const tFmt = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  let days = "";
+  for (let i = 0; i < 7; i++) {
+    const day = new Date(start);
+    day.setDate(day.getDate() + i);
+    const key = `${day.getFullYear()}-${day.getMonth()}-${day.getDate()}`;
+    const appts = byDay.get(key) || [];
+    const cards = appts.map((a) => {
+      const s = new Date(a.starts_at), e = new Date(a.ends_at);
+      return `<div class="dp-appt">
+        <div class="dp-time">${tFmt(s)} – ${tFmt(e)}</div>
+        <div class="dp-title">${esc(a.title)}</div>
+        ${a.location ? `<div class="dp-loc">${icon("pin")}<span>${esc(a.location)}</span></div>` : ""}
+        ${a.description ? `<div class="dp-desc">${esc(a.description)}</div>` : ""}
+        <div class="dp-foot">${apptStatusChip(a.status)}</div>
+      </div>`;
+    }).join("");
+    days += `<div class="dp-day${day.toDateString() === todayStr ? " today" : ""}">
+      <div class="dp-dayhead"><span class="dp-dow">${dFmt(day, { weekday: "short" })}</span><span class="dp-dnum">${day.getDate()}</span></div>
+      ${appts.length ? `<div class="dp-appts">${cards}</div>` : `<div class="dp-none">&mdash;</div>`}
+    </div>`;
+  }
+  return `
+    <aside class="files-panel diary-panel" id="files-panel" aria-label="Appointment diary">
+      <div class="fp-head">${icon("calendar")}<span class="fp-title">Diary</span>${week.length ? `<span class="fp-count">${week.length}</span>` : ""}<button class="fp-close" id="fp-close" aria-label="Close diary">${icon("close")}</button></div>
+      <div class="dp-weeknav">
+        <button class="dp-nav" id="dp-prev" aria-label="Previous week">${icon("chevL")}</button>
+        <button class="dp-today" id="dp-today">Today</button>
+        <span class="dp-label">${esc(label)}</span>
+        <button class="dp-nav" id="dp-next" aria-label="Next week">${icon("chevR")}</button>
+      </div>
+      <div class="dp-days" id="dp-body">${days}</div>
+      <div class="dp-hint">Invitations sent or received here land in this diary.</div>
+    </aside>`;
+}
+
+/** The side panel shows Shared files or the Diary, never both. */
+function sidePanelHtml() {
+  return state.panel === "diary" ? diaryPanelHtml() : filesPanelHtml();
+}
+
+/** Wire the diary's week navigation. Safe to call after a panel re-render. */
+function wireDiaryPanel() {
+  const prev = $("#dp-prev"), next = $("#dp-next"), today = $("#dp-today");
+  if (prev) prev.addEventListener("click", () => { state.diaryOffset--; renderSidePanel(); });
+  if (next) next.addEventListener("click", () => { state.diaryOffset++; renderSidePanel(); });
+  if (today) today.addEventListener("click", () => { state.diaryOffset = 0; renderSidePanel(); });
+}
+
+/** Swap the side panel's content in place (week navigation, search). */
+function renderSidePanel() {
+  const panel = $("#files-panel");
+  if (!panel || !state.conv) return;
+  panel.outerHTML = sidePanelHtml();
+  const fpc = $("#fp-close");
+  if (fpc) fpc.addEventListener("click", () => { state.panel = null; renderConversationDetail(); });
+  wireFilesPanel();
+  wireDiaryPanel();
+}
+
+/** Accept or decline an invitation from its card. */
+async function setApptStatus(id, status) {
+  const conv = state.conv;
+  if (!conv) return;
+  try {
+    const r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/appointments/" + encodeURIComponent(id) + "/status", {
+      method: "POST",
+      body: JSON.stringify({ status }),
+    });
+    for (const m of state.messages) {
+      if (m.appointment && String(m.appointment.id) === String(id)) m.appointment = r.appointment;
+    }
+    await refreshDiary();
+    renderConversationDetail();
+    toast(status === "accepted" ? "Invitation accepted." : status === "declined" ? "Invitation declined." : "Invitation updated.");
+  } catch (e) {
+    toast(e.message || "Couldn't update the invitation.", true);
+  }
+}
+
 function renderConversationDetail() {
   const conv = state.conv;
   if (!conv) { location.hash = "#/conversations"; return; }
@@ -575,7 +758,7 @@ function renderConversationDetail() {
 
   app.innerHTML = `
     <div class="view conv-view">
-      <div class="conv-layout${state.filesOpen ? " files-open" : ""}">
+      <div class="conv-layout${state.panel ? " files-open" : ""}">
         <div class="conv-main">
           <div class="nav-bar">
             <button class="nav-back" id="back">${icon("back")}Conversations</button>
@@ -584,7 +767,8 @@ function renderConversationDetail() {
               <div class="nav-title small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(conv.title)}</div>
               <div style="font-size:12px;color:var(--label-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(memberNames)}${conv.is_group ? " · " + (conv.members.length + 1) + "/8" : ""}</div>
             </div>
-            <button class="nav-action files-toggle" id="files-toggle" aria-label="Shared files" title="Shared files">${icon("files")}${state.files.length ? `<span class="ft-badge">${state.files.length}</span>` : ""}</button>
+            <button class="nav-action diary-toggle${state.panel === "diary" ? " on" : ""}" id="diary-toggle" aria-label="Appointment diary" title="Appointment diary">${icon("calendar")}${diaryWeekAppts().length ? `<span class="ft-badge">${diaryWeekAppts().length}</span>` : ""}</button>
+            <button class="nav-action files-toggle${state.panel === "files" ? " on" : ""}" id="files-toggle" aria-label="Shared files" title="Shared files">${icon("files")}${state.files.length ? `<span class="ft-badge">${state.files.length}</span>` : ""}</button>
             ${conv.is_group ? `<button class="nav-action" id="grp-edit">Edit</button>` : ""}
           </div>
           <div class="msg-scroll" id="msgs">${body || `<div class="empty">${icon("send", "big")}<h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
@@ -597,17 +781,18 @@ function renderConversationDetail() {
           </div>
           <div class="composer">
               ${state.replyTo ? `<div class="reply-bar"><span>${icon("reply")}Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply" aria-label="Cancel reply">${icon("close")}</button></div>` : ""}
+            ${state.eventForm ? eventFormHtml() : ""}
             <div class="grow">
               ${pending.length ? `<div class="pending-files" id="pending">${pending.map((f, i) => `
                 <span class="pchip">${icon(attIconName(attKind(f.type)))}<span class="pchip-name">${esc(f.name)}</span><span class="pchip-size">${esc(fmtSize(f.size))}</span><button class="pchip-x" data-pchip="${i}" aria-label="Remove ${esc(f.name)}">${icon("close")}</button></span>`).join("")}</div>` : ""}
               <div class="subject-line${ch === "email" && !state.replyTo ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
               <textarea id="draft" rows="1" placeholder="Message ${ch ? CHAN_META[ch].label : ""}…"></textarea>
             </div>
-            ${ch === "email" ? `<button class="attach-btn" id="attach" aria-label="Attach files" title="Attach files (25 MB max each)">${icon("paperclip")}</button><input type="file" id="filepick" multiple hidden>` : ""}
+            ${ch === "email" ? `<button class="attach-btn" id="attach" aria-label="Attach files" title="Attach files (25 MB max each)">${icon("paperclip")}</button><input type="file" id="filepick" multiple hidden><button class="cal-btn${state.eventForm ? " on" : ""}" id="calinvite" aria-label="Send calendar invitation" title="Send calendar invitation">${icon("calendar")}</button>` : ""}
             <button class="send-btn" id="send" aria-label="Send" ${ch ? "" : "disabled"}>${icon("send")}</button>
           </div>
         </div>
-        ${filesPanelHtml()}
+        ${sidePanelHtml()}
       </div>
     </div>`;
 
@@ -615,11 +800,16 @@ function renderConversationDetail() {
   const ge = $("#grp-edit");
   if (ge) ge.addEventListener("click", () => openGroupSheet(conv));
 
-  // Shared-files widget: toggle + tiles + bubble attachments.
-  $("#files-toggle").addEventListener("click", () => { state.filesOpen = !state.filesOpen; renderConversationDetail(); });
+  // Side panel: shared files and the appointment diary.
+  $("#files-toggle").addEventListener("click", () => { state.panel = state.panel === "files" ? null : "files"; renderConversationDetail(); });
+  $("#diary-toggle").addEventListener("click", () => { state.panel = state.panel === "diary" ? null : "diary"; renderConversationDetail(); });
   const fpc = $("#fp-close");
-  if (fpc) fpc.addEventListener("click", () => { state.filesOpen = false; renderConversationDetail(); });
+  if (fpc) fpc.addEventListener("click", () => { state.panel = null; renderConversationDetail(); });
   wireFilesPanel();
+  wireDiaryPanel();
+  // Invitation cards: accept / decline inbound invites.
+  $$("#msgs [data-appt-accept]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptAccept, "accepted")));
+  $$("#msgs [data-appt-decline]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptDecline, "declined")));
   $$("#msgs [data-att]").forEach((b) => b.addEventListener("click", () => {
     const id = b.dataset.att;
     const i = activeFiles().findIndex((f) => String(f.id) === String(id));
@@ -637,6 +827,29 @@ function renderConversationDetail() {
     renderConversationDetail();
     $("#draft").focus();
   }));
+
+  // Calendar invitation (email channel only): inline form in the composer.
+  const calBtn = $("#calinvite");
+  if (calBtn) calBtn.addEventListener("click", () => {
+    state.eventForm = !state.eventForm;
+    renderConversationDetail();
+    if (state.eventForm) $("#ef-title")?.focus(); else $("#draft")?.focus();
+  });
+  const efCancel = $("#ef-cancel");
+  if (efCancel) efCancel.addEventListener("click", () => {
+    state.eventForm = false; state.eventDraft = null;
+    renderConversationDetail();
+    $("#draft")?.focus();
+  });
+  // Keep the invitation draft across re-renders.
+  for (const [fid, key] of [["ef-title", "title"], ["ef-start", "start"], ["ef-end", "end"], ["ef-loc", "loc"], ["ef-desc", "desc"]]) {
+    const el = document.getElementById(fid);
+    if (el) el.addEventListener("input", () => {
+      state.eventDraft = { ...(state.eventDraft || {}), [key]: el.value };
+    });
+  }
+  const efSend = $("#ef-send");
+  if (efSend) efSend.addEventListener("click", sendInvite);
 
   // Attachments (email channel only).
   const attachBtn = $("#attach");
@@ -691,16 +904,54 @@ function senderName(m) {
   return "";
 }
 
+/** Inline calendar-invitation form inside the composer (email channel only). */
+function eventFormHtml() {
+  const d = state.eventDraft || {};
+  return `<div class="event-form" id="event-form">
+    <div class="ef-title">${icon("calendar")}<span>Calendar invitation</span><button class="ef-x" id="ef-cancel" aria-label="Cancel invitation" title="Cancel invitation">${icon("close")}</button></div>
+    <input class="text-input" id="ef-title" placeholder="Event title" value="${esc(d.title || "")}" autocomplete="off" aria-label="Event title">
+    <div class="ef-row">
+      <label>Starts<input type="datetime-local" id="ef-start" value="${esc(d.start || "")}" aria-label="Start time"></label>
+      <label>Ends<input type="datetime-local" id="ef-end" value="${esc(d.end || "")}" aria-label="End time"></label>
+    </div>
+    <input class="text-input" id="ef-loc" placeholder="Location (optional)" value="${esc(d.loc || "")}" autocomplete="off" aria-label="Location">
+    <textarea id="ef-desc" rows="2" placeholder="Notes (optional)" aria-label="Notes">${esc(d.desc || "")}</textarea>
+    <div class="ef-actions"><span class="ef-hint">Goes out as an .ics invitation by email</span><button class="ef-send" id="ef-send">Send invitation</button></div>
+  </div>`;
+}
+
+/** Validate the invitation form, then send it with the message. */
+async function sendInvite() {
+  const d = state.eventDraft || {};
+  const title = String(d.title || "").trim();
+  const startV = String(d.start || ""), endV = String(d.end || "");
+  if (!title) { toast("Give the invitation a title.", true); return; }
+  const s = new Date(startV), e = new Date(endV);
+  if (!startV || !endV || isNaN(s.getTime()) || isNaN(e.getTime())) { toast("Pick a start and end time.", true); return; }
+  if (e.getTime() <= s.getTime()) { toast("The end time has to be after the start time.", true); return; }
+  state.pendingEvent = {
+    title,
+    starts_at: s.toISOString(),
+    ends_at: e.toISOString(),
+    location: String(d.loc || "").trim(),
+    description: String(d.desc || "").trim(),
+  };
+  state.eventForm = false;
+  await sendMsg();
+}
+
 async function sendMsg() {
   const conv = state.conv;
   const ch = selectedChannel();
   if (!conv || !ch || state.sending) return;
   const body = $("#draft").value;
   const files = state.pendingFiles.slice();
-  if (!body.trim() && !files.length) return;
-  if (files.length && ch !== "email") { toast("Files can only be sent by email — switch channels or remove them.", true); return; }
+  const event = state.pendingEvent;
+  if (!body.trim() && !files.length && !event) return;
+  if ((files.length || event) && ch !== "email") { toast("Invitations and files go out by email — switch channels or drop them.", true); return; }
   state.sending = true;
   $("#send").disabled = true;
+  const clearEvent = () => { state.pendingEvent = null; state.eventDraft = null; state.eventForm = false; };
   try {
     let r;
     if (files.length) {
@@ -709,27 +960,32 @@ async function sendMsg() {
       form.set("body", body);
       form.set("subject", ch === "email" ? ($("#subject")?.value || "") : "");
       if (state.replyTo) form.set("in_reply_to", state.replyTo.id);
+      if (event) form.set("event", JSON.stringify(event));
       for (const f of files) form.append("files", f, f.name);
       r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages", { method: "POST", body: form });
     } else {
       r = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages", {
         method: "POST",
-        body: JSON.stringify({ channel: ch, body, subject: ch === "email" ? ($("#subject")?.value || "") : "", in_reply_to: state.replyTo ? state.replyTo.id : undefined }),
+        body: JSON.stringify({ channel: ch, body, subject: ch === "email" ? ($("#subject")?.value || "") : "", in_reply_to: state.replyTo ? state.replyTo.id : undefined, event: event || undefined }),
       });
     }
     state.messages.push(r.message);
     state.replyTo = null;
     state.pendingFiles = [];
+    clearEvent();
     state.dropDraft = true; // the send consumed the draft — don't restore it
     await refreshFiles();
+    await refreshDiary();
     renderConversationDetail();
   } catch (e) {
     if (e.failed_message) {
       state.messages.push(e.failed_message);
       state.replyTo = null;
       state.pendingFiles = [];
+      clearEvent();
       state.dropDraft = true;
       await refreshFiles();
+      await refreshDiary();
       renderConversationDetail();
       toast(e.message, true);
     } else {
@@ -768,6 +1024,7 @@ async function refreshConversation() {
     state.messages = m.messages || [];
     if (state.messages.length !== before) {
       await refreshFiles();
+      await refreshDiary();
       const sc = $("#msgs");
       const nearBottom = sc && (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120);
       renderConversationDetail();

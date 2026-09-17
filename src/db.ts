@@ -111,6 +111,23 @@ export function openDb(path: string): Database {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_attachments_msg ON attachments(message_id);
+    CREATE TABLE IF NOT EXISTS appointments (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      message_id TEXT NOT NULL DEFAULT '',
+      uid TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      starts_at TEXT NOT NULL,
+      ends_at TEXT NOT NULL,
+      location TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      organizer TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'sent',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_appt_conv ON appointments(conversation_id, starts_at);
+    CREATE INDEX IF NOT EXISTS idx_appt_msg ON appointments(message_id);
+    CREATE INDEX IF NOT EXISTS idx_appt_uid ON appointments(uid);
     CREATE TABLE IF NOT EXISTS kv (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL DEFAULT ''
@@ -296,6 +313,83 @@ export function insertAttachment(a: { message_id: string; filename: string; mime
 
 export function getAttachment(id: string): Attachment | null {
   return (db.query("SELECT * FROM attachments WHERE id = ?").get(id) as Attachment) || null;
+}
+
+// ---------- appointments ----------
+
+export interface Appointment {
+  id: string;
+  conversation_id: string;
+  message_id: string;
+  uid: string;
+  title: string;
+  starts_at: string;
+  ends_at: string;
+  location: string;
+  description: string;
+  organizer: string;
+  /** sent | received | accepted | declined | cancelled */
+  status: string;
+  created_at: string;
+}
+
+export function insertAppointment(a: {
+  conversation_id: string; message_id?: string; uid?: string; title: string;
+  starts_at: string; ends_at: string; location?: string; description?: string;
+  organizer?: string; status?: string;
+}): Appointment {
+  const row: Appointment = {
+    id: uid(),
+    conversation_id: a.conversation_id,
+    message_id: a.message_id || "",
+    uid: a.uid || "",
+    title: a.title,
+    starts_at: a.starts_at,
+    ends_at: a.ends_at,
+    location: a.location || "",
+    description: a.description || "",
+    organizer: a.organizer || "",
+    status: a.status || "sent",
+    created_at: now(),
+  };
+  db.query(`INSERT INTO appointments
+    (id, conversation_id, message_id, uid, title, starts_at, ends_at, location, description, organizer, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    row.id, row.conversation_id, row.message_id, row.uid, row.title, row.starts_at,
+    row.ends_at, row.location, row.description, row.organizer, row.status, row.created_at);
+  return row;
+}
+
+/** Every appointment in a conversation, chronological. */
+export function listAppointments(convId: string): Appointment[] {
+  return db.query("SELECT * FROM appointments WHERE conversation_id = ? ORDER BY starts_at, created_at")
+    .all(convId) as Appointment[];
+}
+
+export function getAppointment(id: string): Appointment | null {
+  return (db.query("SELECT * FROM appointments WHERE id = ?").get(id) as Appointment) || null;
+}
+
+export function getAppointmentByUid(uid: string): Appointment | null {
+  if (!uid) return null;
+  return (db.query("SELECT * FROM appointments WHERE uid = ? LIMIT 1").get(uid) as Appointment) || null;
+}
+
+/** First appointment per message, for a batch of message ids. */
+export function getAppointmentsForMessages(messageIds: string[]): Map<string, Appointment> {
+  const out = new Map<string, Appointment>();
+  if (!messageIds.length) return out;
+  const placeholders = messageIds.map(() => "?").join(",");
+  const rows = db.query(
+    `SELECT * FROM appointments WHERE message_id IN (${placeholders}) ORDER BY created_at`
+  ).all(...messageIds) as Appointment[];
+  for (const r of rows) if (r.message_id && !out.has(r.message_id)) out.set(r.message_id, r);
+  return out;
+}
+
+export function setAppointmentStatus(id: string, status: string): Appointment | null {
+  db.query("UPDATE appointments SET status = ? WHERE id = ?").run(status, id);
+  return getAppointment(id);
 }
 
 /** All attachments for a set of message ids, in one query. */

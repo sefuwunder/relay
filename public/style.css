@@ -408,8 +408,9 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
 /* ---------- shared files widget ---------- */
 .conv-layout { flex: 1; display: flex; min-height: 0; }
 .conv-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.files-toggle { position: relative; }
-.files-toggle .ic { width: 22px; height: 22px; }
+.files-toggle, .diary-toggle { position: relative; }
+.files-toggle .ic, .diary-toggle .ic { width: 22px; height: 22px; }
+.nav-action.on { color: var(--blue-deep); }
 .ft-badge { position: absolute; top: 2px; right: 0; background: var(--blue); color: #fff; font-size: 10px; font-weight: 700; min-width: 16px; height: 16px; border-radius: 8px; display: flex; align-items: center; justify-content: center; padding: 0 4px; }
 .files-panel { display: none; flex-direction: column; background: var(--card); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border-left: 1px solid var(--hairline); min-height: 0; }
 .fp-head { display: flex; align-items: center; gap: 8px; padding: 14px 14px 10px; font-weight: 700; font-size: 15px; }
@@ -486,7 +487,7 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
   .conv-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; }
   .conv-view .conv-main { max-width: none; margin: 0; }
   .files-panel { display: flex; }
-  .files-toggle, .fp-close { display: none; }
+  .fp-close { display: none; }
   .people-grid { grid-template-columns: repeat(5, 1fr); }
 }
 @media (max-width: 1099.98px) {
@@ -496,3 +497,70 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
   .people-grid { grid-template-columns: repeat(6, 1fr); }
 }
 @keyframes fp-in { from { transform: translateX(40px); opacity: 0.5; } to { transform: none; opacity: 1; } }
+
+/* ---------- calendar invitations ---------- */
+.cal-btn { width: 42px; height: 42px; border-radius: 50%; border: none; cursor: pointer; flex-shrink: 0; background: rgba(120,120,128,0.16); color: var(--label-2); display: flex; align-items: center; justify-content: center; transition: transform 0.12s ease; }
+.cal-btn:active { transform: scale(0.9); }
+.cal-btn .ic { width: 22px; height: 22px; }
+.cal-btn.on { background: var(--blue); color: #fff; }
+.event-form { background: rgba(120,120,128,0.10); border: 1px solid var(--hairline); border-radius: 14px; padding: 10px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 8px; }
+.ef-title { display: flex; align-items: center; gap: 6px; font-weight: 700; font-size: 13px; color: var(--label-2); }
+.ef-title .ic { width: 16px; height: 16px; }
+.ef-title span { flex: 1; }
+.ef-x { background: none; border: none; cursor: pointer; color: var(--label-3); padding: 4px; display: flex; border-radius: 8px; }
+.ef-x .ic { width: 14px; height: 14px; }
+.ef-row { display: flex; gap: 8px; }
+.ef-row label { flex: 1; min-width: 0; font-size: 11px; font-weight: 600; color: var(--label-3); display: flex; flex-direction: column; gap: 4px; }
+.event-form input[type="datetime-local"] { width: 100%; font: inherit; font-size: 14px; color: var(--label); background: var(--field); border: 1px solid var(--hairline); border-radius: 12px; padding: 10px 12px; outline: none; }
+.event-form input[type="datetime-local"]:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(10,132,255,0.18); }
+#ef-desc { width: 100%; font: inherit; font-size: 14px; color: var(--label); background: var(--field); border: 1px solid var(--hairline); border-radius: 12px; padding: 10px 12px; outline: none; resize: vertical; min-height: 52px; }
+#ef-desc:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(10,132,255,0.18); }
+.ef-actions { display: flex; align-items: center; gap: 10px; }
+.ef-hint { flex: 1; font-size: 11px; color: var(--label-3); }
+.ef-send { border: none; border-radius: 999px; background: var(--blue); color: #fff; font: inherit; font-size: 13px; font-weight: 700; padding: 9px 16px; cursor: pointer; }
+.ef-send:active { transform: scale(0.97); }
+
+/* invitation card inside a message bubble */
+.invite-card { background: rgba(120,120,128,0.10); border: 1px solid var(--hairline); border-radius: 12px; padding: 10px 12px; margin-top: 6px; display: flex; flex-direction: column; gap: 6px; max-width: 340px; }
+.inv-head { display: flex; align-items: center; gap: 10px; }
+.inv-head > .ic { width: 26px; height: 26px; color: var(--blue); flex-shrink: 0; }
+.inv-meta { flex: 1; min-width: 0; }
+.inv-title { font-weight: 700; font-size: 14px; }
+.inv-when { font-size: 12px; color: var(--label-2); margin-top: 2px; }
+.inv-loc { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--label-2); }
+.inv-loc .ic { width: 14px; height: 14px; flex-shrink: 0; }
+.inv-desc { font-size: 12px; color: var(--label-2); white-space: pre-wrap; }
+.inv-actions { display: flex; gap: 8px; margin-top: 2px; }
+.inv-btn { flex: 1; border: none; border-radius: 10px; padding: 8px; font: inherit; font-weight: 700; font-size: 13px; cursor: pointer; }
+.inv-btn.accept { background: var(--green); color: #fff; }
+.inv-btn.decline { background: rgba(120,120,128,0.16); color: var(--label-1); }
+.inv-btn:active { transform: scale(0.97); }
+.appt-status { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; padding: 3px 8px; border-radius: 999px; background: rgba(120,120,128,0.18); color: var(--label-2); white-space: nowrap; }
+.appt-status.st-received { background: rgba(37,99,235,0.16); color: var(--blue); }
+.appt-status.st-accepted { background: rgba(22,163,74,0.16); color: var(--green); }
+.appt-status.st-declined { background: rgba(220,38,38,0.14); color: var(--red); }
+.appt-status.st-cancelled { opacity: 0.6; }
+
+/* ---------- appointment diary widget ---------- */
+.dp-weeknav { display: flex; align-items: center; gap: 6px; padding: 0 14px 10px; }
+.dp-nav { background: rgba(120,120,128,0.14); border: none; border-radius: 10px; width: 30px; height: 30px; cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--label-2); flex-shrink: 0; }
+.dp-nav .ic { width: 16px; height: 16px; }
+.dp-today { border: none; background: rgba(120,120,128,0.14); border-radius: 10px; padding: 6px 10px; font: inherit; font-size: 12px; font-weight: 600; color: var(--label-2); cursor: pointer; }
+.dp-label { flex: 1; text-align: center; font-size: 12px; font-weight: 600; color: var(--label-2); }
+.dp-days { flex: 1; overflow-y: auto; padding: 0 14px 12px; display: flex; flex-direction: column; gap: 10px; }
+.dp-day { border: 1px solid var(--hairline); border-radius: 12px; padding: 8px 10px; }
+.dp-day.today { border-color: var(--blue); }
+.dp-dayhead { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.dp-dow { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--label-3); }
+.dp-dnum { font-size: 15px; font-weight: 700; }
+.dp-day.today .dp-dnum { color: var(--blue); }
+.dp-none { color: var(--label-3); font-size: 13px; }
+.dp-appts { display: flex; flex-direction: column; gap: 8px; }
+.dp-appt { background: rgba(120,120,128,0.10); border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 3px; }
+.dp-time { font-size: 11px; font-weight: 700; color: var(--blue); }
+.dp-title { font-size: 13px; font-weight: 700; }
+.dp-loc { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--label-2); }
+.dp-loc .ic { width: 12px; height: 12px; flex-shrink: 0; }
+.dp-desc { font-size: 11px; color: var(--label-2); white-space: pre-wrap; }
+.dp-foot { margin-top: 2px; }
+.dp-hint { padding: 10px 14px 14px; font-size: 11px; color: var(--label-3); }

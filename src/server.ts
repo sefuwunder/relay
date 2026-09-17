@@ -8,8 +8,10 @@ import {
   getConversation, conversationMembers, dmFor, createGroup, listConversations, markRead,
   listMessages, insertMessage, hasExternalId, kvGet, kvSet, MAX_PEOPLE,
   insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, searchConversationAttachments, deleteConversationData,
-  type Contact, type Conversation, type Channel, type Message, type Attachment,
+  insertAppointment, listAppointments, getAppointment, getAppointmentByUid, getAppointmentsForMessages, setAppointmentStatus,
+  type Contact, type Conversation, type Channel, type Message, type Attachment, type Appointment,
 } from "./db";
+import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
 import { sendMail, validateSmtp, gvGatewayAddress, newMessageId, type SmtpConfig, type MailAttachment } from "./smtp";
 import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, type ImapConfig, type SentMailItem, type InboundAttachment } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
@@ -66,7 +68,7 @@ const MAX_FILES_PER_MESSAGE = 10;
 const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25 MB per file
 
 /** Embed each message's file metadata (no bytes) for the UI. */
-function withAttachments<T extends Message>(msgs: T[]): (T & { attachments: Attachment[] })[] {
+function withAttachments<T extends Message>(msgs: T[]): (T & { attachments: Attachment[]; appointment: Appointment | null })[] {
   const all = listAttachmentsForMessages(msgs.map((m) => m.id));
   const byMsg = new Map<string, Attachment[]>();
   for (const a of all) {
@@ -74,7 +76,76 @@ function withAttachments<T extends Message>(msgs: T[]): (T & { attachments: Atta
     list.push(a);
     byMsg.set(a.message_id, list);
   }
-  return msgs.map((m) => ({ ...m, attachments: byMsg.get(m.id) || [] }));
+  const appts = getAppointmentsForMessages(msgs.map((m) => m.id));
+  return msgs.map((m) => ({ ...m, attachments: byMsg.get(m.id) || [], appointment: appts.get(m.id) || null }));
+}
+
+/** True when an attachment is a calendar invitation. */
+function isCalendarAttachment(a: { mime: string; filename: string }): boolean {
+  return a.mime === "text/calendar" || /\.ics$/i.test(a.filename);
+}
+
+/**
+ * Scan a message's attachments for calendar invites and record one
+ * appointment per ICS event (deduped by UID). Called after both inbound
+ * and sent-mail attachment saves.
+ */
+async function ingestCalendarAttachments(messageId: string, convId: string, direction: "in" | "out"): Promise<void> {
+  const atts = listAttachmentsForMessages([messageId]).filter(isCalendarAttachment);
+  if (!atts.length) return;
+  const { readFile } = await import("node:fs/promises");
+  for (const a of atts) {
+    let text = "";
+    try {
+      text = await readFile(attachmentPath(a.id), "utf8");
+    } catch {
+      continue;
+    }
+    for (const ev of parseIcs(text)) {
+      if (!ev.uid || getAppointmentByUid(ev.uid)) continue;
+      insertAppointment({
+        conversation_id: convId,
+        message_id: messageId,
+        uid: ev.uid,
+        title: ev.summary,
+        starts_at: ev.dtstart,
+        ends_at: ev.dtend,
+        location: ev.location,
+        description: ev.description,
+        status: direction === "in" ? "received" : "sent",
+      });
+    }
+  }
+}
+
+/** Parse and validate an inline calendar-invitation payload (object or JSON string). */
+function parseInviteParam(raw: unknown): {
+  title: string; startsAt: string; endsAt: string; location: string; description: string; uid: string;
+} | null {
+  if (raw == null || raw === "") return null;
+  let ev: any = raw;
+  if (typeof ev === "string") {
+    try {
+      ev = JSON.parse(ev);
+    } catch {
+      throw new Error("That invitation didn't parse — try again.");
+    }
+  }
+  if (typeof ev !== "object") throw new Error("That invitation didn't parse — try again.");
+  const title = String(ev.title || "").trim();
+  if (!title) throw new Error("Give the invitation a title.");
+  const s = new Date(String(ev.starts_at || ev.startsAt || ""));
+  const e = new Date(String(ev.ends_at || ev.endsAt || ""));
+  if (isNaN(s.getTime()) || isNaN(e.getTime())) throw new Error("Pick a valid start and end time.");
+  if (e.getTime() <= s.getTime()) throw new Error("The end time has to be after the start time.");
+  return {
+    title: title.slice(0, 200),
+    startsAt: s.toISOString(),
+    endsAt: e.toISOString(),
+    location: String(ev.location || "").slice(0, 200),
+    description: String(ev.description || "").slice(0, 2000),
+    uid: newEventUid(),
+  };
 }
 
 /** Sanitize an uploaded filename for storage + MIME headers. */
@@ -523,7 +594,7 @@ async function pollMail() {
     const contacts = listContacts();
     const byEmail = new Map(contacts.filter((c) => c.email).map((c) => [c.email.toLowerCase(), c]));
     const byGv = new Map(contacts.map((c) => [normDigits(c.gv_number), c]).filter(([d]) => d.length === 10) as [string, Contact][]);
-    const inboundFiles: { uid: string; messageId: string }[] = [];
+    const inboundFiles: { uid: string; messageId: string; convId: string }[] = [];
     for (const m of mails) {
       const extId = `mail:${m.uid}`;
       if (hasExternalId(extId)) continue;
@@ -554,7 +625,7 @@ async function pollMail() {
         external_id: extId, message_id: m.messageId || "", status: "",
       });
       // Inbound email attachments ride along on the message (GV forwards are SMS — no files).
-      if (channel === "email") inboundFiles.push({ uid: m.uid, messageId: msg.id });
+      if (channel === "email") inboundFiles.push({ uid: m.uid, messageId: msg.id, convId: conv.id });
     }
     if (inboundFiles.length) {
       try {
@@ -565,6 +636,8 @@ async function pollMail() {
           if (files.length && listAttachmentsForMessages([p.messageId]).length === 0) {
             await saveMessageAttachments(p.messageId, files);
           }
+          // Calendar invitations arrive as .ics attachments.
+          await ingestCalendarAttachments(p.messageId, p.convId, "in");
         }
       } catch (e) {
         console.error("inbound attachment fetch failed:", e instanceof Error ? e.message : e);
@@ -673,6 +746,8 @@ async function importSentItem(
     status: "sent", created_at: item.date || undefined,
   });
   if (files.length) await saveMessageAttachments(msg.id, files);
+  // Invitations sent from a regular mail app land in the diary too.
+  await ingestCalendarAttachments(msg.id, conv.id, "out");
 }
 
 /**
@@ -1070,7 +1145,7 @@ const server = (Bun as any).serve({
               if (data.length) files.push({ filename: a.filename, mime: a.mime, data });
             }
             const msg = await sendConversationMessage(id, row.channel as Channel, row.body, row.subject || "", undefined, row.id, files);
-            return json({ message: { ...msg, attachments: stored } });
+            return json({ message: withAttachments([msg])[0] });
           } catch (e) {
             return atErr(e);
           }
@@ -1101,15 +1176,63 @@ const server = (Bun as any).serve({
             if (files.length && channel !== "email") {
               return json({ error: "Files can only be sent by email for now — switch to the Email channel to attach them." }, 400);
             }
+            // Inline calendar invitation: the details ride along as a
+            // generated .ics attachment and land in the diary widget.
+            let invite: ReturnType<typeof parseInviteParam>;
             try {
-              const msg = await sendConversationMessage(id, channel, String(b.body || ""), String(b.subject || ""), typeof b.in_reply_to === "string" ? b.in_reply_to : undefined, undefined, files);
+              invite = parseInviteParam(b.event);
+            } catch (e) {
+              return json({ error: errMsg(e) }, 400);
+            }
+            if (invite && channel !== "email") {
+              return json({ error: "Calendar invitations go out by email — switch to the Email channel." }, 400);
+            }
+            const sendFiles = files.slice();
+            if (invite) {
+              const members = conversationMembers(id);
+              const ics = buildIcs({
+                uid: invite.uid,
+                summary: invite.title,
+                startsAt: new Date(invite.startsAt),
+                endsAt: new Date(invite.endsAt),
+                location: invite.location || undefined,
+                description: invite.description || undefined,
+                organizer: settings.smtp.from || undefined,
+                attendees: members.map((m) => m.email).filter(Boolean) as string[],
+              });
+              sendFiles.push({ filename: "invite.ics", mime: "text/calendar", data: Buffer.from(ics, "utf8") });
+            }
+            const recordInvite = (messageId: string) => {
+              // The uid dedupe also protects the sent-mail import from
+              // recording this same invitation a second time.
+              if (invite && !getAppointmentByUid(invite.uid)) {
+                insertAppointment({
+                  conversation_id: id,
+                  message_id: messageId,
+                  uid: invite.uid,
+                  title: invite.title,
+                  starts_at: invite.startsAt,
+                  ends_at: invite.endsAt,
+                  location: invite.location,
+                  description: invite.description,
+                  organizer: settings.smtp.from || "",
+                  status: "sent",
+                });
+              }
+            };
+            try {
+              const bodyText = String(b.body || "") || (invite ? `📅 Calendar invitation: ${invite.title}` : "");
+              const subjText = String(b.subject || "") || (invite ? `Invitation: ${invite.title}` : "");
+              const msg = await sendConversationMessage(id, channel, bodyText, subjText, typeof b.in_reply_to === "string" ? b.in_reply_to : undefined, undefined, sendFiles);
+              recordInvite(msg.id);
               return json({ message: withAttachments([msg])[0] }, 201);
             } catch (e) {
               // Record the failed attempt so nothing silently vanishes.
               let failedMsg = null;
               try {
                 failedMsg = insertMessage({ conversation_id: id, channel, direction: "out", body: String(b.body || ""), subject: String(b.subject || ""), external_id: "", status: "failed" });
-                if (files.length) await saveMessageAttachments(failedMsg.id, files);
+                if (sendFiles.length) await saveMessageAttachments(failedMsg.id, sendFiles);
+                recordInvite(failedMsg.id);
               } catch { /* noop */ }
               const res = atErr(e);
               if (failedMsg) {
@@ -1120,6 +1243,34 @@ const server = (Bun as any).serve({
               return res;
             }
           }
+        }
+      }
+      {
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/appointments$/);
+        if (m && method === "GET") {
+          const id = decodeURIComponent(m[1]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          return json({ appointments: listAppointments(id) });
+        }
+      }
+      {
+        // Accept / decline / cancel an appointment from an invitation card.
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/appointments\/([^/]+)\/status$/);
+        if (m && method === "POST") {
+          const id = decodeURIComponent(m[1]);
+          const apptId = decodeURIComponent(m[2]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          const appt = getAppointment(apptId);
+          if (!appt || appt.conversation_id !== id) return json({ error: "not found" }, 404);
+          let body: any = {};
+          try {
+            body = await readBody(req);
+          } catch { /* noop */ }
+          const status = String(body.status || "");
+          if (!["accepted", "declined", "cancelled"].includes(status)) {
+            return json({ error: "Pick accepted, declined, or cancelled." }, 400);
+          }
+          return json({ appointment: setAppointmentStatus(apptId, status) });
         }
       }
       {
