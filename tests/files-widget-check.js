@@ -58,7 +58,7 @@ function load(f, extra) {
   (0, eval)(code + `\n//# sourceURL=${f}`);
 }
 load("icons.js", "\n;globalThis.__ICONS__ = ICONS;");
-load("app.js", "\n;globalThis.__APP__ = { state, renderConversationDetail, openLightbox, closeLightbox, bubbleAtts, filesPanelHtml, activeFiles, runFileSearch, wireFilesPanel, refreshFiles, fmtSize, attKind };");
+load("app.js", "\n;globalThis.__APP__ = { state, renderConversationDetail, openLightbox, closeLightbox, bubbleAtts, filesPanelHtml, activeFiles, runFileSearch, wireFilesPanel, refreshFiles, fmtSize, attKind, groupStackable };");
 const A = globalThis.__APP__;
 const { state } = A;
 
@@ -106,18 +106,47 @@ let html = renderDetail(["email"],
   [mkMsg("m1", "out", "see these", [imgAtt, vidAtt]), mkMsg("m2", "in", "nice", [audAtt, docAtt])],
   fourFiles);
 ok("files panel renders", html.includes('id="files-panel"') && html.includes("Shared files"));
-ok("one tile per file", (html.match(/data-ftile="/g) || []).length === 4);
+ok("one tile per file group", (html.match(/data-fentry="/g) || []).length === 4);
 ok("image tile shows a thumbnail", html.includes("/api/attachments/a1"));
 ok("file count badge", />4<\/span>/.test(html) || html.includes('fp-count">4'));
 ok("tile shows name + size", html.includes("deck.pdf") && html.includes("2.0 KB"));
 ok("widget toggle in nav bar", html.includes('id="files-toggle"'));
 
 // 2. per-kind bubble rendering
-ok("image bubble is a zoomable thumbnail", html.includes('class="att att-img"') && html.includes('data-att="a1"'));
+const bhtml = A.bubbleAtts(mkMsg("m1", "out", "see these", [imgAtt]));
+ok("image bubble is a chip, not an inline thumbnail",
+  bhtml.includes("att-imgchip") && bhtml.includes('data-att="a1"') && !bhtml.includes("<img"));
+ok("image chip still opens the lightbox via data-att", bhtml.includes('data-att="a1"') && bhtml.includes("photo.png"));
 ok("video bubble has a player", html.includes("<video") && html.includes("/api/attachments/a2"));
 ok("audio bubble has a player", html.includes("<audio") && html.includes("/api/attachments/a3"));
 ok("doc bubble is a download chip", html.includes('class="att att-file"') && html.includes("deck.pdf"));
 ok("bubble text still renders", html.includes("see these"));
+
+// 2b. same-message images stack into one tile
+const stackFiles = [
+  { ...imgAtt, id: "b1", filename: "one.png", message_id: "mx", direction: "in", sent_at: now },
+  { ...imgAtt, id: "b2", filename: "two.png", message_id: "mx", direction: "in", sent_at: now },
+  { ...docAtt, direction: "in", sent_at: now },
+];
+const entries = A.groupStackable(stackFiles);
+ok("groupStackable groups same-message images",
+  entries.length === 2 && entries[0].type === "stack" && entries[0].images.length === 2);
+ok("groupStackable keeps non-images separate",
+  entries[1].type === "file" && entries[1].f.filename === "deck.pdf");
+ok("groupStackable keeps different messages apart",
+  A.groupStackable([{ ...imgAtt, id: "x1", message_id: "m1" }, { ...imgAtt, id: "x2", message_id: "m2" }])
+    .filter((e) => e.type === "stack").length === 2);
+ok("groupStackable never groups video/audio",
+  A.groupStackable([{ ...vidAtt }, { ...audAtt }]).every((e) => e.type === "file"));
+state.files = stackFiles; state.fileResults = null;
+const stackHtml = A.filesPanelHtml();
+ok("stack renders one tile with a count badge",
+  (stackHtml.match(/data-fentry="/g) || []).length === 2 && stackHtml.includes('ft-count">2'));
+ok("stack shows layered cards behind the top image", stackHtml.includes('class="ft-layer l1"'));
+ok("stack top is the newest image", stackHtml.includes("/api/attachments/b1"));
+ok("single-image stack shows no badge or layers",
+  (() => { state.files = [{ ...imgAtt, direction: "in", sent_at: now }]; const h = A.filesPanelHtml(); state.files = fourFiles;
+    return h.includes("file-stack") && !h.includes("ft-count") && !h.includes("ft-layer"); })());
 
 // 3. attach button is email-only
 ok("attach button on the email channel", html.includes('id="attach"'));

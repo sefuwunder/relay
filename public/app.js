@@ -129,9 +129,9 @@ function attachUrl(id) {
   return "/api/attachments/" + encodeURIComponent(id);
 }
 
-/** Attachment chips inside a message bubble. Images get an inline thumbnail
-    that opens the lightbox; video/audio get small players; the rest are
-    download chips. */
+/** Attachment chips inside a message bubble. Images are preview chips (no inline
+    thumbnails — previews live in the Shared files widget); video/audio get
+    small players; the rest are download chips. */
 function bubbleAtts(m) {
   const atts = m.attachments || [];
   if (!atts.length) return "";
@@ -140,7 +140,7 @@ function bubbleAtts(m) {
     const url = attachUrl(a.id);
     const label = esc(a.filename || "file");
     if (kind === "image") {
-      return `<button class="att att-img" data-att="${esc(a.id)}" title="${label}"><img src="${url}" alt="${label}" loading="lazy"></button>`;
+      return `<button class="att att-file att-imgchip" data-att="${esc(a.id)}" title="${label} — ${esc(fmtSize(a.size))}">${icon("image")}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></button>`;
     }
     if (kind === "video") {
       return `<video class="att att-vid" src="${url}" controls preload="metadata" playsinline></video>`;
@@ -426,17 +426,54 @@ async function refreshFiles() {
   } catch { /* widget keeps its old list */ }
 }
 
+/** Group image previews into per-message stacks for the widget. Returns display
+    entries — {type:"stack", images:[...]} or {type:"file", f} — newest first,
+    so a stack sits where its newest image would. */
+function groupStackable(files) {
+  const entries = [];
+  const stacks = new Map();
+  for (const f of files) {
+    if (attKind(f.mime) === "image" && f.message_id) {
+      let s = stacks.get(f.message_id);
+      if (!s) { s = { type: "stack", images: [] }; stacks.set(f.message_id, s); entries.push(s); }
+      s.images.push(f);
+    } else {
+      entries.push({ type: "file", f });
+    }
+  }
+  return entries;
+}
+
+/** One stack tile: the message's images layered on top of each other. */
+function stackTile(images, i) {
+  const n = images.length;
+  const top = images[0];
+  let under = "";
+  for (let l = Math.min(n, 3) - 1; l >= 1; l--) under += `<span class="ft-layer l${l}"></span>`;
+  const title = n === 1 ? esc(top.filename || "file") : `${n} photos`;
+  const name = n === 1 ? esc(top.filename || "file") : `${n} photos`;
+  return `<button class="file-tile file-stack" data-fentry="${i}" title="${title}">
+    <span class="ft-stack">${under}<span class="ft-prev"><img src="${attachUrl(top.id)}" alt="" loading="lazy"></span>${n > 1 ? `<span class="ft-count">${n}</span>` : ""}</span>
+    <span class="ft-name">${name}</span>
+    <span class="ft-meta">${esc(fmtSize(top.size))}${top.sent_at ? " · " + esc(fmtTime(top.sent_at)) : ""}</span>
+  </button>`;
+}
+
 /** Shared-files widget: sidebar on wide screens, slide-over drawer on narrow. */
 function filesPanelHtml() {
   const searching = state.fileResults !== null;
   const files = activeFiles();
+  const entries = groupStackable(files);
+  state.fileEntries = entries;
   const q = state.fileSearch;
-  const tiles = files.map((f, i) => {
+  const tiles = entries.map((e, i) => {
+    if (e.type === "stack") return stackTile(e.images, i);
+    const f = e.f;
     const kind = attKind(f.mime);
     const prev = kind === "image"
       ? `<span class="ft-prev"><img src="${attachUrl(f.id)}" alt="" loading="lazy"></span>`
       : `<span class="ft-prev ft-ic ft-${kind}">${icon(attIconName(kind))}</span>`;
-    return `<button class="file-tile" data-ftile="${i}" title="${esc(f.filename || "file")}">
+    return `<button class="file-tile" data-fentry="${i}" title="${esc(f.filename || "file")}">
       ${prev}
       <span class="ft-name">${esc(f.filename || "file")}</span>
       <span class="ft-meta">${esc(fmtSize(f.size))}${f.sent_at ? " · " + esc(fmtTime(f.sent_at)) : ""}</span>
@@ -484,7 +521,14 @@ async function runFileSearch(q) {
 
 /** Wire the widget's toggle, tiles, and search box. Safe to call after a panel re-render. */
 function wireFilesPanel() {
-  $$("#files-panel [data-ftile]").forEach((t) => t.addEventListener("click", () => openLightbox(activeFiles(), Number(t.dataset.ftile))));
+  $$("#files-panel [data-fentry]").forEach((t) => t.addEventListener("click", () => {
+    const e = (state.fileEntries || [])[Number(t.dataset.fentry)];
+    if (!e) return;
+    // A stack opens the lightbox on that message's images; a lone file opens
+    // it in the widget's current list.
+    if (e.type === "stack") openLightbox(e.images, 0);
+    else openLightbox(activeFiles(), Math.max(0, activeFiles().indexOf(e.f)));
+  }));
   const qi = $("#fp-q");
   if (qi) {
     qi.addEventListener("input", () => {
@@ -571,7 +615,7 @@ function renderConversationDetail() {
   const ge = $("#grp-edit");
   if (ge) ge.addEventListener("click", () => openGroupSheet(conv));
 
-  // Shared-files widget: toggle + tiles + bubble thumbnails.
+  // Shared-files widget: toggle + tiles + bubble attachments.
   $("#files-toggle").addEventListener("click", () => { state.filesOpen = !state.filesOpen; renderConversationDetail(); });
   const fpc = $("#fp-close");
   if (fpc) fpc.addEventListener("click", () => { state.filesOpen = false; renderConversationDetail(); });
