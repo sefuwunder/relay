@@ -997,3 +997,227 @@ export async function harvestSentContacts(
     conn.close();
   }
 }
+
+// ---------- inbound attachment extraction ----------
+
+export interface InboundAttachment {
+  filename: string;
+  mime: string;
+  /** Raw file bytes. */
+  data: Buffer;
+}
+
+/** Don't fetch full bodies over this size (mirrors the 25 MB send limit, with headroom). */
+export const INBOUND_FETCH_MAX = 30 * 1024 * 1024;
+/** Per-file cap for inbound attachments, matching the outbound limit. */
+export const INBOUND_FILE_MAX = 25 * 1024 * 1024;
+/** Max attachments kept per inbound message, matching the outbound limit. */
+export const INBOUND_FILES_PER_MESSAGE = 10;
+
+function splitHeadBody(raw: string): { head: string; body: string } {
+  const m = raw.match(/\r?\n\r?\n/);
+  if (!m || m.index === undefined) return { head: raw, body: "" };
+  return { head: raw.slice(0, m.index), body: raw.slice(m.index + m[0].length) };
+}
+
+/** Unfold continuation lines; keys lowercased. Repeated headers are joined. */
+function headerMap(head: string): Map<string, string> {
+  const map = new Map<string, string>();
+  let cur = "";
+  for (const rawLine of head.split(/\r?\n/)) {
+    const line = rawLine;
+    if (/^[ \t]/.test(line) && cur) { map.set(cur, map.get(cur)! + " " + line.trim()); continue; }
+    const hm = line.match(/^([^:]+):\s*([\s\S]*)$/);
+    if (hm) {
+      cur = hm[1].toLowerCase();
+      map.set(cur, (map.get(cur) ? map.get(cur)! + " " : "") + hm[2].trim());
+    }
+  }
+  return map;
+}
+
+/** Parse `;`-separated header params, honoring quoted strings. Keys lowercased. */
+function parseParams(value: string): Map<string, string> {
+  const params = new Map<string, string>();
+  const sc = value.indexOf(";");
+  if (sc < 0) return params;
+  let rest = value.slice(sc + 1);
+  for (;;) {
+    rest = rest.replace(/^\s*;?\s*/, "");
+    if (!rest) break;
+    const nm = rest.match(/^([^*=\s;]+(?:\*\d+\*?)?\*?)\s*=\s*/);
+    if (!nm) break;
+    const name = nm[1].toLowerCase();
+    rest = rest.slice(nm[0].length);
+    let val: string;
+    if (rest[0] === '"') {
+      let i = 1, acc = "";
+      while (i < rest.length) {
+        if (rest[i] === "\\" && i + 1 < rest.length) { acc += rest[i + 1]; i += 2; continue; }
+        if (rest[i] === '"') { i++; break; }
+        acc += rest[i]; i++;
+      }
+      val = acc; rest = rest.slice(i);
+    } else {
+      const vm = rest.match(/^[^;]*/);
+      val = (vm ? vm[0] : "").trim(); rest = rest.slice(val.length);
+    }
+    params.set(name, val);
+  }
+  return params;
+}
+
+function decodeRfc2231(v: string): string {
+  const m = v.match(/^([^']*)'[^']*'(.*)$/s);
+  const charset = (m && m[1] ? m[1] : "utf-8").toLowerCase();
+  const enc = m ? m[2] : v;
+  const bytes: number[] = [];
+  for (let i = 0; i < enc.length; i++) {
+    const c = enc[i];
+    if (c === "%" && i + 2 < enc.length && /^[0-9A-Fa-f]{2}$/.test(enc.slice(i + 1, i + 3))) {
+      bytes.push(parseInt(enc.slice(i + 1, i + 3), 16)); i += 2;
+    } else bytes.push(c.charCodeAt(0) & 0xff);
+  }
+  try { return new TextDecoder(charset).decode(Buffer.from(bytes)); }
+  catch { return Buffer.from(bytes).toString("latin1"); }
+}
+
+/** RFC 2231 continuations: filename*0*, filename*1*, ... (or plain numbered). */
+function continuationValue(params: Map<string, string>, base: string): string | null {
+  const parts: string[] = [];
+  for (let i = 0; ; i++) {
+    if (params.has(`${base}*${i}*`)) { parts.push(params.get(`${base}*${i}*`)!); continue; }
+    if (params.has(`${base}*${i}`)) { parts.push(params.get(`${base}*${i}`)!); continue; }
+    break;
+  }
+  if (!parts.length) return null;
+  return decodeRfc2231(parts.join(""));
+}
+
+function stripQuotes(v: string): string {
+  return v.replace(/^"(.*)"$/s, "$1");
+}
+
+/** Best-effort filename from Content-Disposition, falling back to Content-Type name. */
+function attachmentFilename(disp: string, ctype: string): string {
+  const dp = parseParams(disp || "");
+  const cp = parseParams(ctype || "");
+  return continuationValue(dp, "filename")
+    ?? (dp.has("filename*") ? decodeRfc2231(dp.get("filename*")!) : null)
+    ?? (dp.has("filename") ? decodeHeader(stripQuotes(dp.get("filename")!)) : null)
+    ?? continuationValue(cp, "name")
+    ?? (cp.has("name*") ? decodeRfc2231(cp.get("name*")!) : null)
+    ?? (cp.has("name") ? decodeHeader(stripQuotes(cp.get("name")!)) : null)
+    ?? "";
+}
+
+function decodeQuotedPrintable(s: string): Buffer {
+  // A trailing "=" is a soft break whose CRLF was consumed by part splitting
+  // (a literal "=" is always =3D-encoded, so this is unambiguous).
+  const noSoft = s.replace(/=\r?\n/g, "").replace(/=$/, "");
+  const bytes: number[] = [];
+  noSoft.replace(/=([0-9A-Fa-f]{2})|([\s\S])/g, (_m, hex: string, ch: string) => {
+    bytes.push(hex ? parseInt(hex, 16) : ch.charCodeAt(0) & 0xff);
+    return "";
+  });
+  return Buffer.from(bytes);
+}
+
+function decodePartBody(body: string, encoding: string): Buffer {
+  const enc = (encoding || "7bit").toLowerCase();
+  if (enc === "base64") {
+    try { return Buffer.from(body.replace(/\s+/g, ""), "base64"); }
+    catch { return Buffer.alloc(0); }
+  }
+  if (enc === "quoted-printable") return decodeQuotedPrintable(body);
+  return Buffer.from(body, "latin1");
+}
+
+function splitMultipart(body: string, boundary: string): string[] {
+  const parts: string[] = [];
+  const delim = "--" + boundary;
+  let cur: string[] | null = null;
+  for (const rawLine of body.split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (line === delim) { if (cur) parts.push(cur.join("\r\n")); cur = []; }
+    else if (line === delim + "--") { if (cur) parts.push(cur.join("\r\n")); cur = null; break; }
+    else if (cur) cur.push(rawLine);
+  }
+  return parts;
+}
+
+function walkPart(raw: string, out: InboundAttachment[], depth: number): void {
+  if (depth > 8) return;
+  const { head, body } = splitHeadBody(raw);
+  const h = headerMap(head);
+  const ctype = h.get("content-type") || "text/plain";
+  const mime = ctype.split(";")[0].trim().toLowerCase() || "application/octet-stream";
+  if (mime.startsWith("multipart/")) {
+    const boundary = parseParams(ctype).get("boundary");
+    if (!boundary) return;
+    for (const part of splitMultipart(body, stripQuotes(boundary))) walkPart(part, out, depth + 1);
+    return;
+  }
+  const filename = attachmentFilename(h.get("content-disposition") || "", ctype).trim();
+  if (!filename) return;
+  const data = decodePartBody(body, h.get("content-transfer-encoding") || "");
+  if (!data.length) return;
+  out.push({ filename: filename.slice(0, 120), mime: mime.slice(0, 120), data });
+}
+
+/**
+ * Extract file attachments from a raw RFC 5322 message. Only parts carrying
+ * a filename are returned (inline body text is never treated as a file).
+ * Pure function — unit-testable without a network.
+ */
+export function parseMailAttachments(raw: string): InboundAttachment[] {
+  const out: InboundAttachment[] = [];
+  try { walkPart(raw, out, 0); } catch { /* malformed mail: best effort */ }
+  return out;
+}
+
+/** Pull the literal payload out of a `BODY[] {N}` FETCH response. */
+function extractLiteral(lines: string[]): string {
+  for (const line of lines) {
+    const m = line.match(/FETCH[\s\S]*?\{(\d+)\}\n([\s\S]*)$/i);
+    if (m) return m[2].slice(0, Number(m[1]));
+  }
+  return "";
+}
+
+/**
+ * Fetch attachments for the given UIDs (one IMAP connection). Messages over
+ * INBOUND_FETCH_MAX are skipped; per message at most INBOUND_FILES_PER_MESSAGE
+ * files of at most INBOUND_FILE_MAX bytes are returned. A failure on one
+ * message never fails the batch.
+ */
+export async function fetchMailAttachments(cfg0: ImapConfig, uids: string[]): Promise<Map<string, InboundAttachment[]>> {
+  const out = new Map<string, InboundAttachment[]>();
+  if (!uids.length) return out;
+  const conn = await login(cfg0);
+  try {
+    const sizes = new Map<string, number>();
+    try {
+      for (const line of await conn.cmd("c001", `UID FETCH ${uids.join(",")} (UID RFC822.SIZE)`)) {
+        const m = line.match(/UID (\d+)[\s\S]*?RFC822\.SIZE (\d+)/i);
+        if (m) sizes.set(m[1], Number(m[2]));
+      }
+    } catch { /* size gate is advisory */ }
+    for (const uid of uids) {
+      try {
+        const size = sizes.get(uid);
+        if (size !== undefined && (size <= 0 || size > INBOUND_FETCH_MAX)) continue;
+        const lines = await conn.cmd("c002", `UID FETCH ${uid} (UID BODY.PEEK[])`);
+        const raw = extractLiteral(lines);
+        if (!raw) continue;
+        const atts = parseMailAttachments(raw)
+          .filter((a) => a.data.length <= INBOUND_FILE_MAX)
+          .slice(0, INBOUND_FILES_PER_MESSAGE);
+        if (atts.length) out.set(uid, atts);
+      } catch { /* one bad message never kills the batch */ }
+    }
+  } finally {
+    conn.close();
+  }
+  return out;
+}

@@ -22,6 +22,7 @@ The 📎 paperclip in the composer appears on the Email channel. Pick up to **10
 - The widget lives in the conversation header (badge shows the count): on wide screens (≥1100px) it docks as a permanent right-hand panel; on smaller screens it opens as a slide-over drawer. Tiles show a preview, name, size, and time; tapping one opens a full preview lightbox (image / video / audio / document) with prev/next, download, and keyboard navigation (←/→/Esc).
 - A **search box** at the top of the widget searches the conversation's attachments by filename over the **last 90 days** (case-insensitive, debounced, newest-first; Esc or ✕ clears). `GET /api/conversations/:id/files` accepts `q` and `days` (1–365, default 90) to drive it.
 - Files go out as real MIME attachments on the email (`multipart/mixed`, base64). SMS and Matrix reject attachments with a clear error for now.
+- Inbound email attachments are pulled in too: each IMAP poll extracts files from new mail (base64 / quoted-printable, RFC 2047/2231 filenames, nested multiparts), stores them like sent files (same 10-per-message / 25 MB limits; messages over 30 MB are skipped), and they appear in the thread, the widget, and filename search. Re-polls never duplicate them.
 - Failed sends keep their files, so **Retry** re-sends the original attachments. Deleting a conversation removes its files from disk too.
 
 ## Wide-screen reflow

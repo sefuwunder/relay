@@ -11,7 +11,7 @@ import {
   type Contact, type Conversation, type Channel, type Message, type Attachment,
 } from "./db";
 import { sendMail, validateSmtp, gvGatewayAddress, type SmtpConfig, type MailAttachment } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, type ImapConfig } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, type ImapConfig } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -509,6 +509,7 @@ async function pollMail() {
     const contacts = listContacts();
     const byEmail = new Map(contacts.filter((c) => c.email).map((c) => [c.email.toLowerCase(), c]));
     const byGv = new Map(contacts.map((c) => [normDigits(c.gv_number), c]).filter(([d]) => d.length === 10) as [string, Contact][]);
+    const inboundFiles: { uid: string; messageId: string }[] = [];
     for (const m of mails) {
       const extId = `mail:${m.uid}`;
       if (hasExternalId(extId)) continue;
@@ -534,10 +535,26 @@ async function pollMail() {
       }
       if (!contact) continue; // not from someone we track
       const conv = dmFor(contact.id);
-      insertMessage({
+      const msg = insertMessage({
         conversation_id: conv.id, channel, direction: "in", body, subject,
         external_id: extId, message_id: m.messageId || "", status: "",
       });
+      // Inbound email attachments ride along on the message (GV forwards are SMS — no files).
+      if (channel === "email") inboundFiles.push({ uid: m.uid, messageId: msg.id });
+    }
+    if (inboundFiles.length) {
+      try {
+        const attMap = await fetchMailAttachments(settings.imap, inboundFiles.map((p) => p.uid));
+        for (const p of inboundFiles) {
+          const files = attMap.get(p.uid) || [];
+          // Idempotent: a reprocessed message (uidvalidity shift) never duplicates files.
+          if (files.length && listAttachmentsForMessages([p.messageId]).length === 0) {
+            await saveMessageAttachments(p.messageId, files);
+          }
+        }
+      } catch (e) {
+        console.error("inbound attachment fetch failed:", e instanceof Error ? e.message : e);
+      }
     }
     lastPoll.mail = new Date().toISOString();
     lastPoll.mailError = null;
