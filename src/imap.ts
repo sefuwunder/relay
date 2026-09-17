@@ -599,6 +599,8 @@ export async function fetchStarred(cfg0: ImapConfig, limit = 200): Promise<Starr
 export interface UnseenMail {
   uid: string;
   from: string;
+  /** Recipient emails from the envelope to/cc lists — used to spot group threads. */
+  to: string[];
   subject: string;
   date: string;
   snippet: string; // 280-char preview for list views
@@ -627,6 +629,7 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
       mails.push({
         uid,
         from: e.from,
+        to: e.to,
         subject: e.subject || "(no subject)",
         date: e.date,
         snippet: body.slice(0, 280),

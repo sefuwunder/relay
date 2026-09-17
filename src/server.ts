@@ -13,7 +13,7 @@ import {
 } from "./db";
 import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
 import { sendMail, validateSmtp, gvGatewayAddress, newMessageId, type SmtpConfig, type MailAttachment } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, type ImapConfig, type SentMailItem, type InboundAttachment } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, type ImapConfig, type SentMailItem, type InboundAttachment, type UnseenMail } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -619,8 +619,18 @@ async function pollMail() {
         contact = byEmail.get(extractEmail(rawFrom)) || null;
         body = stripEmailQuotes(body); // drop quoted reply history + signatures
       }
-      if (!contact) continue; // not from someone we track
-      const conv = dmFor(contact.id);
+      // Email threads live in exactly one conversation: when the mail involves
+      // several tracked contacts (sender + to/cc), it goes to their group —
+      // created on the spot if needed — never to a DM as well.
+      let conv: Conversation;
+      if (channel === "sms") {
+        if (!contact) continue; // not from someone we track
+        conv = dmFor(contact.id);
+      } else {
+        const ids = participantContactIds(m, byEmail);
+        if (!ids.length) continue; // nobody we track
+        conv = conversationForContacts(ids);
+      }
       const msg = insertMessage({
         conversation_id: conv.id, channel, direction: "in", body, subject,
         external_id: extId, message_id: m.messageId || "", status: "",
@@ -665,18 +675,49 @@ function normSubject(s: string): string {
 }
 
 /**
- * Conversation for a set of recipient contacts: the group whose members match
- * exactly, else the first recipient's DM.
+ * Conversation for a set of participant contacts: the DM for one, else the
+ * group whose members match exactly — created on the spot when an email
+ * pulls several contacts into one thread, so the thread exists only there.
  */
 function conversationForContacts(ids: string[]): Conversation {
-  if (ids.length === 1) return dmFor(ids[0]);
-  const want = [...new Set(ids)].sort().join(",");
+  const unique = [...new Set(ids)];
+  if (unique.length === 1) return dmFor(unique[0]);
+  const want = unique.slice().sort().join(",");
   for (const c of listConversations()) {
     if (!c.is_group) continue;
     const have = conversationMembers(c.id).map((m) => m.id).sort().join(",");
     if (have === want) return c;
   }
-  return dmFor(ids[0]);
+  // No matching group yet: create it, capped at the group size limit so a
+  // huge thread never drops the mail entirely.
+  const capped = unique.slice(0, MAX_PEOPLE - 1);
+  const members = capped.map((id) => getContact(id)).filter((c): c is Contact => !!c);
+  if (members.length < 2) return dmFor(unique[0]);
+  const name = members.length === 2
+    ? `${members[0].name} & ${members[1].name}`
+    : members.map((m) => m.name).join(", ");
+  return createGroup(name, members.map((m) => m.id));
+}
+
+/** Our own addresses, so we never count ourselves as a thread participant. */
+function selfEmailSet(): Set<string> {
+  return new Set([settings.imap.user, settings.smtp.from].filter(Boolean).map((s) => (s as string).toLowerCase()));
+}
+
+/**
+ * Contact ids for everyone we track on an inbound email (sender + to/cc),
+ * excluding ourselves.
+ */
+function participantContactIds(m: UnseenMail, byEmail: Map<string, Contact>): string[] {
+  const self = selfEmailSet();
+  const ids = new Set<string>();
+  for (const raw of [m.from, ...(m.to || [])]) {
+    const email = extractEmail(raw || "");
+    if (!email || self.has(email)) continue;
+    const c = byEmail.get(email);
+    if (c) ids.add(c.id);
+  }
+  return [...ids];
 }
 
 /**
@@ -769,7 +810,7 @@ async function pollSentMail(): Promise<void> {
   if (items.length) {
     const contacts = listContacts();
     const byEmail = new Map(contacts.filter((c) => c.email).map((c) => [c.email!.toLowerCase(), c]));
-    const selfEmails = new Set([settings.imap.user, settings.smtp.from].filter(Boolean).map((s) => (s as string).toLowerCase()));
+    const selfEmails = selfEmailSet();
     for (const item of items) {
       try {
         await importSentItem(mailbox, item, byEmail, selfEmails);
