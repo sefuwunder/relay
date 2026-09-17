@@ -13,7 +13,7 @@ import {
 } from "./db";
 import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
 import { sendMail, validateSmtp, gvGatewayAddress, newMessageId, type SmtpConfig, type MailAttachment } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, type ImapConfig, type SentMailItem, type InboundAttachment, type UnseenMail } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, lookupEnvelopesByMessageId, type ImapConfig, type SentMailItem, type InboundAttachment, type UnseenMail } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -679,7 +679,7 @@ function normSubject(s: string): string {
  * group whose members match exactly — created on the spot when an email
  * pulls several contacts into one thread, so the thread exists only there.
  */
-function conversationForContacts(ids: string[]): Conversation {
+function conversationForContacts(ids: string[], opts: { create?: boolean } = {}): Conversation {
   const unique = [...new Set(ids)];
   if (unique.length === 1) return dmFor(unique[0]);
   const want = unique.slice().sort().join(",");
@@ -688,6 +688,8 @@ function conversationForContacts(ids: string[]): Conversation {
     const have = conversationMembers(c.id).map((m) => m.id).sort().join(",");
     if (have === want) return c;
   }
+  // Dry-run (or a capped thread): report the match without creating anything.
+  if (opts.create === false) return null as unknown as Conversation;
   // No matching group yet: create it, capped at the group size limit so a
   // huge thread never drops the mail entirely.
   const capped = unique.slice(0, MAX_PEOPLE - 1);
@@ -718,6 +720,105 @@ function participantContactIds(m: UnseenMail, byEmail: Map<string, Contact>): st
     if (c) ids.add(c.id);
   }
   return [...ids];
+}
+
+/**
+ * Migrate old mail: backfill participant data, then re-thread multi-contact
+ * mail into its group.
+ *
+ * Messages stored before participants were recorded carry an empty
+ * participants column. We re-locate each one on the mail server by its stable
+ * Message-ID (UIDs shift, Message-IDs don't), read the sender + recipient
+ * envelope, and write the tracked contact ids. Then any email with 2+
+ * participants that still sits in a DM is moved into the group with those
+ * exact members — created on the spot when missing — so the thread exists
+ * only there.
+ *
+ * Idempotent: re-running touches only rows that are still blank, and moves
+ * only mail that isn't already in its group. With dry_run nothing is
+ * written; the returned counts describe what would happen.
+ */
+async function migrateMessageParticipants(dryRun: boolean): Promise<{
+  scanned: number; enriched: number; moved: number; unresolved: number;
+  groups: { id: string; name: string }[];
+}> {
+  const db = getDb();
+  const stats = {
+    scanned: 0, enriched: 0, moved: 0, unresolved: 0,
+    groups: [] as { id: string; name: string }[],
+  };
+  const seenGroups = new Set<string>();
+  // Dry-run only: message id -> participant ids that phase 1 would have written.
+  const pending = new Map<string, string[]>();
+  const noteGroup = (id: string, name: string) => {
+    if (seenGroups.has(id || name)) return;
+    seenGroups.add(id || name);
+    stats.groups.push({ id, name });
+  };
+
+  // Phase 1 — backfill participant ids from the envelope on the server.
+  const stale = db.query(
+    "SELECT id, message_id FROM messages WHERE channel = 'email' AND (participants = '' OR participants = '[]') AND message_id != ''"
+  ).all() as { id: string; message_id: string }[];
+  stats.scanned = stale.length;
+  if (stale.length && imapReady()) {
+    const envelopes = await lookupEnvelopesByMessageId(settings.imap, stale.map((s) => s.message_id));
+    const contacts = listContacts();
+    const byEmail = new Map(contacts.filter((c) => c.email).map((c) => [c.email!.toLowerCase(), c]));
+    const self = selfEmailSet();
+    for (const s of stale) {
+      const env = envelopes.get(s.message_id);
+      const ids = env
+        ? [...new Set(
+            [env.from, ...(env.to || [])]
+              .map((a) => extractEmail(a || "").toLowerCase())
+              .filter((a) => a && !self.has(a))
+              .map((a) => byEmail.get(a)?.id)
+              .filter((id): id is string => !!id)
+          )]
+        : [];
+      if (!ids.length) { stats.unresolved++; continue; }
+      if (!dryRun) db.query("UPDATE messages SET participants = ? WHERE id = ?").run(JSON.stringify(ids), s.id);
+      else pending.set(s.id, ids);
+      stats.enriched++;
+    }
+  } else {
+    stats.unresolved = stale.length;
+  }
+
+  // Phase 2 — re-thread: multi-participant mail still sitting in a DM moves
+  // into the group with those exact members.
+  const rows = db.query(
+    dryRun
+      ? "SELECT id, conversation_id, participants FROM messages WHERE channel = 'email' AND (participants NOT IN ('', '[]') OR message_id != '')"
+      : "SELECT id, conversation_id, participants FROM messages WHERE channel = 'email' AND participants NOT IN ('', '[]')"
+  ).all() as { id: string; conversation_id: string; participants: string }[];
+  for (const r of rows) {
+    let ids: string[];
+    try { ids = JSON.parse(r.participants); } catch { ids = []; }
+    if ((!Array.isArray(ids) || !ids.length) && dryRun && pending.has(r.id)) ids = pending.get(r.id)!;
+    if (!Array.isArray(ids) || ids.length < 2) continue;
+    const conv = getConversation(r.conversation_id);
+    if (!conv || conv.is_group) continue;
+    const target = conversationForContacts(ids, { create: !dryRun });
+    if (!dryRun) {
+      if (!target || target.id === r.conversation_id) continue;
+      db.query("UPDATE messages SET conversation_id = ? WHERE id = ?").run(target.id, r.id);
+      noteGroup(target.id, target.name);
+      stats.moved++;
+    } else if (target && target.id !== r.conversation_id) {
+      noteGroup(target.id, target.name);
+      stats.moved++;
+    } else if (!target) {
+      // Would create a new group; preview it under the name it would get.
+      const ms = ids.map((id) => getContact(id)).filter((c): c is Contact => !!c);
+      if (ms.length < 2) continue;
+      const name = ms.length === 2 ? `${ms[0].name} & ${ms[1].name}` : ms.map((m) => m.name).join(", ");
+      noteGroup("new", `${name} (new)`);
+      stats.moved++;
+    }
+  }
+  return stats;
 }
 
 /**
@@ -1419,6 +1520,15 @@ const server = (Bun as any).serve({
       if (path === "/api/poll" && method === "POST") {
         await Promise.all([pollMail(), pollMatrixOnce()]);
         return json({ ok: true, lastPoll });
+      }
+
+      // ----- mail migration -----
+      // Backfill participant data on old messages (stored before we recorded
+      // who was on an email) and re-thread multi-contact mail into its group.
+      if (path === "/api/migrate-participants" && method === "POST") {
+        const body = await readBody(req);
+        const stats = await migrateMessageParticipants(!!body.dry_run);
+        return json({ ok: true, dry_run: !!body.dry_run, ...stats });
       }
 
       // ----- shared files -----

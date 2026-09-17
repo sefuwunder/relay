@@ -541,6 +541,49 @@ export async function latestEmailWith(cfg0: ImapConfig, email: string, maxBodyCh
   }
 }
 
+/**
+ * Find emails by Message-ID across INBOX and the Sent mailbox. Read-only:
+ * EXAMINE (never SELECT) and BODY.PEEK envelope fetches, so no flags change.
+ * Message-IDs are stable across sessions, unlike UIDs, which makes this the
+ * reliable way to re-locate mail we imported long ago. Returns a map from the
+ * queried Message-ID to its sender + recipient envelope.
+ */
+export async function lookupEnvelopesByMessageId(
+  cfg0: ImapConfig, messageIds: string[]
+): Promise<Map<string, { from: string; to: string[] }>> {
+  const out = new Map<string, { from: string; to: string[] }>();
+  const ids = [...new Set(messageIds.map((s) => (s || "").replace(/[\r\n]+/g, "").trim()).filter(Boolean))];
+  if (!ids.length) return out;
+  const { conn } = await connectAndLogin(cfg0);
+  try {
+    const sentName = await findSentMailbox(conn).catch(() => null);
+    const boxes = ["INBOX"];
+    if (sentName && sentName.toUpperCase() !== "INBOX") boxes.push(sentName);
+    let tag = 0;
+    for (const box of boxes) {
+      await conn.cmd(`mi${++tag}`, `EXAMINE ${qstr(box)}`);
+      // One SEARCH per Message-ID on the same connection, then a single
+      // batched envelope fetch for everything we found in this box.
+      const hitToId = new Map<string, string>();
+      for (const mid of ids) {
+        if (out.has(mid)) continue; // already found in an earlier box
+        const uids = parseSearchUids(await conn.cmd(`mi${++tag}`, `UID SEARCH HEADER Message-ID ${qstr(mid)}`));
+        for (const u of uids.slice(0, 3)) hitToId.set(u, mid);
+      }
+      if (!hitToId.size) continue;
+      const envs = await fetchEnvelopes(conn, `mi${++tag}`, [...hitToId.keys()]);
+      for (const [u, mid] of hitToId) {
+        const e = envs.get(u);
+        if (!e || out.has(mid)) continue;
+        out.set(mid, { from: e.from, to: e.to });
+      }
+    }
+  } finally {
+    conn.close();
+  }
+  return out;
+}
+
 // Batched Return-Path header fetch; best-effort like snippets. Used to spot
 // Google Voice forwards via their stable bounce domain.
 async function fetchReturnPaths(conn: Conn, tag: string, uids: string[]): Promise<Map<string, string>> {

@@ -85,6 +85,7 @@ Google tokens are stored in the gitignored `./data/config.json` next to your oth
 - **Private by default.** Contacts, messages, and credentials live in gitignored `./data/` (`relay.db`, `config.json`) — never pushed.
 - **Polling, not webhooks.** IMAP is polled every 60s; Matrix uses `/sync` long-polling. **Check for new messages** in Settings polls on demand.
 - **Dedupe.** Every inbound message is keyed (`mail:{uid}`, `matrix:{event_id}`) so polls never double-insert.
+- **Participant data.** Every message records the contact ids involved, so threads can be re-filed later. Mail stored before this existed can be backfilled from **Settings → Mail maintenance → Migrate old mail**: each stored email is re-located on the server by its stable Message-ID (UIDs shift, Message-IDs don't), its sender/recipient envelope is read, and multi-contact threads move into their group (created on the spot when missing). `POST /api/migrate-participants` does the same; pass `{dry_run: true}` to preview without writing.
 - Failed sends are kept in the thread with a "failed to send" flag — nothing silently vanishes.
 - UI honors `prefers-reduced-motion` and `prefers-color-scheme`.
 
@@ -106,6 +107,7 @@ Google tokens are stored in the gitignored `./data/config.json` next to your oth
 | GET | `/api/attachments/:id` | download / inline preview of one file |
 | POST | `/api/conversations/:id/read` | clears unread |
 | POST | `/api/poll` | poll mail + Matrix now |
+| POST | `/api/migrate-participants` | backfill participant data + re-thread old multi-contact mail into groups; `{dry_run: true}` previews |
 
 ## Ports
 

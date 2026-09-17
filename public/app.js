@@ -1644,6 +1644,14 @@ function renderSettings() {
         <div style="padding:4px 32px 0"><button class="btn secondary" id="poll" style="width:100%">${icon("retry")} Check for new messages</button></div>
         ${st.lastPoll && (st.lastPoll.mail || st.lastPoll.matrix) ? `<div class="hint" style="text-align:center">Last check — mail: ${st.lastPoll.mail ? fmtTime(st.lastPoll.mail) : "—"} · matrix: ${st.lastPoll.matrix ? fmtTime(st.lastPoll.matrix) : "—"}</div>` : ""}
 
+        <div class="group-caption">Mail maintenance</div>
+        <div class="group-card card" style="padding:14px 16px">
+          <div class="group-row" style="padding:0;background:none;border:none">
+            <div class="rlabel" style="flex:1"><div class="t1">Migrate old mail</div><div class="t2">Re-locates your stored emails by Message-ID, records who was on each one, and moves multi-contact threads into their group.</div></div>
+          </div>
+          <div class="test-row" style="margin-top:8px"><button class="btn secondary small" id="migrate-mail">Migrate old mail</button><span class="test-result" id="migrate-result"></span></div>
+        </div>
+
         <div class="group-caption">Notifications</div>
         <div class="group-card card">
           <div class="group-row">
@@ -1721,6 +1729,21 @@ function renderSettings() {
   api("/api/google/redirect-uri").then((r) => { const el = $("#g-uri"); if (el) el.textContent = r.redirect_uri; }).catch(() => {});
 
   $("#notify-toggle").addEventListener("change", (e) => { setNotify(e.target.checked); });
+
+  $("#migrate-mail").addEventListener("click", async () => {
+    const el = $("#migrate-result");
+    el.className = "test-result"; el.textContent = "Migrating\u2026";
+    try {
+      const r = await api("/api/migrate-participants", { method: "POST" });
+      const bits = [`${r.enriched} enriched`, `${r.moved} moved`];
+      if (r.unresolved) bits.push(`${r.unresolved} unresolved`);
+      const groups = (r.groups || []).map((g) => g.name).filter(Boolean).join(", ");
+      el.className = "test-result ok";
+      el.innerHTML = icon("check") + " " + esc(bits.join(" \u00b7 ")) + (groups ? `<br>Groups: ${esc(groups)}` : "");
+      toast(`Migration done \u2014 ${bits.join(", ")}.`);
+      await loadConversations();
+    } catch (e) { el.className = "test-result err"; el.innerHTML = icon("close") + " " + esc(e.message); }
+  });
 
   $("#g-connect").addEventListener("click", async () => {
     try {
