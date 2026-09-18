@@ -41,6 +41,7 @@ const state = {
   fileResults: null,   // search matches; null = browsing recent files
   lightbox: null,      // { files, index } when the preview overlay is open
   pdfViewer: null,    // file object when the PDF viewer overlay is open
+  docxViewer: null,   // { file, status, html, error, blobs } when the DOCX viewer is open
   dropDraft: false,    // set before re-rendering after a successful send
   notify: (() => { try { return localStorage.getItem("relay_notify") === "1"; } catch { return false; } })(),
 };
@@ -140,6 +141,12 @@ function isPdf(f) {
   return !!f && (f.mime === "application/pdf" || /\.pdf$/i.test(f.filename || ""));
 }
 
+/** True for Word .docx files: detected by MIME type or .docx filename. */
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+function isDocx(f) {
+  return !!f && (f.mime === DOCX_MIME || /\.docx$/i.test(f.filename || ""));
+}
+
 /** "Thu, Sep 18 · 2:00 PM – 3:30 PM" from ISO UTC bounds. */
 function fmtApptRange(startsAt, endsAt) {
   const s = new Date(startsAt), e = new Date(endsAt);
@@ -199,6 +206,9 @@ function bubbleAtts(m) {
     }
     if (isPdf(a)) {
       return `<button class="att att-file att-pdfchip" data-pdf="${esc(a.id)}" title="${label} — view PDF">${icon("pdf")}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></button>`;
+    }
+    if (isDocx(a)) {
+      return `<button class="att att-file att-docxchip" data-docx="${esc(a.id)}" title="${label} — view document">${icon("docx")}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></button>`;
     }
     return `<a class="att att-file" href="${url}" target="_blank" rel="noopener" title="${label} — ${esc(fmtSize(a.size))}">${icon(attIconName(kind))}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></a>`;
   }).join("")}</div>`;
@@ -261,6 +271,494 @@ function renderPdfViewer() {
   $("#pdfv-scrim").addEventListener("click", closePdfViewer);
 }
 
+/* ---------------- DOCX viewer ----------------
+   Zero-dependency .docx rendering: a .docx is a ZIP of XML parts. We parse
+   the ZIP central directory, inflate entries with DecompressionStream, walk
+   word/document.xml with a tiny XML parser, and emit clean HTML (headings,
+   bold/italic/underline, lists, tables, hyperlinks, embedded images). */
+
+/** Strip XML prologues and comments — noise for the tiny parser below. */
+function cleanXml(src) {
+  return src.replace(/<\?[\s\S]*?\?>/g, "").replace(/<!--[\s\S]*?-->/g, "");
+}
+
+/** Tiny XML parser: enough for OOXML's regular subset. Returns a tree of
+    { t: tag, a: attrs, c: children }; text nodes are plain strings. */
+function parseXml(src) {
+  const root = { t: "", a: {}, c: [] };
+  const stack = [root];
+  const ent = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+  const unesc = (s) => s.replace(/&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g, (x, e) => {
+    if (ent[e] !== undefined) return ent[e];
+    if (e[0] === "#") {
+      const cp = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      return Number.isFinite(cp) && cp > 0 ? String.fromCodePoint(cp) : x;
+    }
+    return x;
+  });
+  const re = /<(\/?)([A-Za-z_][\w:.-]*)([^<>]*?)(\/?)>|([^<]+)/g;
+  let m;
+  while ((m = re.exec(src))) {
+    if (m[5] !== undefined) {
+      const text = unesc(m[5]);
+      if (text) stack[stack.length - 1].c.push(text);
+      continue;
+    }
+    if (m[1] === "/") { if (stack.length > 1) stack.pop(); continue; }
+    const attrs = {};
+    const are = /([A-Za-z_][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+    let am;
+    while ((am = are.exec(m[3]))) attrs[am[1]] = unesc(am[2] !== undefined ? am[2] : am[3]);
+    const node = { t: m[2], a: attrs, c: [] };
+    stack[stack.length - 1].c.push(node);
+    if (m[4] !== "/") stack.push(node);
+  }
+  return root;
+}
+
+/** Local tag name without its namespace prefix. */
+function dxln(t) { const i = t.indexOf(":"); return i < 0 ? t : t.slice(i + 1); }
+function dxKids(n, name) { return n.c.filter((x) => typeof x !== "string" && dxln(x.t) === name); }
+function dxKid(n, name) { const k = dxKids(n, name); return k.length ? k[0] : null; }
+function dxFind(n, name) {
+  if (typeof n === "string") return null;
+  if (dxln(n.t) === name) return n;
+  for (const c of n.c) { const f = dxFind(c, name); if (f) return f; }
+  return null;
+}
+/** Resolve a relationship target (relative to word/) to a ZIP part path. */
+function dxResolve(base, target) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return target;
+  const out = [];
+  for (const p of (base + target).split("/")) {
+    if (p === "..") out.pop();
+    else if (p !== "." && p !== "") out.push(p);
+  }
+  return out.join("/");
+}
+
+/** Minimal ZIP reader for .docx: parse the central directory, inflate
+    entries on demand. Only stored (0) and deflated (8) entries. */
+async function unzipDocx(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const n = bytes.length;
+  let eocd = -1;
+  for (let i = n - 22; i >= Math.max(0, n - 66000); i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("not a zip archive");
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const files = {};
+  const dec = new TextDecoder();
+  for (let k = 0; k < count; k++) {
+    if (p + 46 > n || dv.getUint32(p, true) !== 0x02014b50) break;
+    const method = dv.getUint16(p + 10, true);
+    const csize = dv.getUint32(p + 20, true);
+    const nl = dv.getUint16(p + 28, true), el = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+    const lh = dv.getUint32(p + 42, true);
+    const name = dec.decode(bytes.subarray(p + 46, p + 46 + nl));
+    p += 46 + nl + el + cl;
+    if (!name || name.endsWith("/")) continue;
+    if (lh + 30 > n) continue;
+    const lnl = dv.getUint16(lh + 26, true), lel = dv.getUint16(lh + 28, true);
+    const start = lh + 30 + lnl + lel;
+    files[name] = { method, data: bytes.subarray(start, start + csize) };
+  }
+  if (!Object.keys(files).length) throw new Error("empty zip archive");
+  return {
+    names: Object.keys(files),
+    async read(name) {
+      const e = files[name];
+      if (!e) return null;
+      if (e.method === 0) return e.data;
+      if (e.method === 8 && typeof DecompressionStream !== "undefined") {
+        const ds = new DecompressionStream("deflate-raw");
+        const out = await new Response(new Blob([e.data]).stream().pipeThrough(ds)).arrayBuffer();
+        return new Uint8Array(out);
+      }
+      throw new Error("unsupported compression in " + name);
+    },
+  };
+}
+
+const DX_HIGHLIGHT = { yellow: "#ffff00", green: "#00ff00", cyan: "#00ffff", magenta: "#ff00ff", blue: "#0000ff", red: "#ff0000", darkBlue: "#000080", darkCyan: "#008080", darkGreen: "#008000", darkMagenta: "#800080", darkRed: "#800000", darkYellow: "#808000", darkGray: "#808080", lightGray: "#c0c0c0", black: "#000000" };
+const DX_OL_TYPE = { decimal: "1", lowerLetter: "a", upperLetter: "A", lowerRoman: "i", upperRoman: "I" };
+
+/** Inline CSS for a run from its w:rPr. */
+function dxRunStyle(rPr) {
+  if (!rPr) return "";
+  const onoff = (v) => v === undefined || !/^(0|false|off|none)$/i.test(v);
+  const has = (n) => { const k = dxKid(rPr, n); return k ? onoff(k.a["w:val"]) : false; };
+  const s = [], deco = [];
+  if (has("b")) s.push("font-weight:700");
+  if (has("i")) s.push("font-style:italic");
+  const u = dxKid(rPr, "u");
+  if (u && onoff(u.a["w:val"])) deco.push("underline");
+  if (has("strike") || has("dstrike")) deco.push("line-through");
+  if (deco.length) s.push("text-decoration:" + deco.join(" "));
+  const sz = dxKid(rPr, "sz");
+  if (sz && sz.a["w:val"] && parseFloat(sz.a["w:val"]) > 0) s.push("font-size:" + (parseFloat(sz.a["w:val"]) / 2) + "pt");
+  const color = dxKid(rPr, "color");
+  if (color && color.a["w:val"] && !/^auto$/i.test(color.a["w:val"])) s.push("color:#" + color.a["w:val"]);
+  const hl = dxKid(rPr, "highlight");
+  if (hl && DX_HIGHLIGHT[hl.a["w:val"]]) s.push("background-color:" + DX_HIGHLIGHT[hl.a["w:val"]]);
+  const shd = dxKid(rPr, "shd");
+  if (shd && shd.a["w:fill"] && !/^(auto|ffffff)$/i.test(shd.a["w:fill"])) s.push("background-color:#" + shd.a["w:fill"]);
+  if (has("smallCaps")) s.push("font-variant:small-caps");
+  if (has("caps")) s.push("text-transform:uppercase");
+  const va = dxKid(rPr, "vertAlign");
+  if (va && /^(superscript|subscript)$/i.test(va.a["w:val"] || "")) s.push("vertical-align:" + va.a["w:val"].toLowerCase());
+  return s.join(";");
+}
+
+/** <img> for a w:drawing / w:pict: resolve r:embed through rels to word/media. */
+function dxImage(node, ctx) {
+  const blip = dxFind(node, "blip");
+  const idata = dxFind(node, "imagedata");
+  const rid = (blip && (blip.a["r:embed"] || blip.a["r:link"])) || (idata && idata.a["r:id"]);
+  if (!rid) return "";
+  const target = ctx.rels[rid];
+  if (!target) return "";
+  const url = ctx.media[dxResolve("word/", target)];
+  if (!url) return "";
+  // Alt text lives on pic:cNvPr (DrawingML) or v:shape (VML fallback).
+  const cNvPr = dxFind(node, "cNvPr");
+  const shape = dxFind(node, "shape");
+  const alt = cNvPr ? cNvPr.a.descr || cNvPr.a.name || "" : shape ? shape.a.alt || shape.a.title || "" : "";
+  return `<img class="dx-img" src="${esc(url)}" alt="${esc(alt)}">`;
+}
+
+/** Inline HTML for a run's content: text, tabs, breaks, symbols, drawings. */
+function dxInline(r, ctx) {
+  let out = "";
+  for (const c of r.c) {
+    if (typeof c === "string") { out += esc(c); continue; }
+    const t = dxln(c.t);
+    if (t === "t") out += esc(c.c.filter((x) => typeof x === "string").join(""));
+    else if (t === "tab") out += "\t";
+    else if (t === "br" || t === "cr") out += "<br>";
+    else if (t === "noBreakHyphen") out += "&#8209;";
+    else if (t === "sym" && c.a["w:char"]) {
+      const cp = parseInt(c.a["w:char"], 16);
+      if (cp) out += esc(String.fromCodePoint(cp));
+    }
+    else if (t === "drawing" || t === "pict") out += dxImage(c, ctx);
+    else if (t === "AlternateContent") {
+      const d = dxFind(c, "drawing") || dxFind(c, "pict");
+      if (d) out += dxImage(d, ctx);
+    }
+  }
+  return out;
+}
+
+function dxRun(r, ctx) {
+  const inner = dxInline(r, ctx);
+  if (!inner) return "";
+  const style = dxRunStyle(dxKid(r, "rPr"));
+  return style ? `<span style="${esc(style)}">${inner}</span>` : inner;
+}
+
+function dxHyperlink(node, ctx) {
+  let inner = "";
+  for (const c of node.c) {
+    if (typeof c === "string") continue;
+    const t = dxln(c.t);
+    if (t === "r") inner += dxRun(c, ctx);
+  }
+  const target = node.a["r:id"] && ctx.rels[node.a["r:id"]];
+  if (target && /^(https?:|mailto:)/i.test(target)) {
+    return `<a href="${esc(target)}" target="_blank" rel="noopener">${inner}</a>`;
+  }
+  return inner;
+}
+
+/** One w:p → block descriptor { tag, style, list, html }. */
+function dxParagraph(p, ctx) {
+  const pPr = dxKid(p, "pPr");
+  let tag = "p";
+  const styles = [];
+  let list = null;
+  if (pPr) {
+    const ps = dxKid(pPr, "pStyle");
+    const sn = ps ? (ps.a["w:val"] || "").toLowerCase().replace(/[\s_-]+/g, "") : "";
+    if (sn === "title" || sn === "heading1") tag = "h1";
+    else if (sn === "heading2") tag = "h2";
+    else if (/^heading[3-9]$/.test(sn)) tag = "h3";
+    const jc = dxKid(pPr, "jc");
+    const jv = jc ? (jc.a["w:val"] || "").toLowerCase() : "";
+    if (jv === "center" || jv === "right") styles.push("text-align:" + jv);
+    else if (jv === "end") styles.push("text-align:right");
+    else if (jv === "both" || jv === "justify") styles.push("text-align:justify");
+    const numPr = dxKid(pPr, "numPr");
+    if (numPr) {
+      const numId = dxKid(numPr, "numId"), ilvl = dxKid(numPr, "ilvl");
+      if (numId && numId.a["w:val"] !== undefined) {
+        list = { numId: numId.a["w:val"], ilvl: ilvl && ilvl.a["w:val"] ? parseInt(ilvl.a["w:val"], 10) || 0 : 0 };
+      }
+    }
+    const ind = dxKid(pPr, "ind");
+    if (ind && ind.a["w:left"]) {
+      const px = Math.round(parseFloat(ind.a["w:left"]) * 96 / 1440);
+      if (px > 0) styles.push("margin-left:" + px + "px");
+    }
+    const shd = dxKid(pPr, "shd");
+    if (shd && shd.a["w:fill"] && !/^(auto|ffffff)$/i.test(shd.a["w:fill"])) styles.push("background-color:#" + shd.a["w:fill"]);
+  }
+  let inner = "";
+  for (const c of p.c) {
+    if (typeof c === "string") continue;
+    const t = dxln(c.t);
+    if (t === "r") inner += dxRun(c, ctx);
+    else if (t === "hyperlink") inner += dxHyperlink(c, ctx);
+  }
+  return { tag, style: styles.join(";"), list, html: inner };
+}
+
+function dxBlockHtml(b) {
+  return `<${b.tag}${b.style ? ` style="${esc(b.style)}"` : ""}>${b.html || ""}</${b.tag}>`;
+}
+
+/** word/numbering.xml → { nums: numId -> abstractNumId, abstracts: id -> { ilvl -> numFmt } }. */
+function dxParseNumbering(xmlText) {
+  const nums = {}, abstracts = {};
+  if (!xmlText) return { nums, abstracts };
+  const numbering = dxFind(parseXml(cleanXml(xmlText)), "numbering");
+  if (!numbering) return { nums, abstracts };
+  for (const ab of dxKids(numbering, "abstractNum")) {
+    const id = ab.a["w:abstractNumId"];
+    if (id === undefined) continue;
+    const levels = {};
+    for (const lvl of dxKids(ab, "lvl")) {
+      const nf = dxKid(lvl, "numFmt");
+      levels[lvl.a["w:ilvl"] || "0"] = (nf && nf.a["w:val"]) || "bullet";
+    }
+    abstracts[id] = levels;
+  }
+  for (const nm of dxKids(numbering, "num")) {
+    const ref = dxKid(nm, "abstractNumId");
+    if (nm.a["w:numId"] !== undefined && ref) nums[nm.a["w:numId"]] = ref.a["w:val"];
+  }
+  return { nums, abstracts };
+}
+
+function dxNumFmt(ctx, numId, ilvl) {
+  const abs = ctx.numbering.nums[numId];
+  const lvl = abs !== undefined && ctx.numbering.abstracts[abs] ? ctx.numbering.abstracts[abs][String(ilvl)] : undefined;
+  return lvl || "bullet";
+}
+
+/** Consecutive same-list paragraphs → nested <ul>/<ol> by indent level. */
+function dxList(items, ctx) {
+  const root = { ilvl: -1, children: [] };
+  const stack = [root];
+  for (const it of items) {
+    const lvl = it.list.ilvl || 0;
+    while (stack.length > 1 && stack[stack.length - 1].ilvl >= lvl) stack.pop();
+    const node = { ilvl: lvl, html: it.html, fmt: dxNumFmt(ctx, it.list.numId, lvl), children: [] };
+    stack[stack.length - 1].children.push(node);
+    stack.push(node);
+  }
+  const render = (nodes) => {
+    let out = "", k = 0;
+    while (k < nodes.length) {
+      const fmt = nodes[k].fmt, grp = [];
+      while (k < nodes.length && nodes[k].fmt === fmt) grp.push(nodes[k++]);
+      const ordered = fmt !== "bullet";
+      const typeAttr = ordered && DX_OL_TYPE[fmt] ? ` type="${DX_OL_TYPE[fmt]}"` : "";
+      out += ordered ? `<ol${typeAttr}>` : "<ul>";
+      for (const n of grp) out += `<li>${n.html}${n.children.length ? render(n.children) : ""}</li>`;
+      out += ordered ? "</ol>" : "</ul>";
+    }
+    return out;
+  };
+  return render(root.children);
+}
+
+function dxCellStyle(tcPr) {
+  if (!tcPr) return "";
+  const shd = dxKid(tcPr, "shd");
+  if (shd && shd.a["w:fill"] && !/^(auto|ffffff)$/i.test(shd.a["w:fill"])) return "background-color:#" + shd.a["w:fill"];
+  return "";
+}
+
+function dxCellHtml(c) {
+  return `<td${c.colspan > 1 ? ` colspan="${c.colspan}"` : ""}${c.rowspan > 1 ? ` rowspan="${c.rowspan}"` : ""}${c.style ? ` style="${esc(c.style)}"` : ""}>${c.html || "&nbsp;"}</td>`;
+}
+
+function dxCellInner(tc, ctx) {
+  const parts = [];
+  for (const c of tc.c) {
+    if (typeof c === "string") continue;
+    const t = dxln(c.t);
+    if (t === "p") parts.push(dxBlockHtml(dxParagraph(c, ctx)));
+    else if (t === "tbl") parts.push(dxTable(c, ctx));
+  }
+  return parts.join("");
+}
+
+/** w:tbl → HTML table; gridSpan → colspan, vMerge → rowspan. */
+function dxTable(tbl, ctx) {
+  const active = []; // visual column -> cell object with an open vertical merge
+  const rowsOut = [];
+  for (const tr of dxKids(tbl, "tr")) {
+    let col = 0;
+    const rowCells = [];
+    for (const tc of dxKids(tr, "tc")) {
+      const tcPr = dxKid(tc, "tcPr");
+      const gs = tcPr && dxKid(tcPr, "gridSpan");
+      const colspan = gs ? Math.max(1, parseInt(gs.a["w:val"] || "1", 10) || 1) : 1;
+      const vmN = tcPr && dxKid(tcPr, "vMerge");
+      const vm = vmN ? (vmN.a["w:val"] || "continue") : null;
+      if (vm === "continue" && active[col]) {
+        active[col].rowspan++;
+        for (let k = 0; k < colspan; k++) active[col + k] = active[col];
+      } else {
+        const cell = { html: dxCellInner(tc, ctx), colspan, rowspan: 1, style: dxCellStyle(tcPr) };
+        rowCells.push(cell);
+        for (let k = 0; k < colspan; k++) active[col + k] = vm === "restart" ? cell : null;
+      }
+      col += colspan;
+    }
+    active.length = col;
+    rowsOut.push(rowCells);
+  }
+  return `<table><tbody>${rowsOut.map((rc) => `<tr>${rc.map(dxCellHtml).join("")}</tr>`).join("")}</tbody></table>`;
+}
+
+/** Render a .docx ArrayBuffer → { html, blobUrls }. Throws on bad input. */
+async function renderDocx(buf) {
+  const zip = await unzipDocx(buf);
+  const dec = new TextDecoder();
+  const readText = async (name) => { const b = await zip.read(name); return b ? dec.decode(b) : null; };
+  const docText = await readText("word/document.xml");
+  if (!docText) throw new Error("missing word/document.xml");
+  const document = dxFind(parseXml(cleanXml(docText)), "document");
+  const body = document && dxKid(document, "body");
+  if (!body) throw new Error("no readable document body");
+
+  const rels = {};
+  const relsText = await readText("word/_rels/document.xml.rels");
+  if (relsText) {
+    const walk = (n) => {
+      if (typeof n === "string") return;
+      if (dxln(n.t) === "Relationship" && n.a.Id) rels[n.a.Id] = n.a.Target || "";
+      n.c.forEach(walk);
+    };
+    walk(parseXml(cleanXml(relsText)));
+  }
+
+  // Embedded raster images → blob URLs (SVG skipped: script risk; EMF/WMF won't render).
+  const media = {}, blobUrls = [];
+  const mimeFor = (name) => ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", bmp: "image/bmp" }[(name.split(".").pop() || "").toLowerCase()] || "");
+  for (const name of zip.names) {
+    if (!/^word\/media\//i.test(name)) continue;
+    const mt = mimeFor(name);
+    if (!mt) continue;
+    const bytes = await zip.read(name);
+    if (!bytes) continue;
+    const url = URL.createObjectURL(new Blob([bytes], { type: mt }));
+    media[name] = url;
+    blobUrls.push(url);
+  }
+
+  const ctx = { rels, media, numbering: dxParseNumbering(await readText("word/numbering.xml")) };
+  const blocks = [];
+  for (const c of body.c) {
+    if (typeof c === "string") continue;
+    const t = dxln(c.t);
+    if (t === "p") blocks.push(dxParagraph(c, ctx));
+    else if (t === "tbl") blocks.push({ table: dxTable(c, ctx) });
+  }
+  let html = "", i = 0;
+  while (i < blocks.length) {
+    const b = blocks[i];
+    if (b.list) {
+      const grp = [], numId = b.list.numId;
+      while (i < blocks.length && blocks[i].list && blocks[i].list.numId === numId) grp.push(blocks[i++]);
+      html += dxList(grp, ctx);
+    } else if (b.table) { html += b.table; i++; }
+    else { html += dxBlockHtml(b); i++; }
+  }
+  return { html, blobUrls };
+}
+
+/** Open the in-app DOCX viewer: fetch the attachment, render it with the
+    zero-dependency parser above, and show it in a modal. */
+function openDocxViewer(file) {
+  if (!file) return;
+  closeDocxViewer();
+  const v = { file, status: "loading", html: "", error: "", blobs: [] };
+  state.docxViewer = v;
+  renderDocxViewer();
+  loadDocxViewer(v);
+}
+
+async function loadDocxViewer(v) {
+  try {
+    const res = await fetch(attachUrl(v.file.id));
+    if (!res.ok) throw new Error("download failed (" + res.status + ")");
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > 25 * 1024 * 1024) throw new Error("file too large to preview");
+    const { html, blobUrls } = await renderDocx(buf);
+    if (state.docxViewer !== v) { blobUrls.forEach((u) => URL.revokeObjectURL(u)); return; }
+    v.blobs = blobUrls;
+    v.status = "done";
+    v.html = html || '<p class="dx-empty-doc">This document has no readable text.</p>';
+  } catch (err) {
+    if (state.docxViewer !== v) return;
+    v.status = "error";
+    v.error = (err && err.message) || "could not open this document";
+  }
+  renderDocxViewer();
+}
+
+function closeDocxViewer() {
+  const v = state.docxViewer;
+  state.docxViewer = null;
+  if (v && v.blobs) v.blobs.forEach((u) => { try { URL.revokeObjectURL(u); } catch { /* noop */ } });
+  const el = $("#docxview");
+  if (el) el.remove();
+}
+
+function renderDocxViewer() {
+  const old = $("#docxview");
+  if (old) old.remove();
+  const v = state.docxViewer;
+  if (!v) return;
+  const f = v.file;
+  const url = attachUrl(f.id);
+  const label = f.filename || "file";
+  let stage;
+  if (v.status === "loading") {
+    stage = `<div class="dxv-loading"><span class="dxv-spin" aria-hidden="true"></span><p>Opening document&hellip;</p></div>`;
+  } else if (v.status === "error") {
+    stage = `<div class="dxv-error">${icon("warn", "big")}<p>Couldn&rsquo;t open this document.</p><p class="dxv-errmsg">${esc(v.error)}</p><a class="dxv-dlbtn" href="${url}" target="_blank" rel="noopener" download="${esc(label)}">${icon("tray")}<span>Download instead</span></a></div>`;
+  } else {
+    stage = `<div class="dxv-doc">${v.html}</div>`;
+  }
+  const wrap = document.createElement("div");
+  wrap.id = "docxview";
+  wrap.innerHTML = `
+    <div class="dxv-scrim" id="dxv-scrim"></div>
+    <div class="dxv-box" role="dialog" aria-modal="true" aria-label="Document viewer: ${esc(label)}">
+      <div class="dxv-head">
+        <span class="dxv-ic">${icon("docx")}</span>
+        <div class="dxv-meta">
+          <div class="dxv-name">${esc(label)}</div>
+          <div class="dxv-sub">${esc(fmtSize(f.size))}${f.sent_at ? " · " + esc(fmtTime(f.sent_at)) : ""}</div>
+        </div>
+        <a class="dxv-dl" href="${url}" target="_blank" rel="noopener" download="${esc(label)}">${icon("tray")}<span>Download</span></a>
+        <button class="dxv-close" id="dxv-close" aria-label="Close document viewer">${icon("close")}</button>
+      </div>
+      <div class="dxv-stage">${stage}</div>
+    </div>`;
+  document.body.appendChild(wrap);
+  $("#dxv-close").addEventListener("click", closeDocxViewer);
+  $("#dxv-scrim").addEventListener("click", closeDocxViewer);
+}
+
 function renderLightbox() {
   const lb0 = $("#lightbox");
   if (lb0) lb0.remove();
@@ -305,6 +803,10 @@ function renderLightbox() {
 document.addEventListener("keydown", (e) => {
   if (state.pdfViewer) {
     if (e.key === "Escape") closePdfViewer();
+    return;
+  }
+  if (state.docxViewer) {
+    if (e.key === "Escape") closeDocxViewer();
     return;
   }
   const L = state.lightbox;
@@ -595,7 +1097,7 @@ function filesPanelHtml() {
     const kind = attKind(f.mime);
     const prev = kind === "image"
       ? `<span class="ft-prev"><img src="${attachUrl(f.id)}" alt="" loading="lazy"></span>`
-      : `<span class="ft-prev ft-ic ft-${kind}">${icon(isPdf(f) ? "pdf" : attIconName(kind))}</span>`;
+      : `<span class="ft-prev ft-ic ft-${kind}">${icon(isPdf(f) ? "pdf" : isDocx(f) ? "docx" : attIconName(kind))}</span>`;
     return `<button class="file-tile" data-fentry="${i}" title="${esc(f.filename || "file")}">
       ${prev}
       <span class="ft-name">${esc(f.filename || "file")}</span>
@@ -648,9 +1150,11 @@ function wireFilesPanel() {
     const e = (state.fileEntries || [])[Number(t.dataset.fentry)];
     if (!e) return;
     // A stack opens the lightbox on that message's images; a lone PDF opens
-    // the in-app PDF viewer; anything else opens the lightbox on the list.
+    // the in-app PDF viewer; a lone DOCX opens the document viewer; anything
+    // else opens the lightbox on the list.
     if (e.type === "stack") openLightbox(e.images, 0);
     else if (isPdf(e.f)) openPdfViewer(e.f);
+    else if (isDocx(e.f)) openDocxViewer(e.f);
     else openLightbox(activeFiles(), Math.max(0, activeFiles().indexOf(e.f)));
   }));
   const qi = $("#fp-q");
@@ -891,6 +1395,17 @@ function renderConversationDetail() {
     else {
       const m = state.messages.flatMap((x) => x.attachments || []).find((a) => String(a.id) === String(id));
       if (m) openPdfViewer({ id: m.id, filename: m.filename, mime: m.mime, size: m.size });
+    }
+  }));
+
+  // DOCX chips open the in-app document viewer instead of the lightbox.
+  $$("#msgs [data-docx]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.docx;
+    const i = activeFiles().findIndex((f) => String(f.id) === String(id));
+    if (i >= 0) openDocxViewer(activeFiles()[i]);
+    else {
+      const m = state.messages.flatMap((x) => x.attachments || []).find((a) => String(a.id) === String(id));
+      if (m) openDocxViewer({ id: m.id, filename: m.filename, mime: m.mime, size: m.size });
     }
   }));
 

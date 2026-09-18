@@ -102,6 +102,12 @@ const ICONS = {
     '<path d="M14 3v4h4" fill="none" class="w" stroke-width="2" stroke-linejoin="round" opacity=".7"/>' +
     '<rect x="8" y="11.5" width="8" height="2.4" rx="1.2" class="w" opacity=".9"/>' +
     '<rect x="8" y="15.4" width="5" height="2.4" rx="1.2" class="w" opacity=".55"/>',
+  docx:
+    '<path d="M6 3h8l4 4v14H6z" fill="currentColor"/>' +
+    '<path d="M14 3v4h4" fill="none" class="w" stroke-width="2" stroke-linejoin="round" opacity=".7"/>' +
+    '<rect x="8" y="11" width="8" height="3" rx="1" class="a"/>' +
+    '<rect x="8" y="15.6" width="8" height="2.2" rx="1.1" class="w" opacity=".55"/>' +
+    '<rect x="8" y="19" width="5" height="2.2" rx="1.1" class="w" opacity=".55"/>',
   image:
     '<rect x="3" y="5" width="18" height="14" rx="2.5" fill="currentColor"/>' +
     '<circle cx="9" cy="10" r="1.8" class="w"/>' +
