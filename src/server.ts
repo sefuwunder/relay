@@ -5,7 +5,7 @@
 import {
   openDb, getDb, uid,
   listContacts, listActiveContacts, listArchivedContacts, getContact, createContact, updateContact, deleteContact, countActiveContacts,
-  getConversation, conversationMembers, dmFor, createGroup, listConversations, markRead,
+  getConversation, conversationMembers, dmFor, createGroup, listConversations, markRead, setConversationArchived,
   listMessages, insertMessage, hasExternalId, kvGet, kvSet, MAX_PEOPLE,
   insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, searchConversationAttachments, deleteConversationData,
   insertAppointment, listAppointments, getAppointment, getAppointmentByUid, getAppointmentsForMessages, setAppointmentStatus,
@@ -683,7 +683,7 @@ function conversationForContacts(ids: string[], opts: { create?: boolean } = {})
   const unique = [...new Set(ids)];
   if (unique.length === 1) return dmFor(unique[0]);
   const want = unique.slice().sort().join(",");
-  for (const c of listConversations()) {
+  for (const c of listConversations(true)) {
     if (!c.is_group) continue;
     const have = conversationMembers(c.id).map((m) => m.id).sort().join(",");
     if (have === want) return c;
@@ -934,7 +934,7 @@ async function pollMatrixOnce() {
       const contacts = listContacts();
       const roomToConv = new Map<string, string>();
       for (const c of contacts) if (c.matrix_room_id) roomToConv.set(c.matrix_room_id, dmFor(c.id).id);
-      for (const conv of listConversations()) {
+      for (const conv of listConversations(true)) {
         if (conv.is_group && (conv as Conversation).matrix_room_id) roomToConv.set((conv as Conversation).matrix_room_id, conv.id);
       }
       for (const m of messages) {
@@ -1217,7 +1217,10 @@ const server = (Bun as any).serve({
 
       // ----- conversations -----
       if (path === "/api/conversations" && method === "GET") {
-        const convs = listConversations().map((c) => {
+        const onlyArchived = url.searchParams.get("archived") === "1";
+        const convs = listConversations(true)
+          .filter((c) => (onlyArchived ? !!c.archived : !c.archived))
+          .map((c) => {
           const members = conversationMembers(c.id);
           const title = c.is_group ? c.name : members[0]?.name || "Conversation";
           return {
@@ -1225,6 +1228,7 @@ const server = (Bun as any).serve({
             avatar_color: c.is_group ? "#8e8e93" : members[0]?.color || "#8e8e93",
             member_count: c.member_count, last_body: c.last_body || "", last_at: c.last_at || c.created_at,
             last_channel: c.last_channel || "", last_direction: c.last_direction || "", unread: c.unread,
+            archived: !!c.archived,
             members: members.map((x) => ({ id: x.id, name: x.name, color: x.color, avatar_url: avatarFor(x) })),
             hidden: !c.is_group && members.length > 0 && members.every((x) => x.archived === 1),
           };
@@ -1260,8 +1264,9 @@ const server = (Bun as any).serve({
             const b = await readBody(req);
             if (b.name !== undefined) conv.name = String(b.name).trim() || conv.name;
             if (b.matrix_room_id !== undefined) conv.matrix_room_id = String(b.matrix_room_id).trim();
+            if (b.archived !== undefined) setConversationArchived(id, b.archived === true || b.archived === 1 || b.archived === "1");
             getDb().query("UPDATE conversations SET name = ?, matrix_room_id = ? WHERE id = ?").run(conv.name, conv.matrix_room_id, id);
-            return json({ conversation: conv });
+            return json({ conversation: getConversation(id) });
           }
           if (method === "DELETE") {
             const removed = deleteConversationData(id);

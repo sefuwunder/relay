@@ -19,6 +19,7 @@ const CHAN_META = {
 const state = {
   status: null,
   conversations: [],
+  archivedConversations: [],
   contacts: [],
   archivedContacts: [],
   conv: null,          // open conversation detail
@@ -864,6 +865,25 @@ function bindTabs(root) {
 async function loadConversations() {
   const r = await api("/api/conversations");
   state.conversations = r.conversations || [];
+  try {
+    const a = await api("/api/conversations?archived=1");
+    state.archivedConversations = a.conversations || [];
+  } catch { state.archivedConversations = []; }
+}
+
+/** Archive or unarchive the open conversation. Archived threads leave the
+    main list (and stay silent) but keep working — new mail still lands in
+    the existing thread instead of creating a duplicate. */
+async function toggleConversationArchive() {
+  const conv = state.conv;
+  if (!conv) return;
+  const to = conv.archived ? 0 : 1;
+  const r = await api("/api/conversations/" + encodeURIComponent(conv.id), { method: "PATCH", body: JSON.stringify({ archived: to }) });
+  toast(to ? "Archived — it stays put, out of your way." : "Back in your conversations.");
+  await loadConversations();
+  if (to) { location.hash = "#/conversations"; return; }
+  state.conv = r.conversation;
+  renderConversationDetail();
 }
 
 // ---------- message notifications ----------
@@ -941,21 +961,16 @@ async function setNotify(on) {
 
 function renderConversations(skipIfSame) {
   const q = state.search.toLowerCase();
-  const list = state.conversations.filter((c) =>
-    !q || c.title.toLowerCase().includes(q) || (c.members || []).some((m) => m.name.toLowerCase().includes(q)));
+  const match = (c) => !q || c.title.toLowerCase().includes(q) || (c.members || []).some((m) => m.name.toLowerCase().includes(q));
+  const list = state.conversations.filter(match);
+  const arch = (state.archivedConversations || []).filter(match);
   // The 15s timer re-renders this view; skip the rewrite (and its entrance
   // animation) when nothing on screen would change.
-  const sig = q + "|" + list.map((c) => [c.id, c.last_at, c.unread, c.last_body, c.title].join("~")).join("|");
+  const sig = q + "|" + list.map((c) => [c.id, c.last_at, c.unread, c.last_body, c.title].join("~")).join("|")
+    + "|arch|" + arch.map((c) => [c.id, c.last_at, c.unread, c.title].join("~")).join("|");
   if (skipIfSame && sig === state.convListSig) return;
   state.convListSig = sig;
-  const app = $("#app");
-  app.innerHTML = `
-    <div class="view">
-      <div class="nav-bar"><div class="nav-title">Conversations</div>
-        <button class="nav-action" id="new-group">${icon("plus")}Group</button></div>
-      <div class="search-wrap"><div class="search-field">${icon("search")}<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
-      <div class="scroll">
-        ${list.length ? list.map((c) => `
+  const rowHtml = (c) => `
           <button class="conv-row" data-id="${c.id}">
             ${avatarHtml(c.title, c.avatar_color, 48, c.is_group, c.is_group ? null : c.members[0]?.avatar_url)}
             <div class="meta">
@@ -966,8 +981,17 @@ function renderConversations(skipIfSame) {
               </div>
             </div>
             ${c.unread ? `<span class="unread-dot">${c.unread}</span>` : ""}
-          </button>`).join("")
+          </button>`;
+  const app = $("#app");
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar"><div class="nav-title">Conversations</div>
+        <button class="nav-action" id="new-group">${icon("plus")}Group</button></div>
+      <div class="search-wrap"><div class="search-field">${icon("search")}<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
+      <div class="scroll">
+        ${list.length ? list.map(rowHtml).join("")
         : `<div class="empty">${icon("burst", "big")}<h3>No conversations yet</h3><p>Your inner circle lives here.<br>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
+        ${arch.length ? `<div class="group-caption">Archived · ${arch.length}</div>${arch.map(rowHtml).join("")}` : ""}
       </div>
       ${tabBar("conversations")}
     </div>`;
@@ -1349,6 +1373,7 @@ function renderConversationDetail() {
             </div>
             <button class="nav-action diary-toggle${state.panel === "diary" ? " on" : ""}" id="diary-toggle" aria-label="Appointment diary" title="Appointment diary">${icon("calendar")}${diaryWeekAppts().length ? `<span class="ft-badge">${diaryWeekAppts().length}</span>` : ""}</button>
             <button class="nav-action files-toggle${state.panel === "files" ? " on" : ""}" id="files-toggle" aria-label="Shared files" title="Shared files">${icon("files")}${state.files.length ? `<span class="ft-badge">${state.files.length}</span>` : ""}</button>
+            <button class="nav-action" id="conv-archive" aria-label="${conv.archived ? "Unarchive conversation" : "Archive conversation"}" title="${conv.archived ? "Unarchive conversation" : "Archive conversation"}">${icon("box")}</button>
             ${conv.is_group ? `<button class="nav-action" id="grp-edit">Edit</button>` : ""}
           </div>
           <div class="msg-scroll" id="msgs">${body || `<div class="empty">${icon("send", "big")}<h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
@@ -1377,6 +1402,7 @@ function renderConversationDetail() {
     </div>`;
 
   $("#back").addEventListener("click", () => { location.hash = "#/conversations"; });
+  $("#conv-archive").addEventListener("click", toggleConversationArchive);
   const ge = $("#grp-edit");
   if (ge) ge.addEventListener("click", () => openGroupSheet(conv));
 

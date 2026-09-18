@@ -30,6 +30,7 @@ export interface Conversation {
   is_group: number;
   matrix_room_id: string;
   last_read_at: string;
+  archived: number;
   created_at: string;
 }
 
@@ -141,6 +142,11 @@ export function openDb(path: string): Database {
   const cols = db.query("PRAGMA table_info(contacts)").all() as { name: string }[];
   if (!cols.some((c) => c.name === "archived")) {
     db.exec("ALTER TABLE contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
+  }
+  // Migration: archived flag on conversations (older DBs lack the column).
+  const convCols = db.query("PRAGMA table_info(conversations)").all() as { name: string }[];
+  if (!convCols.some((c) => c.name === "archived")) {
+    db.exec("ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
   }
   // Migration: custom contact photo (older DBs lack the column).
   if (!cols.some((c) => c.name === "photo")) {
@@ -269,7 +275,7 @@ export function createGroup(name: string, memberIds: string[], matrixRoomId = ""
   return conv;
 }
 
-export function listConversations(): (Conversation & { member_count: number; last_body: string; last_at: string; last_channel: string; last_direction: string; unread: number })[] {
+export function listConversations(includeArchived = false): (Conversation & { member_count: number; last_body: string; last_at: string; last_channel: string; last_direction: string; unread: number })[] {
   return db.query(`
     SELECT c.*,
       (SELECT COUNT(*) FROM members m WHERE m.conversation_id = c.id) AS member_count,
@@ -279,8 +285,15 @@ export function listConversations(): (Conversation & { member_count: number; las
       (SELECT direction FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_direction,
       (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND direction = 'in' AND created_at > c.last_read_at) AS unread
     FROM conversations c
+    ${includeArchived ? "" : "WHERE c.archived = 0"}
     ORDER BY COALESCE(last_at, c.created_at) DESC
   `).all() as any[];
+}
+
+/** Archive (or unarchive) a conversation. Archived threads stay routable —
+    new mail still lands in the existing thread — but hide from the list. */
+export function setConversationArchived(id: string, archived: boolean): void {
+  db.query("UPDATE conversations SET archived = ? WHERE id = ?").run(archived ? 1 : 0, id);
 }
 
 export function markRead(convId: string): void {
