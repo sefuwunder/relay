@@ -43,6 +43,8 @@ const state = {
   pdfViewer: null,    // file object when the PDF viewer overlay is open
   docxViewer: null,   // { file, status, html, error, blobs } when the DOCX viewer is open
   dropDraft: false,    // set before re-rendering after a successful send
+  convListSig: "",     // signature of the last rendered conversation list (skips no-op re-renders)
+  seenMsgIds: null,    // ids of messages already on screen (only new ones animate in)
   notify: (() => { try { return localStorage.getItem("relay_notify") === "1"; } catch { return false; } })(),
 };
 
@@ -937,10 +939,15 @@ async function setNotify(on) {
   renderSettings();
 }
 
-function renderConversations() {
+function renderConversations(skipIfSame) {
   const q = state.search.toLowerCase();
   const list = state.conversations.filter((c) =>
     !q || c.title.toLowerCase().includes(q) || (c.members || []).some((m) => m.name.toLowerCase().includes(q)));
+  // The 15s timer re-renders this view; skip the rewrite (and its entrance
+  // animation) when nothing on screen would change.
+  const sig = q + "|" + list.map((c) => [c.id, c.last_at, c.unread, c.last_body, c.title].join("~")).join("|");
+  if (skipIfSame && sig === state.convListSig) return;
+  state.convListSig = sig;
   const app = $("#app");
   app.innerHTML = `
     <div class="view">
@@ -981,6 +988,7 @@ async function loadConversation(id) {
   state.replyTo = null;
   state.pendingFiles = [];
   state.panel = null;
+  state.seenMsgIds = new Set(); // fresh view: every message animates in once
   state.diary = [];
   state.diaryOffset = 0;
   state.eventForm = false;
@@ -1309,12 +1317,16 @@ function renderConversationDetail() {
 
   let body = "";
   let lastDay = "";
+  const seen = state.seenMsgIds || new Set();
   for (const m of state.messages) {
     const day = dayLabel(m.created_at);
     if (day !== lastDay) { body += `<div class="day-divider">${esc(day)}</div>`; lastDay = day; }
     const out = m.direction === "out";
     const canReply = m.channel === "email" && !out && m.message_id;
-    body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}">
+    // Messages already on screen keep their place quietly; only genuinely
+    // new ones replay the pop-in animation.
+    const isNew = !seen.has(m.id);
+    body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}${isNew ? "" : " msg-old"}">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
       <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span>${bubbleAtts(m)}</div>
       <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span><button class="retry-btn" data-retry="${m.id}" title="Try sending again">${icon("retry")}Retry</button>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">${icon("reply")}Reply</button>` : ""}</div>
@@ -1486,6 +1498,9 @@ function renderConversationDetail() {
 
   const sc = $("#msgs");
   sc.scrollTop = sc.scrollHeight;
+  // Everything now on screen counts as seen, so only future messages animate.
+  if (!state.seenMsgIds) state.seenMsgIds = new Set();
+  for (const m of state.messages) state.seenMsgIds.add(m.id);
 }
 function senderName(m) {
   // Best-effort: match inbound message to a member via external hints is unreliable;
@@ -2389,8 +2404,9 @@ async function route() {
     } else if (parts[0] === "conversations") {
       await pollConversations();
       renderConversations();
-      // Data arrives via the global poller below; this just re-renders.
-      state.timer = setInterval(() => { if ((location.hash || "#/conversations") === "#/conversations") renderConversations(); }, 15000);
+      // Data arrives via the global poller below; re-render only when the
+      // list actually changed so the view doesn't flicker while idle.
+      state.timer = setInterval(() => { if ((location.hash || "#/conversations") === "#/conversations") renderConversations(true); }, 15000);
     } else if (parts[0] === "people" && parts[1] === "new") {
       await loadContacts();
       openContactSheet(null);
