@@ -64,7 +64,7 @@ function load(f, extra) {
   (0, eval)(code + `\n//# sourceURL=${f}`);
 }
 load("icons.js", "\n;globalThis.__ICONS__ = ICONS;");
-load("app.js", "\n;globalThis.__APP__ = { state, pollConversations, checkNotifications, updateTitle, setNotify, notifyPerm, notifyHint, renderSettings, loadConversations };");
+load("app.js", "\n;globalThis.__APP__ = { state, pollConversations, checkNotifications, updateTitle, setNotify, notifyPerm, notifyHint, renderSettings, loadConversations, fireNotification, notificationIcon, playAlertSound, setSound };");
 const A = globalThis.__APP__;
 const { state } = A;
 
@@ -228,6 +228,62 @@ A.checkNotifications(new Map());
 state.conversations = [conv("c1", iso(5000), "in", "", 2)];
 A.checkNotifications(new Map([["c1", "old"]]));
 ok("empty body falls back", notifications[0].opts.body === "New message");
+
+// 16. notification icon: contact photo vs generated tile
+ok("DM with photo uses the photo", A.notificationIcon({ is_group: false, title: "Alma", avatar_color: "#0a84ff", members: [{ avatar_url: "https://gravatar.com/avatar/abc" }] }) === "https://gravatar.com/avatar/abc");
+const tile = A.notificationIcon({ is_group: false, title: "Alma", avatar_color: "#0a84ff", members: [{ avatar_url: null }] });
+ok("DM without photo gets an initials tile", tile.startsWith("data:image/svg+xml,") && decodeURIComponent(tile).includes(">A<"));
+const gtile = A.notificationIcon({ is_group: true, title: "Book Club", avatar_color: "#8e8e93", members: [{ avatar_url: "https://x/y.png" }] });
+ok("group always gets a tile", gtile.startsWith("data:image/svg+xml,") && decodeURIComponent(gtile).includes(">BC<"));
+const bad = A.notificationIcon({ is_group: true, title: "X", avatar_color: "red", members: [] });
+ok("bad color falls back safely", decodeURIComponent(bad).includes("#8e8e93"));
+
+// 17. fired notification carries the icon
+reset();
+const withPhoto = conv("c1", iso(3600000), "in", "seed", 1);
+withPhoto.members = [{ id: "a", name: "Alma", color: "#0a84ff", avatar_url: "https://gravatar.com/avatar/abc" }];
+state.conversations = [withPhoto];
+A.checkNotifications(new Map());
+state.conversations = [Object.assign({}, withPhoto, { last_at: iso(5000), last_body: "yo", unread: 2 })];
+A.checkNotifications(new Map([["c1", "old"]]));
+ok("notification carries the contact image", notifications[0].opts.icon === "https://gravatar.com/avatar/abc");
+
+// 18. alert sound: plays with notification when on, silent when off
+const audioCalls = [];
+class FakeGain { constructor() { this.gain = { setValueAtTime() {}, exponentialRampToValueAtTime() {} }; } connect() { return this; } }
+class FakeOsc { constructor() { this.type = ""; this.frequency = { value: 0 }; } connect() { return this; } start() { audioCalls.push("start"); } stop() {} }
+global.window.AudioContext = class {
+  constructor() { this.state = "running"; this.currentTime = 0; this.destination = {}; }
+  createOscillator() { return new FakeOsc(); }
+  createGain() { return new FakeGain(); }
+  resume() { return Promise.resolve(); }
+};
+reset();
+state.sound = true;
+state.conversations = [conv("c1", iso(3600000), "in", "seed", 1)];
+A.checkNotifications(new Map());
+state.conversations = [conv("c1", iso(5000), "in", "yo", 2)];
+A.checkNotifications(new Map([["c1", "old"]]));
+ok("notification plays the chime when sound is on", audioCalls.filter((x) => x === "start").length === 2);
+reset();
+state.sound = false;
+audioCalls.length = 0;
+state.conversations = [conv("c1", iso(3600000), "in", "seed", 1)];
+A.checkNotifications(new Map());
+state.conversations = [conv("c1", iso(5000), "in", "yo", 2)];
+A.checkNotifications(new Map([["c1", "old"]]));
+ok("no sound when toggled off", audioCalls.length === 0);
+ok("notification still fires when sound is off", notifications.length === 1);
+
+// 19. sound toggle persists
+reset();
+state.status = {};
+state.settings = { accounts: [], smtp: {}, imap: {}, matrix: {}, gv: {}, google: {} };
+state.sound = true;
+await A.setSound(false);
+ok("setSound persists off", ls.get("relay_sound") === "0" && state.sound === false);
+await A.setSound(true);
+ok("setSound persists on", ls.get("relay_sound") === "1" && state.sound === true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 }

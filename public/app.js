@@ -47,6 +47,7 @@ const state = {
   convListSig: "",     // signature of the last rendered conversation list (skips no-op re-renders)
   seenMsgIds: null,    // ids of messages already on screen (only new ones animate in)
   notify: (() => { try { return localStorage.getItem("relay_notify") === "1"; } catch { return false; } })(),
+  sound: (() => { try { return localStorage.getItem("relay_sound") !== "0"; } catch { return true; } })(),
 };
 
 async function api(path, opts = {}) {
@@ -932,9 +933,75 @@ function fireNotification(c) {
   let body = String(c.last_body || "").replace(/\s+/g, " ").trim().slice(0, 140);
   if (!body) body = "New message";
   try {
-    const n = new Notification(c.title || "Relay", { body, tag: "relay-" + c.id });
+    const n = new Notification(c.title || "Relay", { body, tag: "relay-" + c.id, icon: notificationIcon(c) });
     n.onclick = () => { try { window.focus(); } catch { /* noop */ } location.hash = "#/conversations/" + c.id; n.close(); };
   } catch { /* notifications unavailable */ }
+  playAlertSound();
+}
+
+/** Notification icon: the contact's photo when there is one, otherwise a
+    generated initials tile in their color (groups always use the tile). */
+function notificationIcon(c) {
+  const url = !c.is_group && c.members && c.members[0] && c.members[0].avatar_url;
+  if (url) return url;
+  const t = String(initials(c.title || "?")).replace(/[<>&"']/g, "");
+  const color = /^#[0-9a-fA-F]{6}$/.test(c.avatar_color || "") ? c.avatar_color : "#8e8e93";
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="48" fill="${color}"/><text x="48" y="63" font-family="system-ui,-apple-system,sans-serif" font-size="38" font-weight="600" fill="#ffffff" text-anchor="middle">${t}</text></svg>`;
+  return "data:image/svg+xml," + encodeURIComponent(svg);
+}
+
+// ---------- notification sound ----------
+
+let audioCtx = null;
+/** Shared AudioContext. Browsers only allow audio after a user gesture, so
+    the first tap/keypress unlocks it; before that, sounds are skipped. */
+function ensureAudio() {
+  try {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+  } catch { /* no audio available */ }
+}
+if (typeof window !== "undefined" && window.addEventListener) {
+  ["pointerdown", "keydown"].forEach((t) => window.addEventListener(t, ensureAudio));
+}
+
+/** A small, soft two-note chime synthesized with Web Audio — no audio files. */
+function playAlertSound() {
+  if (!state.sound) return;
+  try {
+    ensureAudio();
+    if (!audioCtx) return;
+    const start = () => {
+      if (audioCtx.state !== "running") return;
+      const t0 = audioCtx.currentTime;
+      // E5 -> B4, gentle attack, fully decayed in half a second.
+      [[659.25, 0], [880, 0.14]].forEach(([freq, dt]) => {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = "sine";
+        o.frequency.value = freq;
+        const s = t0 + dt;
+        g.gain.setValueAtTime(0.0001, s);
+        g.gain.exponentialRampToValueAtTime(0.16, s + 0.025);
+        g.gain.exponentialRampToValueAtTime(0.0001, s + 0.5);
+        o.connect(g); g.connect(audioCtx.destination);
+        o.start(s); o.stop(s + 0.55);
+      });
+    };
+    if (audioCtx.state === "suspended") audioCtx.resume().then(start).catch(() => {});
+    else start();
+  } catch { /* stay silent */ }
+}
+
+async function setSound(on) {
+  state.sound = on;
+  try { localStorage.setItem("relay_sound", on ? "1" : "0"); } catch { /* noop */ }
+  if (on) playAlertSound(); // preview the chime
+  renderSettings();
 }
 
 function updateTitle() {
@@ -2282,6 +2349,10 @@ function renderSettings() {
             <div class="rlabel" style="flex:1"><div class="t1">New message notifications</div><div class="t2">${notifyHint()}</div></div>
             <label class="switch"><input type="checkbox" id="notify-toggle" ${state.notify ? "checked" : ""} aria-label="New message notifications"><span class="track"><span class="thumb"></span></span></label>
           </div>
+          <div class="group-row">
+            <div class="rlabel" style="flex:1"><div class="t1">Notification sound</div><div class="t2">A soft chime plays with each notification.</div></div>
+            <label class="switch"><input type="checkbox" id="sound-toggle" ${state.sound ? "checked" : ""} aria-label="Notification sound"><span class="track"><span class="thumb"></span></span></label>
+          </div>
         </div>
 
         <div class="group-caption">Email sending · SMTP</div>
@@ -2353,6 +2424,7 @@ function renderSettings() {
   api("/api/google/redirect-uri").then((r) => { const el = $("#g-uri"); if (el) el.textContent = r.redirect_uri; }).catch(() => {});
 
   $("#notify-toggle").addEventListener("change", (e) => { setNotify(e.target.checked); });
+  $("#sound-toggle").addEventListener("change", (e) => { setSound(e.target.checked); });
 
   $("#migrate-mail").addEventListener("click", async () => {
     const el = $("#migrate-result");
