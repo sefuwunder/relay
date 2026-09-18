@@ -119,7 +119,7 @@ ok("image bubble is a chip, not an inline thumbnail",
 ok("image chip still opens the lightbox via data-att", bhtml.includes('data-att="a1"') && bhtml.includes("photo.png"));
 ok("video bubble has a player", html.includes("<video") && html.includes("/api/attachments/a2"));
 ok("audio bubble has a player", html.includes("<audio") && html.includes("/api/attachments/a3"));
-ok("doc bubble is a download chip", html.includes('class="att att-file"') && html.includes("deck.pdf"));
+ok("pdf bubble opens the in-app viewer", html.includes('data-pdf="a4"') && html.includes("att-pdfchip") && html.includes("deck.pdf"));
 ok("bubble text still renders", html.includes("see these"));
 
 // 2b. same-message images stack into one tile

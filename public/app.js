@@ -40,6 +40,7 @@ const state = {
   fileSearch: "",      // shared-files widget search query (last 90 days)
   fileResults: null,   // search matches; null = browsing recent files
   lightbox: null,      // { files, index } when the preview overlay is open
+  pdfViewer: null,    // file object when the PDF viewer overlay is open
   dropDraft: false,    // set before re-rendering after a successful send
   notify: (() => { try { return localStorage.getItem("relay_notify") === "1"; } catch { return false; } })(),
 };
@@ -134,6 +135,11 @@ function attachUrl(id) {
   return "/api/attachments/" + encodeURIComponent(id);
 }
 
+/** True for PDF files: detected by MIME type or .pdf filename. */
+function isPdf(f) {
+  return !!f && (f.mime === "application/pdf" || /\.pdf$/i.test(f.filename || ""));
+}
+
 /** "Thu, Sep 18 · 2:00 PM – 3:30 PM" from ISO UTC bounds. */
 function fmtApptRange(startsAt, endsAt) {
   const s = new Date(startsAt), e = new Date(endsAt);
@@ -191,6 +197,9 @@ function bubbleAtts(m) {
     if (kind === "audio") {
       return `<audio class="att att-aud" src="${url}" controls preload="metadata"></audio>`;
     }
+    if (isPdf(a)) {
+      return `<button class="att att-file att-pdfchip" data-pdf="${esc(a.id)}" title="${label} — view PDF">${icon("pdf")}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></button>`;
+    }
     return `<a class="att att-file" href="${url}" target="_blank" rel="noopener" title="${label} — ${esc(fmtSize(a.size))}">${icon(attIconName(kind))}<span class="att-name">${label}</span><span class="att-size">${esc(fmtSize(a.size))}</span></a>`;
   }).join("")}</div>`;
 }
@@ -206,6 +215,50 @@ function closeLightbox() {
   state.lightbox = null;
   const lb = $("#lightbox");
   if (lb) lb.remove();
+}
+
+/** Open the in-app PDF viewer: the browser's native PDF renderer (zoom,
+    search, page navigation) inside a full-screen modal. Server sends
+    attachments with Content-Disposition: inline, so the PDF renders in
+    place instead of downloading. */
+function openPdfViewer(file) {
+  if (!file) return;
+  state.pdfViewer = file;
+  renderPdfViewer();
+}
+
+function closePdfViewer() {
+  state.pdfViewer = null;
+  const pv = $("#pdfview");
+  if (pv) pv.remove();
+}
+
+function renderPdfViewer() {
+  const old = $("#pdfview");
+  if (old) old.remove();
+  const f = state.pdfViewer;
+  if (!f) return;
+  const url = attachUrl(f.id);
+  const label = f.filename || "file";
+  const wrap = document.createElement("div");
+  wrap.id = "pdfview";
+  wrap.innerHTML = `
+    <div class="pdfv-scrim" id="pdfv-scrim"></div>
+    <div class="pdfv-box" role="dialog" aria-modal="true" aria-label="PDF viewer: ${esc(label)}">
+      <div class="pdfv-head">
+        <span class="pdfv-ic">${icon("pdf")}</span>
+        <div class="pdfv-meta">
+          <div class="pdfv-name">${esc(label)}</div>
+          <div class="pdfv-sub">${esc(fmtSize(f.size))}${f.sent_at ? " · " + esc(fmtTime(f.sent_at)) : ""}</div>
+        </div>
+        <a class="pdfv-dl" href="${url}" target="_blank" rel="noopener" download="${esc(label)}">${icon("tray")}<span>Download</span></a>
+        <button class="pdfv-close" id="pdfv-close" aria-label="Close PDF viewer">${icon("close")}</button>
+      </div>
+      <div class="pdfv-stage"><iframe class="pdfv-doc" src="${url}" title="${esc(label)}"></iframe></div>
+    </div>`;
+  document.body.appendChild(wrap);
+  $("#pdfv-close").addEventListener("click", closePdfViewer);
+  $("#pdfv-scrim").addEventListener("click", closePdfViewer);
 }
 
 function renderLightbox() {
@@ -250,6 +303,10 @@ function renderLightbox() {
 }
 
 document.addEventListener("keydown", (e) => {
+  if (state.pdfViewer) {
+    if (e.key === "Escape") closePdfViewer();
+    return;
+  }
   const L = state.lightbox;
   if (!L) return;
   if (e.key === "Escape") closeLightbox();
@@ -538,7 +595,7 @@ function filesPanelHtml() {
     const kind = attKind(f.mime);
     const prev = kind === "image"
       ? `<span class="ft-prev"><img src="${attachUrl(f.id)}" alt="" loading="lazy"></span>`
-      : `<span class="ft-prev ft-ic ft-${kind}">${icon(attIconName(kind))}</span>`;
+      : `<span class="ft-prev ft-ic ft-${kind}">${icon(isPdf(f) ? "pdf" : attIconName(kind))}</span>`;
     return `<button class="file-tile" data-fentry="${i}" title="${esc(f.filename || "file")}">
       ${prev}
       <span class="ft-name">${esc(f.filename || "file")}</span>
@@ -590,9 +647,10 @@ function wireFilesPanel() {
   $$("#files-panel [data-fentry]").forEach((t) => t.addEventListener("click", () => {
     const e = (state.fileEntries || [])[Number(t.dataset.fentry)];
     if (!e) return;
-    // A stack opens the lightbox on that message's images; a lone file opens
-    // it in the widget's current list.
+    // A stack opens the lightbox on that message's images; a lone PDF opens
+    // the in-app PDF viewer; anything else opens the lightbox on the list.
     if (e.type === "stack") openLightbox(e.images, 0);
+    else if (isPdf(e.f)) openPdfViewer(e.f);
     else openLightbox(activeFiles(), Math.max(0, activeFiles().indexOf(e.f)));
   }));
   const qi = $("#fp-q");
@@ -823,6 +881,16 @@ function renderConversationDetail() {
     else {
       const m = state.messages.flatMap((x) => x.attachments || []).find((a) => String(a.id) === String(id));
       if (m) openLightbox([{ id: m.id, filename: m.filename, mime: m.mime, size: m.size }], 0);
+    }
+  }));
+  // PDF chips open the in-app PDF viewer instead of the lightbox.
+  $$("#msgs [data-pdf]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.pdf;
+    const i = activeFiles().findIndex((f) => String(f.id) === String(id));
+    if (i >= 0) openPdfViewer(activeFiles()[i]);
+    else {
+      const m = state.messages.flatMap((x) => x.attachments || []).find((a) => String(a.id) === String(id));
+      if (m) openPdfViewer({ id: m.id, filename: m.filename, mime: m.mime, size: m.size });
     }
   }));
 

@@ -385,6 +385,8 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
 .att-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; align-items: stretch; }
 /* Image chips in bubbles: no inline thumbnails — previews live in the widget. */
 .att-imgchip { cursor: zoom-in; border: none; font: inherit; text-align: left; }
+/* PDF chips open the in-app viewer. */
+.att-pdfchip { cursor: pointer; border: none; font: inherit; text-align: left; }
 .att-vid { max-width: 240px; border-radius: 12px; background: #000; display: block; }
 .att-aud { max-width: 240px; height: 38px; display: block; }
 .att-file { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 12px; background: rgba(120,120,128,0.16); color: inherit; text-decoration: none; font-size: 14px; max-width: 240px; }
@@ -476,6 +478,30 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
 .lb-nav .ic { width: 20px; height: 20px; }
 .lb-prev { left: 10px; }
 .lb-next { right: 10px; }
+
+/* ---------- PDF viewer ---------- */
+#pdfview { position: fixed; inset: 0; z-index: 85; display: flex; align-items: center; justify-content: center; }
+.pdfv-scrim { position: absolute; inset: 0; background: rgba(0,0,0,0.78); animation: fade 0.2s ease; }
+.pdfv-box { position: relative; width: min(1020px, 96vw); height: min(94vh, 1200px); display: flex; flex-direction: column; background: var(--card-solid); border-radius: 20px; overflow: hidden; box-shadow: 0 24px 80px rgba(0,0,0,0.45); animation: sheet-up 0.28s cubic-bezier(0.2, 0.9, 0.3, 1.15); }
+.pdfv-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; flex: 0 0 auto; }
+.pdfv-ic { width: 34px; height: 34px; border-radius: 10px; background: rgba(255,69,58,0.12); color: #ff453a; display: flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.pdfv-ic .ic { width: 20px; height: 20px; }
+.pdfv-meta { flex: 1; min-width: 0; }
+.pdfv-name { font-weight: 700; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pdfv-sub { color: var(--label-3); font-size: 12.5px; }
+.pdfv-dl { display: inline-flex; align-items: center; gap: 6px; color: var(--blue); font-weight: 600; font-size: 14px; text-decoration: none; padding: 7px 10px; border-radius: 10px; white-space: nowrap; }
+.pdfv-dl:active { background: rgba(120,120,128,0.14); }
+.pdfv-dl .ic { width: 17px; height: 17px; }
+.pdfv-close { width: 34px; height: 34px; border-radius: 50%; border: none; cursor: pointer; background: var(--fill); color: var(--label-1); display: flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.pdfv-close .ic { width: 17px; height: 17px; }
+.pdfv-stage { flex: 1; min-height: 0; background: #525659; }
+.pdfv-doc { width: 100%; height: 100%; border: none; display: block; background: #fff; }
+@media (max-width: 560px) {
+  .pdfv-box { width: 100vw; height: 100dvh; border-radius: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pdfv-scrim, .pdfv-box { animation: none; }
+}
 
 /* ---------- wide-screen reflow ---------- */
 @media (min-width: 900px) {
