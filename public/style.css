@@ -643,3 +643,37 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
 .dp-desc { font-size: 11px; color: var(--label-2); white-space: pre-wrap; }
 .dp-foot { margin-top: 2px; }
 .dp-hint { padding: 10px 14px 14px; font-size: 11px; color: var(--label-3); }
+
+/* Ad-hoc meeting chip under a message bubble. */
+.mtg-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-top: 6px; padding: 6px 10px;
+  border: 1px solid var(--hairline); border-radius: 999px;
+  background: rgba(37, 99, 235, 0.10); color: var(--blue);
+  font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+  max-width: 100%;
+}
+.mtg-chip .ic { width: 14px; height: 14px; flex-shrink: 0; }
+.mtg-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mtg-chip:hover { background: rgba(37, 99, 235, 0.18); }
+.mtg-chip:active { transform: scale(0.97); }
+
+/* Diary-entry composer modal. */
+.modal-wrap {
+  position: fixed; inset: 0; z-index: 80;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.32); padding: 16px;
+}
+.modal {
+  width: min(420px, 100%); max-height: 88vh; overflow-y: auto;
+  background: var(--card); border: 1px solid var(--hairline); border-radius: 16px;
+  padding: 16px; display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+}
+.modal-head { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 700; }
+.modal-head .ic { width: 18px; height: 18px; color: var(--blue); flex-shrink: 0; }
+.modal-head .modal-title { flex: 1; text-align: left; }
+.modal-x { border: none; background: none; color: var(--label-3); cursor: pointer; padding: 6px; border-radius: 8px; display: flex; }
+.modal-x .ic { width: 16px; height: 16px; }
+.modal-x:hover { background: rgba(120,120,128,0.16); }
+.diary-modal textarea { font: inherit; resize: vertical; }

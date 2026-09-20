@@ -1400,6 +1400,39 @@ const server = (Bun as any).serve({
           if (!getConversation(id)) return json({ error: "not found" }, 404);
           return json({ appointments: listAppointments(id) });
         }
+        if (m && method === "POST") {
+          // Personal diary entry (no email invitation): same appointments
+          // store the diary side panel reads.
+          const id = decodeURIComponent(m[1]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          let body: any = {};
+          try {
+            body = await readBody(req);
+          } catch {
+            return json({ error: "bad request" }, 400);
+          }
+          const title = String(body.title || "").trim();
+          const startsAt = String(body.starts_at || ""), endsAt = String(body.ends_at || "");
+          const s = new Date(startsAt), e = new Date(endsAt);
+          if (!title) return json({ error: "Give the entry a title." }, 400);
+          if (!startsAt || !endsAt || isNaN(s.getTime()) || isNaN(e.getTime())) {
+            return json({ error: "Pick a start and end time." }, 400);
+          }
+          if (e.getTime() <= s.getTime()) {
+            return json({ error: "The end time has to be after the start time." }, 400);
+          }
+          const appt = insertAppointment({
+            conversation_id: id,
+            message_id: String(body.message_id || ""),
+            title,
+            starts_at: s.toISOString(),
+            ends_at: e.toISOString(),
+            location: String(body.location || ""),
+            description: String(body.description || ""),
+            status: "planned",
+          });
+          return json({ appointment: appt }, 201);
+        }
       }
       {
         // Accept / decline / cancel an appointment from an invitation card.

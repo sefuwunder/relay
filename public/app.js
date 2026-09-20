@@ -37,6 +37,7 @@ const state = {
   diaryOffset: 0,      // week offset from the current week in the diary
   eventForm: false,    // inline calendar-invitation form open in the composer
   eventDraft: null,    // in-progress invitation field values
+  diaryDraft: null,    // pre-filled diary-entry composer ({ convId, messageId, title, start, end, location, desc })
   pendingEvent: null,  // validated invitation to send with the next message
   fileSearch: "",      // shared-files widget search query (last 90 days)
   fileResults: null,   // search matches; null = browsing recent files
@@ -163,7 +164,7 @@ function fmtApptRange(startsAt, endsAt) {
 
 /** Small status pill for an appointment. */
 function apptStatusChip(status) {
-  const labels = { sent: "sent", received: "invitation", accepted: "accepted", declined: "declined", cancelled: "cancelled" };
+  const labels = { sent: "sent", received: "invitation", accepted: "accepted", declined: "declined", cancelled: "cancelled", planned: "planned" };
   return `<span class="appt-status st-${esc(status || "")}">${esc(labels[status] || status || "")}</span>`;
 }
 
@@ -183,6 +184,140 @@ function inviteCard(m, a) {
     <div class="inv-head">${icon("calendar")}<div class="inv-meta"><div class="inv-title">${esc(title)}</div>${when ? `<div class="inv-when">${when}</div>` : ""}</div>${status}</div>
     ${loc}${desc}${actions}
   </div>`;
+}
+
+/** Parsed meeting suggestions for the messages on screen, keyed by message id.
+ *  Rebuilt on every conversation render; powers the "Add to diary" chips. */
+const mtgCache = new Map();
+
+/** "Tue 1:00 PM" from a UTC ISO instant, in local time. */
+function fmtMtgWhen(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, { weekday: "short" }) + " " +
+    d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+/** Friendly default diary title from the detected cue word. */
+function titleFromCue(cue) {
+  const c = String(cue || "").toLowerCase();
+  const map = { call: "Call", talk: "Call", zoom: "Zoom call", chat: "Chat", coffee: "Coffee", lunch: "Lunch", dinner: "Dinner", breakfast: "Breakfast", drinks: "Drinks", sync: "Sync", demo: "Demo", standup: "Standup", huddle: "Huddle", appointment: "Appointment" };
+  for (const k of Object.keys(map)) if (c.includes(k)) return map[k];
+  return "Meeting";
+}
+
+/** Local "YYYY-MM-DDTHH:MM" for datetime-local inputs. */
+function toLocalInput(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** Inline "Add to diary" chip for a message that looks like an ad-hoc meeting
+ *  request. Empty string when there's nothing to offer: no detection library,
+ *  no meeting cue + date/time, or a diary entry already exists for the message. */
+function meetingChipFor(m) {
+  if (!m || !m.body || typeof RelayDates === "undefined") return "";
+  if (m.appointment) return "";
+  if ((state.diary || []).some((a) => a.message_id && String(a.message_id) === String(m.id))) return "";
+  let det = null;
+  try { det = RelayDates.detectMeetingRequest(m.body); } catch { return ""; }
+  if (!det) return "";
+  mtgCache.set(m.id, { msg: m, det });
+  return `<button class="mtg-chip" data-mtg="${esc(m.id)}" title="Add this to your diary">${icon("calendar")}<span>Add to diary · ${esc(fmtMtgWhen(det.start))}</span></button>`;
+}
+
+/** Open the diary-entry composer pre-filled from a flagged message. */
+function openDiaryComposer(mid) {
+  const e = mtgCache.get(mid);
+  if (!e || !state.conv) return;
+  const { msg, det } = e;
+  state.diaryDraft = {
+    convId: state.conv.id,
+    messageId: msg.id,
+    title: titleFromCue(det.cue),
+    start: toLocalInput(new Date(det.start)),
+    end: toLocalInput(new Date(det.end)),
+    location: "",
+    desc: String(msg.body || "").slice(0, 500),
+  };
+  renderDiaryComposer();
+}
+
+function closeDiaryComposer() {
+  const w = document.getElementById("diary-composer");
+  if (w) w.remove();
+  state._diaryModal = null;
+}
+
+/** Dismiss the composer entirely, discarding the draft. */
+function cancelDiaryComposer() {
+  closeDiaryComposer();
+  state.diaryDraft = null;
+}
+
+/** The diary-entry modal. Kept on state._diaryModal for tests. */
+function renderDiaryComposer() {
+  closeDiaryComposer();
+  const d = state.diaryDraft;
+  if (!d) return;
+  const wrap = document.createElement("div");
+  wrap.id = "diary-composer";
+  wrap.className = "modal-wrap";
+  wrap.innerHTML = `<div class="modal diary-modal" role="dialog" aria-modal="true" aria-label="Add to diary">
+    <div class="modal-head">${icon("calendar")}<span class="modal-title">Add to diary</span><button class="modal-x" id="dc-x" aria-label="Cancel" title="Cancel">${icon("close")}</button></div>
+    <input class="text-input" id="dc-title" placeholder="Title" value="${esc(d.title)}" autocomplete="off" aria-label="Title">
+    <div class="ef-row">
+      <label>Starts<input type="datetime-local" id="dc-start" value="${esc(d.start)}" aria-label="Start time"></label>
+      <label>Ends<input type="datetime-local" id="dc-end" value="${esc(d.end)}" aria-label="End time"></label>
+    </div>
+    <input class="text-input" id="dc-loc" placeholder="Location (optional)" value="${esc(d.location)}" autocomplete="off" aria-label="Location">
+    <textarea id="dc-desc" rows="3" placeholder="Notes" aria-label="Notes">${esc(d.desc)}</textarea>
+    <div class="ef-actions"><span class="ef-hint">Saved to this conversation's diary — nothing is sent</span><button class="ef-send" id="dc-save">Add to diary</button></div>
+  </div>`;
+  document.body.appendChild(wrap);
+  state._diaryModal = wrap;
+  const x = document.getElementById("dc-x");
+  if (x) x.addEventListener("click", cancelDiaryComposer);
+  wrap.addEventListener("click", (ev) => { if (ev.target === wrap) cancelDiaryComposer(); });
+  document.addEventListener("keydown", function esc2(ev) {
+    if (ev.key === "Escape") { cancelDiaryComposer(); document.removeEventListener("keydown", esc2); }
+  });
+  const t = document.getElementById("dc-title");
+  if (t) { t.focus(); t.select(); }
+  const save = document.getElementById("dc-save");
+  if (save) save.addEventListener("click", saveDiaryDraft);
+}
+
+/** Validate the diary composer and write the entry to the diary store. */
+async function saveDiaryDraft() {
+  const d = state.diaryDraft;
+  if (!d) return;
+  const title = String(document.getElementById("dc-title").value || "").trim();
+  const startV = String(document.getElementById("dc-start").value || "");
+  const endV = String(document.getElementById("dc-end").value || "");
+  const location = String(document.getElementById("dc-loc").value || "").trim();
+  const desc = String(document.getElementById("dc-desc").value || "").trim();
+  if (!title) { toast("Give the entry a title.", true); return; }
+  const s = new Date(startV), e = new Date(endV);
+  if (!startV || !endV || isNaN(s.getTime()) || isNaN(e.getTime())) { toast("Pick a start and end time.", true); return; }
+  if (e.getTime() <= s.getTime()) { toast("The end time has to be after the start time.", true); return; }
+  try {
+    await api("/api/conversations/" + encodeURIComponent(d.convId) + "/appointments", {
+      method: "POST",
+      body: JSON.stringify({
+        title, starts_at: s.toISOString(), ends_at: e.toISOString(),
+        location, description: desc, message_id: d.messageId,
+      }),
+    });
+    closeDiaryComposer();
+    state.diaryDraft = null;
+    await refreshDiary();
+    state.panel = "diary"; // show the diary so the new entry is visible
+    renderConversationDetail();
+    toast("Added to the diary.");
+  } catch (err) {
+    toast(err && err.message ? err.message : "Couldn't save the entry.", true);
+  }
 }
 
 /** Attachment chips inside a message bubble. Images are preview chips (no inline
@@ -1084,6 +1219,8 @@ async function loadConversation(id) {
   state.diaryOffset = 0;
   state.eventForm = false;
   state.eventDraft = null;
+  state.diaryDraft = null;
+  cancelDiaryComposer();
   state.pendingEvent = null;
   state.fileSearch = "";
   state.fileResults = null;
@@ -1399,6 +1536,7 @@ async function setApptStatus(id, status) {
 function renderConversationDetail() {
   const conv = state.conv;
   if (!conv) { location.hash = "#/conversations"; return; }
+  mtgCache.clear(); // rebuilt per render by meetingChipFor
   // Preserve the in-progress draft across re-renders (file picks, refreshes).
   const keepDraft = $("#draft") ? $("#draft").value : "";
   const keepSubj = $("#subject") ? $("#subject").value : "";
@@ -1420,6 +1558,7 @@ function renderConversationDetail() {
     body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}${isNew ? "" : " msg-old"}">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
       <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span>${bubbleAtts(m)}</div>
+      ${meetingChipFor(m)}
       <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span><button class="retry-btn" data-retry="${m.id}" title="Try sending again">${icon("retry")}Retry</button>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">${icon("reply")}Reply</button>` : ""}</div>
     </div>`;
   }
@@ -1483,6 +1622,8 @@ function renderConversationDetail() {
   // Invitation cards: accept / decline inbound invites.
   $$("#msgs [data-appt-accept]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptAccept, "accepted")));
   $$("#msgs [data-appt-decline]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptDecline, "declined")));
+  // Ad-hoc meeting chips: open the diary composer pre-filled.
+  $$("#msgs [data-mtg]").forEach((b) => b.addEventListener("click", () => openDiaryComposer(b.dataset.mtg)));
   $$("#msgs [data-att]").forEach((b) => b.addEventListener("click", () => {
     const id = b.dataset.att;
     const i = activeFiles().findIndex((f) => String(f.id) === String(id));
