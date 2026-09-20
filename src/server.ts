@@ -12,6 +12,7 @@ import {
   type Contact, type Conversation, type Channel, type Message, type Attachment, type Appointment,
 } from "./db";
 import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
+import { fetchIcalFeed, previewFromFeedText, type CalPreviewEvent } from "./calfeed";
 import { sendMail, validateSmtp, gvGatewayAddress, newMessageId, type SmtpConfig, type MailAttachment } from "./smtp";
 import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, lookupEnvelopesByMessageId, type ImapConfig, type SentMailItem, type InboundAttachment, type UnseenMail } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
@@ -189,11 +190,19 @@ async function readMessageBody(req: Request): Promise<{ fields: any; files: Mail
   return { fields: await readBody(req), files: [] };
 }
 
+interface CalendarFeedSettings {
+  /** Secret iCal feed URL — never sent to clients. */
+  feedUrl: string;
+  /** ISO timestamp of the last manual sync, "" when never. */
+  lastSyncAt: string;
+}
+
 interface Settings {
   smtp: SmtpConfig;
   imap: ImapConfig;
   matrix: MatrixConfig;
   google: GoogleSettings;
+  calendar: CalendarFeedSettings;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -201,6 +210,7 @@ const DEFAULT_SETTINGS: Settings = {
   imap: { host: "", port: 993, user: "", pass: "" },
   matrix: { homeserver: "", token: "", userId: "" },
   google: { clientId: "", clientSecret: "", accessToken: "", refreshToken: "", expiresAt: 0, email: "" },
+  calendar: { feedUrl: "", lastSyncAt: "" },
 };
 
 let settings: Settings = structuredClone(DEFAULT_SETTINGS);
@@ -215,6 +225,7 @@ async function bootSettings() {
         imap: { ...DEFAULT_SETTINGS.imap, ...(j.imap || {}) },
         matrix: { ...DEFAULT_SETTINGS.matrix, ...(j.matrix || {}) },
         google: { ...DEFAULT_SETTINGS.google, ...(j.google || {}) },
+        calendar: { ...DEFAULT_SETTINGS.calendar, ...(j.calendar || {}) },
       };
     }
   } catch { /* keep defaults */ }
@@ -1028,18 +1039,24 @@ const server = (Bun as any).serve({
             connected: googleReady(),
             email: settings.google.email,
           },
+          // The feed URL is a secret — clients only learn whether one is set.
+          calendar: {
+            configured: !!settings.calendar.feedUrl,
+            lastSyncAt: settings.calendar.lastSyncAt,
+          },
         });
       }
       if (path === "/api/settings" && method === "POST") {
         const b = await readBody(req);
-        const section = b.section as "smtp" | "imap" | "matrix" | "google";
-        if (!["smtp", "imap", "matrix", "google"].includes(section)) return json({ error: "unknown settings section" }, 400);
+        const section = b.section as "smtp" | "imap" | "matrix" | "google" | "calendar";
+        if (!["smtp", "imap", "matrix", "google", "calendar"].includes(section)) return json({ error: "unknown settings section" }, 400);
         const vals = b.values || {};
         // Keep existing secrets when the client sends a placeholder.
         if (section === "smtp" && vals.pass === "__KEEP__") delete vals.pass;
         if (section === "imap" && vals.pass === "__KEEP__") delete vals.pass;
         if (section === "matrix" && vals.token === "__KEEP__") delete vals.token;
         if (section === "google" && vals.clientSecret === "__KEEP__") delete vals.clientSecret;
+        if (section === "calendar" && vals.feedUrl === "__KEEP__") delete vals.feedUrl;
         (settings as any)[section] = { ...(settings as any)[section], ...vals };
         if (section === "imap") { sentCache = null; smsCache = null; } // harvests came from the old mailbox
         await saveSettings();
@@ -1455,6 +1472,74 @@ const server = (Bun as any).serve({
           });
           return json({ appointment: appt }, 201);
         }
+      }
+      // ----- calendar feed (iCal secret address) sync -----
+      if (path === "/api/calendar/sync" && method === "POST") {
+        // Manual sync only: fetch the feed, parse it server-side, and return
+        // a preview. Nothing is written until POST /api/calendar/import.
+        const feedUrl = settings.calendar.feedUrl;
+        if (!feedUrl) return json({ error: "Set your calendar feed URL in Settings first." }, 400);
+        let text: string;
+        try {
+          text = await fetchIcalFeed(feedUrl);
+        } catch (e: any) {
+          return json({ error: e && e.message ? e.message : "Couldn't fetch the calendar feed." }, 502);
+        }
+        let events: CalPreviewEvent[];
+        try {
+          events = previewFromFeedText(text);
+        } catch (e: any) {
+          return json({ error: e && e.message ? e.message : "Couldn't parse the calendar feed." }, 400);
+        }
+        settings.calendar.lastSyncAt = new Date().toISOString();
+        await saveSettings();
+        return json({ events, fetched_at: settings.calendar.lastSyncAt });
+      }
+      if (path === "/api/calendar/import" && method === "POST") {
+        // Confirm step of the calendar sync: write the checked preview rows
+        // as diary entries. Dedupe by uid::start so re-syncs never duplicate.
+        let body: any = {};
+        try {
+          body = await readBody(req);
+        } catch {
+          return json({ error: "bad request" }, 400);
+        }
+        const items = Array.isArray(body.items) ? body.items : [];
+        if (!items.length) return json({ error: "Nothing selected to import." }, 400);
+        const results: any[] = [];
+        let imported = 0, skipped = 0;
+        for (const it of items) {
+          const key = String(it.key || "");
+          const summary = String(it.summary || "").trim();
+          const start = String(it.start || ""), end = String(it.end || "");
+          const convId = String(it.conversation_id || "");
+          const s = new Date(start), e = new Date(end);
+          const conv = convId ? getConversation(convId) : null;
+          const skip = (status: string, reason: string) => {
+            skipped++;
+            results.push({ key, status, reason });
+          };
+          if (it.cancelled) { skip("cancelled", "Event was cancelled."); continue; }
+          if (!key || !summary || !start || !end || isNaN(s.getTime()) || isNaN(e.getTime()) || e.getTime() <= s.getTime()) {
+            skip("invalid", "Missing or invalid event details."); continue;
+          }
+          if (!conv) { skip("no_conversation", "No conversation for the matched contact."); continue; }
+          if (getAppointmentByUid(key)) { skip("already_imported", "Already imported."); continue; }
+          insertAppointment({
+            conversation_id: conv.id,
+            uid: key,
+            title: summary.slice(0, 200),
+            starts_at: s.toISOString(),
+            ends_at: e.toISOString(),
+            location: String(it.location || "").slice(0, 300),
+            description: String(it.description || "").slice(0, 2000),
+            organizer: String(it.organizer || "").slice(0, 200),
+            status: "planned",
+          });
+          imported++;
+          results.push({ key, status: "imported", conversation_id: conv.id, conversation_name: conv.name });
+        }
+        return json({ results, imported, skipped });
       }
       {
         // Accept / decline / cancel an appointment from an invitation card.

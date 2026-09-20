@@ -50,6 +50,8 @@ const state = {
   eventForm: false,    // inline calendar-invitation form open in the composer
   eventDraft: null,    // in-progress invitation field values
   diaryDraft: null,    // pre-filled diary-entry composer ({ convId, messageId, title, start, end, location, desc })
+  calPreview: null,    // calendar-feed sync preview rows (pending user confirm)
+  calSyncing: false,   // a feed sync is in flight
   pendingEvent: null,  // validated invitation to send with the next message
   fileSearch: "",      // shared-files widget search query (last 90 days)
   fileResults: null,   // search matches; null = browsing recent files
@@ -330,6 +332,183 @@ async function saveDiaryDraft() {
   } catch (err) {
     toast(err && err.message ? err.message : "Couldn't save the entry.", true);
   }
+}
+
+// ---------- calendar feed sync (iCal secret address) ----------
+
+/** "Sep 20, 3:45 PM" in the user's local timezone. */
+function fmtCalSyncAt(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", " +
+    d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+/** Local date/time line for a preview row. */
+function fmtCalWhen(ev) {
+  const s = new Date(ev.start), e = new Date(ev.end);
+  const day = s.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  if (ev.all_day) return day + " · All day";
+  const hm = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const sameDay = s.toDateString() === e.toDateString();
+  return day + " · " + hm(s) + " – " + (sameDay ? hm(e) : e.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) + " " + hm(e));
+}
+
+const CAL_CONF_LABEL = { email: "email", name: "name", mention: "mentioned" };
+
+/** A row is pre-checked when it has a confident contact match landing in a real conversation. */
+function calRowPrechecked(ev) {
+  if (ev.cancelled || ev.already_imported || !ev.import_conversation_id) return false;
+  return (ev.matches || []).some((m) => m.confidence === "email" || m.confidence === "name");
+}
+
+function closeCalPreview() {
+  const w = document.getElementById("cal-preview");
+  if (w) w.remove();
+  state._calPreviewEl = null;
+}
+
+function closeCalSummary() {
+  const w = document.getElementById("cal-summary");
+  if (w) w.remove();
+}
+
+/**
+ * Fetch the feed (server-side), show the preview modal.
+ * Resolves with the sync response; rejects with a user-facing error.
+ * Nothing is written until the user confirms the preview.
+ */
+async function syncCalendarFeed() {
+  if (state.calSyncing) return { events: state.calPreview || [] };
+  if (!state.settings) await loadSettings();
+  if (!state.settings.calendar || !state.settings.calendar.configured) {
+    toast("Set your calendar feed URL in Settings first.", true);
+    location.hash = "#/settings";
+    throw new Error("Set your calendar feed URL in Settings first.");
+  }
+  state.calSyncing = true;
+  try {
+    const r = await api("/api/calendar/sync", { method: "POST" });
+    state.calPreview = r.events || [];
+    state.settings.calendar.lastSyncAt = r.fetched_at;
+    renderCalPreview();
+    return r;
+  } finally {
+    state.calSyncing = false;
+  }
+}
+
+function calModalShell(id, title, bodyHtml, footHtml) {
+  closeCalPreview(); closeCalSummary();
+  const wrap = document.createElement("div");
+  wrap.id = id;
+  wrap.className = "modal-wrap";
+  wrap.innerHTML = `<div class="modal cal-modal" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal-head">${icon("retry")}<span class="modal-title">${esc(title)}</span><button class="modal-x" id="${id}-x" aria-label="Close" title="Close">${icon("close")}</button></div>
+    <div class="cal-body">${bodyHtml}</div>
+    ${footHtml ? `<div class="ef-actions">${footHtml}</div>` : ""}
+  </div>`;
+  document.body.appendChild(wrap);
+  state._calModal = wrap; // last calendar modal, for tests
+  const close = () => { wrap.remove(); state.calPreview = null; };  const x = document.getElementById(id + "-x");
+  if (x) x.addEventListener("click", close);
+  wrap.addEventListener("click", (ev) => { if (ev.target === wrap) close(); });
+  document.addEventListener("keydown", function escCal(ev) {
+    if (ev.key === "Escape") { close(); document.removeEventListener("keydown", escCal); }
+  });
+  return wrap;
+}
+
+/** The sync preview: one checkbox row per event occurrence. */
+function renderCalPreview() {
+  const events = state.calPreview || [];
+  const rows = events.map((ev) => {
+    const pre = calRowPrechecked(ev);
+    const badges = [];
+    if (ev.cancelled) badges.push(`<span class="cal-badge bad">Cancelled</span>`);
+    if (ev.already_imported) badges.push(`<span class="cal-badge">Already imported</span>`);
+    if (!ev.cancelled && !ev.already_imported && !ev.import_conversation_id) badges.push(`<span class="cal-badge">No conversation</span>`);
+    const matches = (ev.matches || []).map((m) =>
+      `<span class="cal-match conf-${m.confidence}" title="${m.confidence === "email" ? "Email matches this contact" : m.confidence === "name" ? "Name matches this contact" : "Name mentioned in the event"}">${icon("people")}${esc(m.name)} · ${CAL_CONF_LABEL[m.confidence]}</span>`
+    ).join("");
+    const target = ev.import_conversation_id && (ev.matches || []).length
+      ? `<span class="cal-target">${icon("calendar")}${esc(ev.matches[0].conversation_name || "Diary")}</span>` : "";
+    const recur = ev.recurring ? `<span class="cal-recur">${ev.recurring.index}/${ev.recurring.total}</span>` : "";
+    return `<label class="cal-row${ev.cancelled || ev.already_imported ? " dim" : ""}">
+      <input type="checkbox" class="cal-check" data-cal-key="${esc(ev.key)}" ${pre ? "checked" : ""} ${(ev.cancelled || ev.already_imported) ? "disabled" : ""} aria-label="Import ${esc(ev.summary)}">
+      <span class="cal-main">
+        <span class="cal-title">${esc(ev.summary)}${recur}</span>
+        <span class="cal-when">${esc(fmtCalWhen(ev))}</span>
+        <span class="cal-meta">${matches}${target}</span>
+      </span>
+      <span class="cal-badges">${badges.join("")}</span>
+    </label>`;
+  }).join("");
+  const wrap = calModalShell("cal-preview", "Sync calendar",
+    events.length
+      ? `<div class="cal-hint">Review before importing — nothing is written until you confirm.</div><div class="cal-rows">${rows}</div>`
+      : `<div class="empty"><h3>No upcoming events</h3><p>The feed parsed, but it holds no events to import.</p></div>`,
+    events.length ? `<span class="ef-hint" id="cal-count"></span><button class="ef-send" id="cal-import">Import selected</button>` : "");
+  state._calPreviewEl = wrap;
+  updateCalImportCount(wrap);
+  const go = document.getElementById("cal-import");
+  if (go) go.addEventListener("click", confirmCalImport);
+}
+
+/** Refresh the "Import selected (n)" button from the checked rows. */
+function updateCalImportCount(wrap) {
+  const n = wrap.querySelectorAll(".cal-check:checked").length;
+  const btn = document.getElementById("cal-import");
+  const hint = document.getElementById("cal-count");
+  if (btn) { btn.textContent = `Import selected (${n})`; btn.disabled = n === 0; }
+  if (hint) hint.textContent = n ? `${n} event${n === 1 ? "" : "s"} will be added to diaries` : "Select at least one event";
+}
+
+/** Confirm step: write the checked rows as diary entries. */
+async function confirmCalImport() {
+  const wrap = state._calPreviewEl || document.getElementById("cal-preview");
+  if (!wrap) return;
+  const keys = new Set([...wrap.querySelectorAll(".cal-check:checked")].map((c) => c.getAttribute("data-cal-key")));
+  const items = (state.calPreview || []).filter((ev) => keys.has(ev.key)).map((ev) => ({
+    key: ev.key, uid: ev.uid, summary: ev.summary, start: ev.start, end: ev.end,
+    location: ev.location, description: ev.description, organizer: ev.organizer,
+    conversation_id: ev.import_conversation_id, cancelled: ev.cancelled,
+  }));
+  if (!items.length) { toast("Select at least one event.", true); return; }
+  try {
+    const r = await api("/api/calendar/import", { method: "POST", body: JSON.stringify({ items }) });
+    closeCalPreview();
+    state.calPreview = null;
+    renderCalSummary(r, items);
+    await refreshDiary();
+    if (state.panel === "diary") renderSidePanel();
+  } catch (e) {
+    toast(e && e.message ? e.message : "Couldn't import the events.", true);
+  }
+}
+
+const CAL_STATUS_LABEL = {
+  imported: "Imported", already_imported: "Already imported",
+  no_conversation: "No conversation", cancelled: "Cancelled", invalid: "Invalid",
+};
+
+/** The import summary: N imported, M skipped, per-event status. */
+function renderCalSummary(r, items) {
+  const byKey = {};
+  (items || []).forEach((it) => { byKey[it.key] = it; });
+  const lines = (r.results || []).map((res) => {
+    const it = byKey[res.key] || {};
+    const cls = res.status === "imported" ? "ok" : "skip";
+    return `<div class="cal-sum-row"><span class="cal-sum-title">${esc(it.summary || res.key)}</span>
+      <span class="cal-sum-status ${cls}">${CAL_STATUS_LABEL[res.status] || res.status}</span>
+      ${res.status !== "imported" && res.reason ? `<span class="cal-sum-reason">${esc(res.reason)}</span>` : ""}
+      ${res.status === "imported" && res.conversation_name ? `<span class="cal-sum-reason">→ ${esc(res.conversation_name)}</span>` : ""}
+    </div>`;
+  }).join("");
+  calModalShell("cal-summary", "Calendar import",
+    `<div class="cal-hint"><b>${r.imported}</b> imported · <b>${r.skipped}</b> skipped</div><div class="cal-rows">${lines}</div>`,
+    "");
+  toast(`Calendar import — ${r.imported} imported, ${r.skipped} skipped.`);
 }
 
 /** Attachment chips inside a message bubble. Images are preview chips (no inline
@@ -1633,7 +1812,7 @@ function diaryPanelHtml() {
   }
   return `
     <aside class="files-panel diary-panel" id="files-panel" aria-label="Appointment diary">
-      <div class="fp-head">${icon("calendar")}<span class="fp-title">Diary</span>${week.length ? `<span class="fp-count">${week.length}</span>` : ""}<button class="fp-close" id="fp-close" aria-label="Close diary">${icon("close")}</button></div>
+      <div class="fp-head">${icon("calendar")}<span class="fp-title">Diary</span>${week.length ? `<span class="fp-count">${week.length}</span>` : ""}<button class="fp-sync" id="dp-sync" aria-label="Sync calendar feed" title="Sync calendar feed">${icon("retry")}</button><button class="fp-close" id="fp-close" aria-label="Close diary">${icon("close")}</button></div>
       <div class="dp-weeknav">
         <button class="dp-nav" id="dp-prev" aria-label="Previous week">${icon("chevL")}</button>
         <button class="dp-today" id="dp-today">Today</button>
@@ -1658,6 +1837,10 @@ function wireDiaryPanel() {
   if (prev) prev.addEventListener("click", () => { state.diaryOffset--; renderSidePanel(); });
   if (next) next.addEventListener("click", () => { state.diaryOffset++; renderSidePanel(); });
   if (today) today.addEventListener("click", () => { state.diaryOffset = 0; renderSidePanel(); });
+  const sync = $("#dp-sync");
+  if (sync) sync.addEventListener("click", () => {
+    syncCalendarFeed().catch((e) => toast(e && e.message ? e.message : "Couldn't sync the calendar.", true));
+  });
 }
 
 /** Swap the side panel's content in place (week navigation, search). */
@@ -3229,6 +3412,13 @@ function renderSettings() {
           </div>
         </div>
 
+        <div class="group-caption">Calendar feed <span style="font-weight:400">(iCal)</span></div>
+        <div class="group-card card" style="padding:14px 16px">
+          ${secretField(0, s.calendar && s.calendar.configured, "c-url", "Secret iCal address", "Google Calendar &rarr; Settings &rarr; Integrate calendar &rarr; <b>Secret address in iCal format</b>. Stored on this server only &mdash; never shared.")}
+          ${s.calendar && s.calendar.configured ? `<div class="hint">${s.calendar.lastSyncAt ? "Last synced " + esc(fmtCalSyncAt(s.calendar.lastSyncAt)) + "." : "Saved. Not synced yet."}</div>` : `<div class="hint">Paste the secret address to pull events from your calendar.</div>`}
+          <div class="test-row" style="margin-top:8px"><button class="btn secondary small" id="c-sync">Sync now</button><span class="test-result" id="c-sync-result"></span></div>
+        </div>
+
         <div style="padding:8px 32px 40px"><button class="btn" id="save-all" style="width:100%">Save settings</button></div>
       </div>
       ${tabBar("settings")}
@@ -3246,6 +3436,19 @@ function renderSettings() {
   test("#t-smtp", "#r-smtp", "smtp");
   test("#t-imap", "#r-imap", "imap");
   test("#t-matrix", "#r-matrix", "matrix");
+
+  const csync = $("#c-sync");
+  if (csync) csync.addEventListener("click", async () => {
+    const el = $("#c-sync-result");
+    el.className = "test-result"; el.textContent = "Syncing\u2026";
+    try {
+      await saveAll(true);
+      await loadSettings();
+      const r = await syncCalendarFeed();
+      el.className = "test-result ok";
+      el.innerHTML = icon("check") + " " + esc(`${r.events.length} event${r.events.length === 1 ? "" : "s"} found`);
+    } catch (e) { el.className = "test-result err"; el.innerHTML = icon("close") + " " + esc(e.message); }
+  });
 
   api("/api/google/redirect-uri").then((r) => { const el = $("#g-uri"); if (el) el.textContent = r.redirect_uri; }).catch(() => {});
 
@@ -3298,6 +3501,9 @@ function renderSettings() {
     }})});
     await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "google", values: {
       clientId: $("#g-id").value.trim(), clientSecret: secret("#g-secret", s.google.hasClientSecret),
+    }})});
+    await api("/api/settings", { method: "POST", body: JSON.stringify({ section: "calendar", values: {
+      feedUrl: secret("#c-url", s.calendar && s.calendar.configured),
     }})});
     if (!quiet) { toast("Settings saved."); await loadSettings(); renderSettings(); }
   }

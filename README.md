@@ -37,6 +37,16 @@ The 📅 calendar button in the Email composer opens an inline invitation form �
 - Sent-folder scanning ingests invitations your mail app sent too. New APIs: `GET /api/conversations/:id/appointments` and `POST /api/conversations/:id/appointments/:appointmentId/status` (`accepted` | `declined` | `cancelled`).
 - Like Shared files, the Diary docks as a permanent right-hand panel at ≥1100px and becomes a slide-over drawer on smaller screens — one panel area, switched by the header buttons.
 
+## Calendar feed sync (secret iCal address)
+
+**Settings → Calendar feed (iCal)** takes your calendar's secret iCal address (e.g. Google Calendar's *Secret address in iCal format*). The URL is stored server-side as a secret — it's never logged and `GET /api/settings` only reports `configured` + `lastSyncAt`, never the URL itself.
+
+- **Sync now** (also the ⟳ icon in the Diary panel header) fetches the feed server-side (15s timeout, 5MB cap, same-scheme redirects only) and opens a **preview modal**: every event row shows local date/time, location, a recurrence badge (`2/5`), an already-imported or cancelled badge, and the matched contacts with confidence chips — **email**, **name**, or **mentioned**.
+- Matching is exact: attendee/organizer email, attendee CN, or the contact's name appearing in the summary/description/location. Recurrences (`RRULE` DAILY/WEEKLY, COUNT/UNTIL/BYDAY) expand into one row per occurrence, capped at 200.
+- Rows with a confident email/name match and an existing 1:1 conversation come pre-checked; cancelled, already-imported, and conversation-less rows are disabled. **Nothing is written until you confirm.**
+- Confirm imports the checked rows into each contact's existing conversation diary as `planned` entries (dedupe key: ICS UID + occurrence start — re-syncs show **Already imported** instead of duplicating; no conversations are ever created). The result summary lists imported/skipped counts and a per-event status.
+- Manual sync only — no background polling. New APIs: `POST /api/calendar/sync` (preview) and `POST /api/calendar/import` (`{ items }` → `{ imported, skipped, results }`).
+
 ## Commitments + decisions tracker
 
 The ✓ toggle in the conversation header opens the **Commitments panel** (Open / Suggestions / Decisions tabs):

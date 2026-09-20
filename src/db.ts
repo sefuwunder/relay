@@ -299,9 +299,15 @@ export function conversationMembers(convId: string): Contact[] {
   ).all(convId) as Contact[];
 }
 
+/** Find the 1:1 conversation for a contact, without creating one. null when none exists. */
+export function findDmConversation(contactId: string): Conversation | null {
+  return (db.query(
+    "SELECT c.* FROM conversations c JOIN members m ON m.conversation_id = c.id WHERE c.is_group = 0 AND m.contact_id = ? LIMIT 1"
+  ).get(contactId) as Conversation) || null;
+}
+
 /** Find (or create) the 1:1 conversation for a contact. */
-export function dmFor(contactId: string): Conversation {
-  const existing = db.query(
+export function dmFor(contactId: string): Conversation {  const existing = db.query(
     "SELECT c.* FROM conversations c JOIN members m ON m.conversation_id = c.id WHERE c.is_group = 0 AND m.contact_id = ? LIMIT 1"
   ).get(contactId) as Conversation | null;
   if (existing) return existing;

@@ -12,6 +12,14 @@ export interface CalEvent {
   /** Organizer email (mailto: stripped), "" when the event names none. */
   organizer: string;
   method: string;
+  /** Attendees: mailto: stripped email + CN display name. */
+  attendees: { email: string; cn: string }[];
+  /** STATUS value (e.g. CONFIRMED, CANCELLED), uppercased, "" when absent. */
+  status: string;
+  /** Raw RRULE value, "" when the event does not repeat. */
+  rrule: string;
+  /** True when DTSTART was a bare date (all-day event). */
+  allDay: boolean;
 }
 
 export function newEventUid(): string {
@@ -174,6 +182,10 @@ export function parseIcs(text: string): CalEvent[] {
             description: cur.description || "",
             method: method || "REQUEST",
             organizer: cur.organizer || "",
+            attendees: cur.attendees ? JSON.parse(cur.attendees) : [],
+            status: (cur.status || "").toUpperCase(),
+            rrule: cur.rrule || "",
+            allDay: /^\d{8}$/.test(cur.dtstartRaw || ""),
           });
         }
         cur = null;
@@ -187,10 +199,104 @@ export function parseIcs(text: string): CalEvent[] {
         else if (prop === "LOCATION") cur.location = unescText(value);
         else if (prop === "DESCRIPTION") cur.description = unescText(value);
         else if (prop === "ORGANIZER") cur.organizer = value.trim().replace(/^mailto:/i, "");
+        else if (prop === "STATUS") cur.status = value.trim();
+        else if (prop === "RRULE") cur.rrule = value.trim();
+        else if (prop === "ATTENDEE") {
+          const email = value.trim().replace(/^mailto:/i, "");
+          const cnM = /CN=("[^"]*"|[^;:]*)/i.exec(params);
+          let cn = cnM ? cnM[1] : "";
+          if (cn.startsWith('"') && cn.endsWith('"') && cn.length >= 2) cn = cn.slice(1, -1);
+          const list = cur.attendees ? JSON.parse(cur.attendees) : [];
+          list.push({ email, cn: unescText(cn) });
+          cur.attendees = JSON.stringify(list);
+        }
       }
     }
   } catch {
     /* best effort — a broken invite never breaks the poll */
   }
   return out;
+}
+
+/** One expanded instance of a (possibly recurring) event. ISO UTC. */
+export interface IcsOccurrence {
+  start: string;
+  end: string;
+}
+
+/** Maximum occurrences expanded from one RRULE — a sanity cap. */
+export const MAX_RRULE_OCCURRENCES = 200;
+
+const WEEKDAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+
+/**
+ * Expand a basic RRULE (FREQ=DAILY or FREQ=WEEKLY, with optional
+ * INTERVAL/COUNT/UNTIL/BYDAY) into concrete occurrences.
+ * Unknown or unsupported rules yield just the base occurrence.
+ * Never throws; always capped at MAX_RRULE_OCCURRENCES.
+ */
+export function expandRecurrence(dtstart: string, dtend: string, rrule: string): IcsOccurrence[] {
+  const base = { start: dtstart, end: dtend };
+  const startMs = new Date(dtstart).getTime();
+  const endMs = new Date(dtend).getTime();
+  if (!rrule || isNaN(startMs) || isNaN(endMs) || endMs <= startMs) return [base];
+  const parts: Record<string, string> = {};
+  for (const kv of rrule.split(";")) {
+    const i = kv.indexOf("=");
+    if (i > 0) parts[kv.slice(0, i).trim().toUpperCase()] = kv.slice(i + 1).trim().toUpperCase();
+  }
+  const freq = parts.FREQ;
+  if (freq !== "DAILY" && freq !== "WEEKLY") return [base];
+  const interval = Math.max(1, parseInt(parts.INTERVAL || "1", 10) || 1);
+  const count = parts.COUNT ? Math.max(0, parseInt(parts.COUNT, 10) || 0) : 0;
+  let untilMs = 0;
+  if (parts.UNTIL) {
+    if (/^\d{8}$/.test(parts.UNTIL)) {
+      // Date-only UNTIL is inclusive through the end of that day.
+      untilMs = Date.UTC(+parts.UNTIL.slice(0, 4), +parts.UNTIL.slice(4, 6) - 1, +parts.UNTIL.slice(6, 8)) + 86400000 - 1;
+    } else {
+      const u = parseIcsDate("", parts.UNTIL);
+      untilMs = u ? new Date(u).getTime() : 0;
+    }
+  }
+  const durationMs = endMs - startMs;
+  const out: IcsOccurrence[] = [];
+  const push = (ms: number) => {
+    if (out.length >= MAX_RRULE_OCCURRENCES) return;
+    out.push({ start: new Date(ms).toISOString(), end: new Date(ms + durationMs).toISOString() });
+  };
+
+  if (freq === "DAILY") {
+    let ms = startMs, i = 0;
+    const step = interval * 86400000;
+    while (out.length < MAX_RRULE_OCCURRENCES) {
+      if (count && i >= count) break;
+      if (untilMs && ms > untilMs) break;
+      push(ms);
+      i++;
+      ms += step;
+      if (!count && !untilMs) break; // unbounded without a bound would loop forever
+    }
+    return out.length ? out : [base];
+  }
+
+  // WEEKLY: walk day by day; a day qualifies when its week block matches the
+  // interval and its weekday is listed (default: the start's weekday).
+  const startDay = new Date(startMs);
+  const byday = (parts.BYDAY || WEEKDAYS[startDay.getUTCDay()]).split(",").map((d) => d.trim()).filter(Boolean);
+  const dayMs = 86400000;
+  const maxWalk = MAX_RRULE_OCCURRENCES * interval * 7 + 7;
+  let added = 0;
+  for (let d = 0; d < maxWalk && out.length < MAX_RRULE_OCCURRENCES; d++) {
+    const ms = startMs + d * dayMs;
+    if (untilMs && ms > untilMs) break;
+    if (count && added >= count) break;
+    const wk = Math.floor(d / 7);
+    if (wk % interval !== 0) continue;
+    if (!byday.includes(WEEKDAYS[new Date(ms).getUTCDay()])) continue;
+    push(ms);
+    added++;
+    if (!count && !untilMs) break; // unbounded — one occurrence, like DAILY
+  }
+  return out.length ? out : [base];
 }
