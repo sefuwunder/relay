@@ -1049,8 +1049,9 @@ async function pollConversations() {
   checkNotifications(prev);
   updateTitle();
   checkCommitNudges().catch(() => {});
-  // Keep the global-row badge fresh; a single small query.
-  refreshGlobalCommits().catch(() => {});
+  // Keep the global-row badge fresh; a single small query, awaited so the
+  // first render already shows the current count.
+  await refreshGlobalCommits().catch(() => {});
 }
 
 /**
@@ -1725,6 +1726,8 @@ async function refreshCommitData() {
     state.commitments = c.commitments || [];
     state.commitSuggestions = s.suggestions || [];
     state.decisions = d.decisions || [];
+    // Any commit mutation can change the global-row badge; refresh it too.
+    await refreshGlobalCommits().catch(() => {});
   } catch { state.commitments = []; state.commitSuggestions = []; state.decisions = []; }
 }
 

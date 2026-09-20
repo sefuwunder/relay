@@ -83,7 +83,8 @@ load("dates.js", "\n;globalThis.RelayDates = RelayDates;");
 load("app.js", `\n;globalThis.__APP__ = { state, renderConversationDetail, renderConversations,
   commitPanelHtml, groupCommitments, clientDay, openCommitMenu, closeCommitMenu,
   openCommitEditor, saveCommitEditor, keepSuggestion, dropSuggestion, setCommitStatus,
-  renderGlobalCommits, checkCommitNudges, refreshCommitData, openCommitCount };`);
+  renderGlobalCommits, checkCommitNudges, refreshCommitData, refreshGlobalCommits,
+  globalCommitRowHtml, openCommitCount };`);
 const A = globalThis.__APP__;
 const { state } = A;
 
@@ -372,6 +373,24 @@ freezeAt(12);
   ok("no nudge when notifications off", notifs.length === 0);
 }
 unfreeze();
+
+// ---------- global badge + cache invalidation ----------
+resetState();
+{
+  allCommits = [{ id: "k1", text: "One", status: "open" }, { id: "k2", text: "Two", status: "open" }];
+  await A.refreshGlobalCommits();
+  ok("refreshGlobalCommits caches the list", state.globalCommits.length === 2);
+  const row = A.globalCommitRowHtml();
+  ok("global row shows the open count", />2</.test(row) || row.includes(">2<"));
+}
+resetState();
+{
+  // CRUD funnels through refreshCommitData, which must also refresh the
+  // global cache so the row badge never goes stale.
+  allCommits = [{ id: "k9", text: "Fresh", status: "open" }];
+  await A.refreshCommitData();
+  ok("refreshCommitData invalidates the global cache", state.globalCommits.length === 1 && state.globalCommits[0].id === "k9");
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
