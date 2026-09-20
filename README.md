@@ -37,6 +37,17 @@ The 📅 calendar button in the Email composer opens an inline invitation form �
 - Sent-folder scanning ingests invitations your mail app sent too. New APIs: `GET /api/conversations/:id/appointments` and `POST /api/conversations/:id/appointments/:appointmentId/status` (`accepted` | `declined` | `cancelled`).
 - Like Shared files, the Diary docks as a permanent right-hand panel at ≥1100px and becomes a slide-over drawer on smaller screens — one panel area, switched by the header buttons.
 
+## Commitments + decisions tracker
+
+The ✓ toggle in the conversation header opens the **Commitments panel** (Open / Suggestions / Decisions tabs):
+
+- Relay watches inbound messages with conservative, deterministic heuristics ("I'll …", "we decided …", "I promise …") and date/time extraction. Anything it thinks is a commitment or decision becomes a **suggestion** — a private guess that saves nothing until you tap **Keep** or **Dismiss**.
+- Keep teaches the **adaptive phrasing loop**: your wording is templated (dates → `{WHEN}`, numbers → `{NUM}`, names → `{X}` — raw text is never stored), and after **3 confirms** that phrasing suggests on its own; **3 dismissals** retires it, **6 confirms** revives it. Conversation patterns win over global ones; every suggestion's reason names the pattern and its count ("learned from your phrasing", "3 times").
+- Open commitments group into **Overdue / Today / This week / Later / No date** with muted terracotta urgency; each row does Done, diary, edit, and delete. Mark any message via right-click (or long-press / Shift+F10) → **Mark as commitment** / **Log as decision**.
+- A **global Commitments** row above the conversation list shows everything across conversations, with search.
+- **Nudges** (on by default, `relay_commit_nudges`): due-today and overdue items surface one desktop notification per day, quiet hours 22:00–07:00, digest when several are due.
+- New APIs: `GET/POST /api/conversations/:id/commitments`, `PATCH/DELETE /api/commitments/:id`, `GET /api/conversations/:id/suggestions`, `POST /api/suggestions/:id/confirm|dismiss`, `GET/POST /api/conversations/:id/decisions`, `PATCH/DELETE /api/decisions/:id`, `GET /api/commitments/all`, `GET /api/decisions/all` (searchable), `GET /api/commitments/due`, `POST /api/commitments/:id/nudge`, and JSON/CSV export. Everything is local SQLite — no network, no models, no new dependencies.
+
 ## Wide-screen reflow
 
 Stretch the window and the UI opens up: at ≥1100px the conversation view gains the persistent Shared files panel while the thread uses the rest; at ≥1400px the People grid goes six-wide. Everything stays glass, and animations still respect `prefers-reduced-motion`.

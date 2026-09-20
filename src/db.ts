@@ -137,6 +137,56 @@ export function openDb(path: string): Database {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS commitments (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      message_id TEXT NOT NULL DEFAULT '',
+      text TEXT NOT NULL,
+      owner TEXT NOT NULL DEFAULT 'me',
+      due_date TEXT NOT NULL DEFAULT '',
+      due_time TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'open',
+      source TEXT NOT NULL DEFAULT 'manual',
+      last_nudged_at TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_commit_conv ON commitments(conversation_id, status, due_date);
+    CREATE INDEX IF NOT EXISTS idx_commit_due ON commitments(status, due_date);
+    CREATE INDEX IF NOT EXISTS idx_commit_msg ON commitments(message_id);
+    CREATE TABLE IF NOT EXISTS decisions (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      message_id TEXT NOT NULL DEFAULT '',
+      text TEXT NOT NULL,
+      participants TEXT NOT NULL DEFAULT '[]',
+      decided_at TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'manual',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_decision_conv ON decisions(conversation_id, decided_at);
+    CREATE TABLE IF NOT EXISTS suggestions (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      class TEXT NOT NULL,
+      reason TEXT NOT NULL DEFAULT '',
+      due_date TEXT NOT NULL DEFAULT '',
+      due_time TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sugg_conv ON suggestions(conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_sugg_msg ON suggestions(message_id);
+    CREATE TABLE IF NOT EXISTS language_patterns (
+      pattern TEXT NOT NULL,
+      class TEXT NOT NULL,
+      scope TEXT NOT NULL DEFAULT '',
+      confirms INTEGER NOT NULL DEFAULT 0,
+      dismissals INTEGER NOT NULL DEFAULT 0,
+      retired TEXT NOT NULL DEFAULT '',
+      first_seen TEXT NOT NULL,
+      last_seen TEXT NOT NULL,
+      PRIMARY KEY (pattern, class, scope)
+    );
   `);
   // Migration: archived flag on contacts (older DBs lack the column).
   const cols = db.query("PRAGMA table_info(contacts)").all() as { name: string }[];
@@ -465,6 +515,12 @@ export function deleteConversationData(convId: string): string[] {
   db.query("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)").run(convId);
   db.query("DELETE FROM messages WHERE conversation_id = ?").run(convId);
   db.query("DELETE FROM members WHERE conversation_id = ?").run(convId);
+  // Commitments tracker: drop the conversation's commitments, decisions,
+  // suggestions, and learned language patterns (scoped rows only).
+  db.query("DELETE FROM commitments WHERE conversation_id = ?").run(convId);
+  db.query("DELETE FROM decisions WHERE conversation_id = ?").run(convId);
+  db.query("DELETE FROM suggestions WHERE conversation_id = ?").run(convId);
+  db.query("DELETE FROM language_patterns WHERE scope = ?").run(convId);
   db.query("DELETE FROM conversations WHERE id = ?").run(convId);
   return ids;
 }

@@ -20,6 +20,15 @@ import {
   type GoogleSettings,
 } from "./google";
 import { createHash } from "node:crypto";
+import {
+  createCommitment, listCommitments, patchCommitment, deleteCommitment,
+  listDueCommitments, recordNudge, listAllCommitments,
+  createDecision, listDecisions, patchDecision, deleteDecision, listAllDecisions,
+  listSuggestions, confirmSuggestion, dismissSuggestion,
+  sweepExpiredSuggestions, trackMessage, teachFromManual,
+  exportJson, exportCsv,
+  type Commitment, type Decision,
+} from "./commitments";
 
 const PORT = Number(process.env.PORT || 3006);
 const DATA_DIR = "./data";
@@ -577,9 +586,20 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
 
 // On a retry, flip the original failed row to sent instead of inserting a duplicate.
 function recordSent(retryOfId: string | undefined, rec: Omit<Message, "id" | "created_at"> & { created_at?: string }): Message {
-  if (!retryOfId) return insertMessage(rec);
+  if (!retryOfId) return insertTracked(rec);
   getDb().query("UPDATE messages SET channel = ?, direction = 'out', body = ?, subject = ?, external_id = ?, message_id = ?, status = 'sent' WHERE id = ?").run(rec.channel, rec.body, rec.subject, rec.external_id, rec.message_id || "", retryOfId);
-  return getDb().query("SELECT * FROM messages WHERE id = ?").get(retryOfId) as Message;
+  const msg = getDb().query("SELECT * FROM messages WHERE id = ?").get(retryOfId) as Message;
+  try { trackMessage(msg); } catch (e) { console.error("suggestion analysis failed:", e instanceof Error ? e.message : e); }
+  return msg;
+}
+
+/** Insert a message and run the commitments/decision suggestion analysis over
+    it. Analysis never throws into the caller — a bad heuristic must never
+    break message delivery. */
+function insertTracked(m: Parameters<typeof insertMessage>[0]): Message {
+  const msg = insertMessage(m);
+  try { trackMessage(msg); } catch (e) { console.error("suggestion analysis failed:", e instanceof Error ? e.message : e); }
+  return msg;
 }
 
 // ---------- polling ----------
@@ -631,7 +651,7 @@ async function pollMail() {
         if (!ids.length) continue; // nobody we track
         conv = conversationForContacts(ids);
       }
-      const msg = insertMessage({
+      const msg = insertTracked({
         conversation_id: conv.id, channel, direction: "in", body, subject,
         external_id: extId, message_id: m.messageId || "", status: "",
       });
@@ -662,6 +682,8 @@ async function pollMail() {
     } catch (e) {
       console.error("sent-mail poll failed:", e instanceof Error ? e.message : e);
     }
+    // Suggestions expire after 7 days; sweep on the same cadence as dedupe.
+    try { sweepExpiredSuggestions(); } catch (e) { console.error("suggestion sweep failed:", e instanceof Error ? e.message : e); }
   } catch (e) {
     lastPoll.mailError = errMsg(e);
   }
@@ -882,7 +904,7 @@ async function importSentItem(
     if (item.messageId) getDb().query("UPDATE messages SET message_id = ? WHERE id = ?").run(item.messageId, dup.id);
     return;
   }
-  const msg = insertMessage({
+  const msg = insertTracked({
     conversation_id: conv.id, channel: "email", direction: "out",
     body: item.body || "(no text)", subject: item.subject,
     external_id: extId, message_id: item.messageId || "",
@@ -942,7 +964,7 @@ async function pollMatrixOnce() {
         if (!m.eventId || hasExternalId(extId)) continue;
         const convId = roomToConv.get(m.roomId);
         if (!convId) continue; // room we don't track
-        insertMessage({
+        insertTracked({
           conversation_id: convId, channel: "matrix", direction: "in", body: m.body, subject: "",
           external_id: extId, status: "", created_at: new Date(m.ts).toISOString(),
         });
@@ -1378,7 +1400,7 @@ const server = (Bun as any).serve({
               // Record the failed attempt so nothing silently vanishes.
               let failedMsg = null;
               try {
-                failedMsg = insertMessage({ conversation_id: id, channel, direction: "out", body: String(b.body || ""), subject: String(b.subject || ""), external_id: "", status: "failed" });
+                failedMsg = insertTracked({ conversation_id: id, channel, direction: "out", body: String(b.body || ""), subject: String(b.subject || ""), external_id: "", status: "failed" });
                 if (sendFiles.length) await saveMessageAttachments(failedMsg.id, sendFiles);
                 recordInvite(failedMsg.id);
               } catch { /* noop */ }
@@ -1507,12 +1529,210 @@ const server = (Bun as any).serve({
             // didn't go out.
             return json({ appointment: updated, message: null, rsvp: false, rsvp_error: errMsg(e) });
           }
-          const msg = insertMessage({
+          const msg = insertTracked({
             conversation_id: id, channel: "email", direction: "out",
             body: text, subject: `${verb}: ${appt.title}`,
             external_id: "", message_id: mid, status: "sent",
           });
           return json({ appointment: updated, message: withAttachments([msg])[0], rsvp: true });
+        }
+      }
+      // ----- commitments tracker + decision log -----
+      // Suggestions for one conversation (inline chips + Suggestions tab).
+      {
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/suggestions$/);
+        if (m && method === "GET") {
+          const id = decodeURIComponent(m[1]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          return json({ suggestions: listSuggestions(id) });
+        }
+      }
+      {
+        const m = path.match(/^\/api\/suggestions\/([^/]+)\/(confirm|dismiss)$/);
+        if (m && method === "POST") {
+          const sid = decodeURIComponent(m[1]);
+          const action = m[2];
+          try {
+            if (action === "dismiss") {
+              dismissSuggestion(sid);
+              return json({ ok: true });
+            }
+            const b = await readBody(req);
+            const rec = confirmSuggestion(sid, {
+              text: typeof b.text === "string" ? b.text : undefined,
+              owner: typeof b.owner === "string" ? b.owner : undefined,
+              due_date: typeof b.due_date === "string" ? b.due_date : undefined,
+              due_time: typeof b.due_time === "string" ? b.due_time : undefined,
+              participants: Array.isArray(b.participants) ? b.participants.map(String) : undefined,
+              decided_at: typeof b.decided_at === "string" ? b.decided_at : undefined,
+            });
+            return json({ ok: true, record: rec }, 201);
+          } catch (e) {
+            return json({ error: errMsg(e) }, (e as Error).message.includes("not found") ? 404 : 400);
+          }
+        }
+      }
+      // What the client's nudge check should fire right now.
+      if (path === "/api/commitments/due" && method === "GET") {
+        return json({ commitments: listDueCommitments() });
+      }
+      if (path === "/api/commitments/all" && method === "GET") {
+        const q = (url.searchParams.get("q") || "").trim().slice(0, 80);
+        const includeArchived = url.searchParams.get("include_archived") === "1";
+        return json({ commitments: listAllCommitments(q, includeArchived) });
+      }
+      if (path === "/api/decisions/all" && method === "GET") {
+        const q = (url.searchParams.get("q") || "").trim().slice(0, 80);
+        const includeArchived = url.searchParams.get("include_archived") === "1";
+        return json({ decisions: listAllDecisions(q, includeArchived) });
+      }
+      if (path === "/api/commitments/export" && method === "GET") {
+        const format = url.searchParams.get("format") || "json";
+        if (format === "csv") {
+          return new Response(exportCsv("commitments"), {
+            headers: {
+              "Content-Type": "text/csv",
+              "Content-Disposition": 'attachment; filename="relay-commitments.csv"',
+            },
+          });
+        }
+        return new Response(JSON.stringify(exportJson(), null, 2), {
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Disposition": 'attachment; filename="relay-commitments.json"',
+          },
+        });
+      }
+      if (path === "/api/decisions/export" && method === "GET") {
+        const format = url.searchParams.get("format") || "json";
+        if (format === "csv") {
+          return new Response(exportCsv("decisions"), {
+            headers: {
+              "Content-Type": "text/csv",
+              "Content-Disposition": 'attachment; filename="relay-decisions.csv"',
+            },
+          });
+        }
+        return new Response(JSON.stringify({ exported_at: new Date().toISOString(), decisions: exportJson().decisions }, null, 2), {
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Disposition": 'attachment; filename="relay-decisions.json"',
+          },
+        });
+      }
+      {
+        const m = path.match(/^\/api\/commitments\/([^/]+)\/nudge$/);
+        if (m && method === "POST") {
+          const rec = recordNudge(decodeURIComponent(m[1]));
+          if (!rec) return json({ error: "not found" }, 404);
+          return json({ commitment: rec });
+        }
+      }
+      {
+        const m = path.match(/^\/api\/commitments\/([^/]+)$/);
+        if (m) {
+          const id = decodeURIComponent(m[1]);
+          if (method === "PATCH") {
+            try {
+              const b = await readBody(req);
+              const patch: any = {};
+              for (const k of ["text", "owner", "due_date", "due_time", "status"]) {
+                if (k in b) patch[k] = typeof b[k] === "string" ? b[k] : "";
+              }
+              const rec = patchCommitment(id, patch);
+              if (!rec) return json({ error: "not found" }, 404);
+              return json({ commitment: rec });
+            } catch (e) {
+              return json({ error: errMsg(e) }, 400);
+            }
+          }
+          if (method === "DELETE") {
+            if (!deleteCommitment(id)) return json({ error: "not found" }, 404);
+            return json({ ok: true });
+          }
+        }
+      }
+      {
+        const m = path.match(/^\/api\/decisions\/([^/]+)$/);
+        if (m) {
+          const id = decodeURIComponent(m[1]);
+          if (method === "PATCH") {
+            try {
+              const b = await readBody(req);
+              const patch: any = {};
+              if ("text" in b) patch.text = String(b.text ?? "");
+              if ("participants" in b && Array.isArray(b.participants)) patch.participants = b.participants.map(String);
+              if ("decided_at" in b) patch.decided_at = String(b.decided_at ?? "");
+              const rec = patchDecision(id, patch);
+              if (!rec) return json({ error: "not found" }, 404);
+              return json({ decision: rec });
+            } catch (e) {
+              return json({ error: errMsg(e) }, 400);
+            }
+          }
+          if (method === "DELETE") {
+            if (!deleteDecision(id)) return json({ error: "not found" }, 404);
+            return json({ ok: true });
+          }
+        }
+      }
+      {
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/commitments$/);
+        if (m) {
+          const id = decodeURIComponent(m[1]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          if (method === "GET") {
+            const q = (url.searchParams.get("q") || "").trim().slice(0, 80);
+            const status = url.searchParams.get("status") || "";
+            return json({ commitments: listCommitments(id, q, status) });
+          }
+          if (method === "POST") {
+            try {
+              const b = await readBody(req);
+              const rec = createCommitment({
+                conversation_id: id,
+                message_id: typeof b.message_id === "string" ? b.message_id : "",
+                text: String(b.text || ""),
+                owner: typeof b.owner === "string" ? b.owner : "me",
+                due_date: typeof b.due_date === "string" ? b.due_date : "",
+                due_time: typeof b.due_time === "string" ? b.due_time : "",
+                source: "manual",
+              });
+              // Manual marking teaches the loop: the user's phrasing is the signal.
+              try { teachFromManual({ text: rec.text, class: "commitment", conversationId: id }); } catch { /* learning is best-effort */ }
+              return json({ commitment: rec }, 201);
+            } catch (e) {
+              return json({ error: errMsg(e) }, 400);
+            }
+          }
+        }
+      }
+      {
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/decisions$/);
+        if (m) {
+          const id = decodeURIComponent(m[1]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          if (method === "GET") {
+            const q = (url.searchParams.get("q") || "").trim().slice(0, 80);
+            return json({ decisions: listDecisions(id, q) });
+          }
+          if (method === "POST") {
+            try {
+              const b = await readBody(req);
+              const rec = createDecision({
+                conversation_id: id,
+                message_id: typeof b.message_id === "string" ? b.message_id : "",
+                text: String(b.text || ""),
+                participants: Array.isArray(b.participants) ? b.participants.map(String) : undefined,
+                decided_at: typeof b.decided_at === "string" ? b.decided_at : undefined,
+                source: "manual",
+              });
+              try { teachFromManual({ text: rec.text, class: "decision", conversationId: id }); } catch { /* learning is best-effort */ }
+              return json({ decision: rec }, 201);
+            } catch (e) {
+              return json({ error: errMsg(e) }, 400);
+            }
+          }
         }
       }
       {
@@ -1541,7 +1761,7 @@ const server = (Bun as any).serve({
             // Reuse the poller's external-id for inbox mail so a later poll dedupes.
             const extId = found.mailbox === "inbox" ? `mail:${found.uid}` : `sentmail:${found.uid}`;
             if (hasExternalId(extId)) return json({ seeded: false, reason: "already-present" });
-            insertMessage({
+            insertTracked({
               conversation_id: id, channel: "email", direction: found.direction,
               body: found.body, subject: found.subject, external_id: extId,
               message_id: found.messageId || "", status: "",
@@ -1625,4 +1845,6 @@ const server = (Bun as any).serve({
 });
 
 startPollers();
+// Suggestions older than 7 days never come back after a restart.
+try { sweepExpiredSuggestions(); } catch (e) { console.error("suggestion sweep failed:", e instanceof Error ? e.message : e); }
 console.log(`relay listening on http://localhost:${server.port}`);

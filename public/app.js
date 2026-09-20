@@ -32,7 +32,19 @@ const state = {
   timer: null,
   files: [],           // recently shared files in the open conversation
   pendingFiles: [],    // File objects staged in the composer
-  panel: null,         // side panel: "files" | "diary" | null
+  panel: null,         // side panel: "files" | "diary" | "commit" | null
+  commitTab: "open",   // commit panel tab: "open" | "suggestions" | "decisions"
+  commitments: [],     // open commitments in the open conversation (cached)
+  commitSuggestions: [], // pending suggestions in the open conversation (cached)
+  decisions: [],       // decisions in the open conversation (cached)
+  globalCommits: [],   // open commitments across conversations (cached for the global row)
+  globalCommitView: false, // the global commitments view is showing
+  globalCommitTab: "open", // global view tab: "open" | "decisions"
+  globalCommitSearch: "",
+  commitNudges: (() => { try { return localStorage.getItem("relay_commit_nudges") !== "0"; } catch { return true; } })(),
+  _nudgeSeen: {},      // "commitId@YYYY-MM-DD" already notified this session
+  _commitMenu: null,   // open message context menu element
+  _commitEditor: null,  // open commitment/decision editor element
   diary: [],           // appointments in the open conversation
   diaryOffset: 0,      // week offset from the current week in the diary
   eventForm: false,    // inline calendar-invitation form open in the composer
@@ -1036,6 +1048,57 @@ async function pollConversations() {
   try { await loadConversations(); } catch { return; }
   checkNotifications(prev);
   updateTitle();
+  checkCommitNudges().catch(() => {});
+  // Keep the global-row badge fresh; a single small query.
+  refreshGlobalCommits().catch(() => {});
+}
+
+/**
+ * Local commitment nudges, piggy-backed on the 15s poll.
+ * Open commitments due today or overdue raise a desktop notification once
+ * per local day each. Quiet hours 22:00–07:00 suppress them; the first poll
+ * after 07:00 coalesces everything deferred into a single digest.
+ */
+async function checkCommitNudges() {
+  if (!state.commitNudges) return;
+  if (!state.notify || notifyPerm() !== "granted") return;
+  const hour = new Date().getHours();
+  if (hour >= 22 || hour < 7) return; // quiet hours — digest comes after 07:00
+  let due = [];
+  try { due = (await api("/api/commitments/due")).commitments || []; } catch { return; }
+  if (!due.length) return;
+  // Stay silent while the user is looking at commitments.
+  if (state.panel === "commit" || (location.hash || "").startsWith("#/commitments")) return;
+  const today = clientDay(0);
+  const fresh = due.filter((c) => !state._nudgeSeen[c.id + "@" + today]);
+  if (!fresh.length) return;
+  for (const c of fresh) state._nudgeSeen[c.id + "@" + today] = 1;
+  if (fresh.length === 1) {
+    const c = fresh[0];
+    const overdue = c.due_date && c.due_date < today;
+    fireCommitNudge("Commitment " + (overdue ? "overdue" : "due today"), c.text, c.conversation_id, "relay-commit-" + c.id);
+  } else {
+    const names = fresh.slice(0, 3).map((c) => c.text.slice(0, 60)).join("; ");
+    fireCommitNudge("Commitments need attention (" + fresh.length + ")",
+      names + (fresh.length > 3 ? " …" : ""), null, "relay-commit-digest-" + today);
+  }
+  for (const c of fresh) {
+    try { await api("/api/commitments/" + encodeURIComponent(c.id) + "/nudge", { method: "POST" }); } catch { /* noop */ }
+  }
+  if (state.globalCommitView) { state._globalAll = null; renderGlobalCommits(); }
+}
+
+function fireCommitNudge(title, body, conversationId, tag) {
+  try {
+    const n = new Notification(title, { body: String(body || "").slice(0, 160), tag });
+    n.onclick = () => {
+      try { window.focus(); } catch { /* noop */ }
+      if (conversationId) location.hash = "#/conversations/" + conversationId;
+      else location.hash = "#/commitments";
+      n.close();
+    };
+  } catch { /* notifications blocked */ }
+  playAlertSound(); // respects the existing sound toggle
 }
 
 function checkNotifications(prev) {
@@ -1139,6 +1202,12 @@ async function setSound(on) {
   renderSettings();
 }
 
+function setCommitNudges(on) {
+  state.commitNudges = on;
+  try { localStorage.setItem("relay_commit_nudges", on ? "1" : "0"); } catch { /* noop */ }
+  renderSettings();
+}
+
 function updateTitle() {
   const n = (state.conversations || []).reduce((a, c) => a + (c.unread || 0), 0);
   document.title = n > 0 ? `(${n}) Relay` : "Relay";
@@ -1190,6 +1259,7 @@ function renderConversations(skipIfSame) {
       <div class="nav-bar"><div class="nav-title">Conversations</div>
         <button class="nav-action" id="new-group">${icon("plus")}Group</button></div>
       <div class="search-wrap"><div class="search-field">${icon("search")}<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
+      ${globalCommitRowHtml()}
       <div class="scroll">
         ${list.length ? list.map(rowHtml).join("")
         : `<div class="empty">${icon("burst", "big")}<h3>No conversations yet</h3><p>Your inner circle lives here.<br>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
@@ -1199,9 +1269,94 @@ function renderConversations(skipIfSame) {
     </div>`;
   bindTabs(app);
   $("#new-group").addEventListener("click", () => { location.hash = "#/group/new"; });
+  const cgr = $("#commit-global");
+  if (cgr) cgr.addEventListener("click", () => { location.hash = "#/commitments"; });
   const qi = $("#q");
   qi.addEventListener("input", () => { state.search = qi.value; renderConversations(); const nq = $("#q"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
   $$(".conv-row", app).forEach((r) => r.addEventListener("click", () => { location.hash = "#/conversations/" + r.dataset.id; }));
+}
+
+// ---------- global commitments view ----------
+
+function globalCommitRowHtml() {
+  const n = (state.globalCommits || []).length;
+  return `<button class="commit-global-row" id="commit-global" aria-label="Open commitments">
+    ${icon("check")}<span class="cgr-title">Commitments</span>
+    ${n ? `<span class="ft-badge">${n}</span>` : `<span class="cgr-hint">none open</span>`}
+  </button>`;
+}
+
+function globalRowFor(kind, r) {
+  const conv = (state.conversations || []).find((c) => String(c.id) === String(r.conversation_id));
+  const cname = r.conversation_title || (conv ? conv.title : "");
+  const when = kind === "commitment" ? fmtDue(r) : (r.decided_at ? new Date(r.decided_at).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "");
+  const overdue = kind === "commitment" && r.due_date && r.due_date < clientDay(0);
+  return `<div class="cm-item${overdue ? " overdue" : ""}" data-goto="${r.conversation_id}" data-panel="${kind === "decision" ? "commit" : "commit"}" role="button" tabindex="0" title="Open conversation">
+    <div class="cm-body">
+      <div class="cm-text">${esc(r.text)}</div>
+      <div class="cm-meta"><span class="cm-owner">${esc(cname)}</span>${when ? `<span class="cm-due${overdue ? " overdue" : ""}">${kind === "commitment" ? icon("clock") : ""}${esc(when)}</span>` : ""}</div>
+    </div>
+    ${icon("chevR")}
+  </div>`;
+}
+
+/** The searchable global Open | Decisions view. */
+async function renderGlobalCommits() {
+  state.globalCommitView = true;
+  const tab = state.globalCommitTab;
+  const q = (state.globalCommitSearch || "").toLowerCase();
+  const match = (r) => !q || (r.text || "").toLowerCase().includes(q) || (r.conversation_title || "").toLowerCase().includes(q);
+  let items = [];
+  if (tab === "open") {
+    try {
+      if (!state._globalAll) {
+        const [c, d] = await Promise.all([api("/api/commitments/all"), api("/api/decisions/all")]);
+        state._globalAll = { commitments: c.commitments || [], decisions: d.decisions || [] };
+      }
+      const g = groupCommitments(state._globalAll.commitments.filter(match));
+      const groups = [["overdue", "Overdue"], ["today", "Today"], ["week", "This week"], ["later", "Later"], ["nodate", "No date"]];
+      for (const [key, label] of groups) {
+        if (!g[key].length) continue;
+        items.push(`<div class="cm-group"><div class="cm-group-label${key === "overdue" ? " overdue" : ""}">${label} · ${g[key].length}</div>${g[key].map((r) => globalRowFor("commitment", r)).join("")}</div>`);
+      }
+    } catch { items = [`<div class="cm-empty"><p>Couldn't load commitments.</p></div>`]; }
+  } else {
+    try {
+      if (!state._globalAll) {
+        const [c, d] = await Promise.all([api("/api/commitments/all"), api("/api/decisions/all")]);
+        state._globalAll = { commitments: c.commitments || [], decisions: d.decisions || [] };
+      }
+      const decs = state._globalAll.decisions.filter(match);
+      items = decs.length ? decs.map((r) => globalRowFor("decision", r))
+        : [`<div class="cm-empty">${icon("card", "big")}<p>No decisions logged yet.</p></div>`];
+    } catch { items = [`<div class="cm-empty"><p>Couldn't load decisions.</p></div>`]; }
+  }
+  const n = (state._globalAll && tab === "open") ? state._globalAll.commitments.length : (state._globalAll ? state._globalAll.decisions.length : 0);
+  const app = $("#app");
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar">
+        <button class="nav-back" id="gback">${icon("back")}Conversations</button>
+        <div style="flex:1"><div class="nav-title small">Commitments</div></div>
+      </div>
+      <div class="search-wrap"><div class="search-field">${icon("search")}<input id="gq" placeholder="Search commitments and decisions" value="${esc(state.globalCommitSearch || "")}"></div></div>
+      <div class="cm-tabs global-tabs" role="tablist">
+        <button class="cm-tab${tab === "open" ? " on" : ""}" data-gtab="open" role="tab" aria-selected="${tab === "open"}">Open${tab === "open" && n ? ` <span class="fp-count">${n}</span>` : ""}</button>
+        <button class="cm-tab${tab === "decisions" ? " on" : ""}" data-gtab="decisions" role="tab" aria-selected="${tab === "decisions"}">Decisions${tab === "decisions" && n ? ` <span class="fp-count">${n}</span>` : ""}</button>
+      </div>
+      <div class="scroll cm-global-list">${items.join("") || `<div class="cm-empty">${icon("check", "big")}<p>No open commitments.<br>Everything's handled — nice.</p></div>`}</div>
+      ${tabBar("conversations")}
+    </div>`;
+  bindTabs(app);
+  $("#gback").addEventListener("click", () => { state.globalCommitView = false; location.hash = "#/conversations"; });
+  const gq = $("#gq");
+  gq.addEventListener("input", () => { state.globalCommitSearch = gq.value; renderGlobalCommits(); const nq = $("#gq"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
+  $$("[data-gtab]", app).forEach((b) => b.addEventListener("click", () => { state.globalCommitTab = b.dataset.gtab; renderGlobalCommits(); }));
+  $$("[data-goto]", app).forEach((r) => {
+    const go = () => { state.globalCommitView = false; state._pendingPanel = "commit"; state._globalAll = null; location.hash = "#/conversations/" + r.dataset.goto; };
+    r.addEventListener("click", go);
+    r.addEventListener("keydown", (ev) => { if (ev.key === "Enter") go(); });
+  });
 }
 
 // ---------- message view ----------
@@ -1214,6 +1369,9 @@ async function loadConversation(id) {
   state.replyTo = null;
   state.pendingFiles = [];
   state.panel = null;
+  state.commitTab = "open";
+  state.globalCommitView = false;
+  state._globalAll = null;
   state.seenMsgIds = new Set(); // fresh view: every message animates in once
   state.diary = [];
   state.diaryOffset = 0;
@@ -1232,6 +1390,9 @@ async function loadConversation(id) {
     const d = await api("/api/conversations/" + encodeURIComponent(id) + "/appointments");
     state.diary = d.appointments || [];
   } catch { state.diary = []; }
+  await refreshCommitData();
+  // Navigation from the global view can pre-select the side panel.
+  if (state._pendingPanel) { state.panel = state._pendingPanel; state._pendingPanel = null; }
   if (!state.messages.length && state.conv && !state.conv.is_group) {
     // Empty conversation: pre-populate the first message from the last email exchange.
     api("/api/conversations/" + encodeURIComponent(id) + "/seed-email", { method: "POST" })
@@ -1485,6 +1646,8 @@ function diaryPanelHtml() {
 
 /** The side panel shows Shared files or the Diary, never both. */
 function sidePanelHtml() {
+  // The side panel shows Commitments, the Diary, or Shared files — never more than one.
+  if (state.panel === "commit") return commitPanelHtml();
   return state.panel === "diary" ? diaryPanelHtml() : filesPanelHtml();
 }
 
@@ -1505,6 +1668,7 @@ function renderSidePanel() {
   if (fpc) fpc.addEventListener("click", () => { state.panel = null; renderConversationDetail(); });
   wireFilesPanel();
   wireDiaryPanel();
+  wireCommitPanel();
 }
 
 /** Accept or decline an invitation from its card: sends a real METHOD:REPLY
@@ -1533,6 +1697,512 @@ async function setApptStatus(id, status) {
   }
 }
 
+/* ================= commitments tracker + decision log =================
+   Local-first: commitments and decisions live in SQLite next to messages.
+   Nothing is ever created without an explicit tap — the suggestion engine
+   only proposes, and a per-conversation learning loop tunes the phrasing
+   it listens for from the user's own confirms and dismissals. */
+
+/** Client-local calendar day as YYYY-MM-DD. */
+function clientDay(offsetDays) {
+  const d = new Date();
+  d.setDate(d.getDate() + (offsetDays || 0));
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+/** Refresh the cached tracker lists for the open conversation. */
+async function refreshCommitData() {
+  const conv = state.conv;
+  if (!conv) { state.commitments = []; state.commitSuggestions = []; state.decisions = []; return; }
+  const base = "/api/conversations/" + encodeURIComponent(conv.id);
+  try {
+    const [c, s, d] = await Promise.all([
+      api(base + "/commitments?status=open"),
+      api(base + "/suggestions"),
+      api(base + "/decisions"),
+    ]);
+    state.commitments = c.commitments || [];
+    state.commitSuggestions = s.suggestions || [];
+    state.decisions = d.decisions || [];
+  } catch { state.commitments = []; state.commitSuggestions = []; state.decisions = []; }
+}
+
+/** Refresh the global open-commitment list (global row badge + global view). */
+async function refreshGlobalCommits() {
+  try {
+    const r = await api("/api/commitments/all");
+    state.globalCommits = r.commitments || [];
+  } catch { state.globalCommits = []; }
+}
+
+function openCommitCount() {
+  return (state.commitments || []).filter((c) => c.status === "open").length;
+}
+
+/** Group open commitments into Overdue / Today / This week / Later / No date. */
+function groupCommitments(list) {
+  const today = clientDay(0);
+  const weekEnd = clientDay(7);
+  const g = { overdue: [], today: [], week: [], later: [], nodate: [] };
+  for (const c of list) {
+    if (!c.due_date) g.nodate.push(c);
+    else if (c.due_date < today) g.overdue.push(c);
+    else if (c.due_date === today) g.today.push(c);
+    else if (c.due_date <= weekEnd) g.week.push(c);
+    else g.later.push(c);
+  }
+  return g;
+}
+
+function ownerName(c) {
+  if (!c.owner || c.owner === "me") return "You";
+  const m = (state.conv && state.conv.members || []).find((x) => String(x.id) === String(c.owner));
+  return m ? m.name : "Someone";
+}
+
+function fmtDue(c) {
+  if (!c.due_date) return "";
+  const today = clientDay(0);
+  let label;
+  if (c.due_date < today) label = "Overdue";
+  else if (c.due_date === today) label = "Today";
+  else if (c.due_date === clientDay(1)) label = "Tomorrow";
+  else {
+    const [y, m, d] = c.due_date.split("-").map(Number);
+    label = new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+  if (c.due_time) {
+    const [h, mi] = c.due_time.split(":").map(Number);
+    const ap = h >= 12 ? "PM" : "AM";
+    const hh = h % 12 || 12;
+    label += " " + hh + ":" + String(mi).padStart(2, "0") + " " + ap;
+  }
+  return label;
+}
+
+function commitItemHtml(c) {
+  const overdue = c.due_date && c.due_date < clientDay(0);
+  return `<div class="cm-item${overdue ? " overdue" : ""}" data-commit="${c.id}">
+    <button class="cm-check" data-cm-done="${c.id}" aria-label="Mark done" title="Mark done">${icon("check")}</button>
+    <div class="cm-body">
+      <div class="cm-text">${esc(c.text)}</div>
+      <div class="cm-meta">
+        <span class="cm-owner">${esc(ownerName(c))}</span>
+        ${c.due_date ? `<span class="cm-due${overdue ? " overdue" : ""}">${icon("clock")}${esc(fmtDue(c))}</span>` : ""}
+        ${c.source === "suggested" ? `<span class="cm-src">suggested</span>` : ""}
+      </div>
+    </div>
+    <div class="cm-actions">
+      ${c.due_date ? `<button class="cm-icobtn" data-cm-diary="${c.id}" aria-label="Add to diary" title="Add to diary">${icon("calendar")}</button>` : ""}
+      <button class="cm-icobtn" data-cm-edit="${c.id}" aria-label="Edit commitment" title="Edit">${icon("sliders")}</button>
+      <button class="cm-icobtn danger" data-cm-del="${c.id}" aria-label="Delete commitment" title="Delete">${icon("close")}</button>
+    </div>
+  </div>`;
+}
+
+function suggestionCardHtml(s) {
+  const excerpt = (s.body || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  return `<div class="cm-sugg" data-sugg="${s.id}">
+    <div class="cm-sugg-kind">${s.class === "decision" ? "Possible decision" : "Possible commitment"}</div>
+    ${excerpt ? `<div class="cm-sugg-msg">\u201c${esc(excerpt)}\u201d</div>` : ""}
+    <div class="cm-sugg-reason">${esc(s.reason)}</div>
+    ${s.due_date ? `<div class="cm-meta"><span class="cm-due">${icon("clock")}${esc(fmtDue(s))}</span></div>` : ""}
+    <div class="cm-sugg-actions">
+      <button class="btn small" data-sugg-keep="${s.id}">Keep</button>
+      <button class="btn secondary small" data-sugg-drop="${s.id}">Dismiss</button>
+    </div>
+    <div class="cm-hint">Nothing is saved until you tap Keep.</div>
+  </div>`;
+}
+
+function decisionItemHtml(d) {
+  let parts = [];
+  try { parts = JSON.parse(d.participants || "[]"); } catch { parts = []; }
+  const names = parts.map((id) => id === "me" ? "You"
+    : ((state.conv && state.conv.members || []).find((x) => String(x.id) === String(id)) || {}).name || "Someone");
+  const when = d.decided_at ? new Date(d.decided_at).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+  return `<div class="cm-item" data-decision="${d.id}">
+    <div class="cm-body">
+      <div class="cm-text">${esc(d.text)}</div>
+      <div class="cm-meta"><span class="cm-owner">${esc(names.join(", ") || "You")}</span>${when ? `<span class="cm-due">${esc(when)}</span>` : ""}${d.source === "suggested" ? `<span class="cm-src">suggested</span>` : ""}</div>
+    </div>
+    <div class="cm-actions">
+      <button class="cm-icobtn" data-dec-diary="${d.id}" aria-label="Add to diary" title="Add to diary">${icon("calendar")}</button>
+      <button class="cm-icobtn" data-dec-edit="${d.id}" aria-label="Edit decision" title="Edit">${icon("sliders")}</button>
+      <button class="cm-icobtn danger" data-dec-del="${d.id}" aria-label="Delete decision" title="Delete">${icon("close")}</button>
+    </div>
+  </div>`;
+}
+
+/** The Commitments side panel: Open | Suggestions | Decisions tabs. */
+function commitPanelHtml() {
+  const open = (state.commitments || []).filter((c) => c.status === "open");
+  const suggs = state.commitSuggestions || [];
+  const decs = state.decisions || [];
+  const tab = state.commitTab;
+  const tabs = [["open", "Open", open.length], ["suggestions", "Suggestions", suggs.length], ["decisions", "Decisions", decs.length]];
+  let body = "";
+  if (tab === "open") {
+    const g = groupCommitments(open);
+    const groups = [["overdue", "Overdue"], ["today", "Today"], ["week", "This week"], ["later", "Later"], ["nodate", "No date"]];
+    const parts = [];
+    for (const [key, label] of groups) {
+      if (!g[key].length) continue;
+      parts.push(`<div class="cm-group"><div class="cm-group-label${key === "overdue" ? " overdue" : ""}">${label} · ${g[key].length}</div>${g[key].map(commitItemHtml).join("")}</div>`);
+    }
+    body = parts.length ? parts.join("")
+      : `<div class="cm-empty">${icon("check", "big")}<p>No open commitments here.<br>Right-click a message (or long-press) to mark one.</p></div>`;
+  } else if (tab === "suggestions") {
+    body = suggs.length ? suggs.map(suggestionCardHtml).join("")
+      : `<div class="cm-empty">${icon("burst", "big")}<p>Nothing suggested right now.<br>Phrases you confirm teach what to listen for.</p></div>`;
+  } else {
+    body = decs.length ? decs.map(decisionItemHtml).join("")
+      : `<div class="cm-empty">${icon("card", "big")}<p>No decisions logged yet.<br>Right-click a message (or long-press) to log one.</p></div>`;
+  }
+  return `
+    <aside class="files-panel commit-panel" id="files-panel" aria-label="Commitments and decisions">
+      <div class="fp-head">${icon("check")}<span class="fp-title">Commitments</span>${open.length ? `<span class="fp-count">${open.length}</span>` : ""}<button class="fp-close" id="fp-close" aria-label="Close commitments">${icon("close")}</button></div>
+      <div class="cm-tabs" role="tablist">${tabs.map(([k, label, n]) =>
+        `<button class="cm-tab${tab === k ? " on" : ""}" role="tab" aria-selected="${tab === k}" data-cm-tab="${k}">${label}${n ? ` <span class="fp-count">${n}</span>` : ""}</button>`).join("")}</div>
+      <div class="cm-list" id="cm-body">${body}</div>
+      <div class="dp-hint">${tab === "decisions" ? "A log of what was decided — edit or delete anytime." : "Suggestions are private guesses — nothing is saved until you tap Keep."}</div>
+    </aside>`;
+}
+
+/** Swap just the panel content in place (tabs, keep/dismiss). */
+function renderCommitPanel() {
+  const panel = $("#files-panel");
+  if (!panel || !state.conv || state.panel !== "commit") return;
+  panel.outerHTML = commitPanelHtml();
+  const fpc = $("#fp-close");
+  if (fpc) fpc.addEventListener("click", () => { state.panel = null; renderConversationDetail(); });
+  wireCommitPanel();
+}
+
+/** Wire tabs, done/edit/delete, keep/dismiss, add-to-diary inside the panel. */
+function wireCommitPanel() {
+  $$("#files-panel [data-cm-tab]").forEach((b) => b.addEventListener("click", () => {
+    state.commitTab = b.dataset.cmTab; renderCommitPanel();
+  }));
+  $$("#files-panel [data-cm-done]").forEach((b) => b.addEventListener("click", () => setCommitStatus(b.dataset.cmDone, "done")));
+  $$("#files-panel [data-cm-edit]").forEach((b) => b.addEventListener("click", () => {
+    const c = (state.commitments || []).find((x) => String(x.id) === String(b.dataset.cmEdit));
+    if (c) openCommitEditor("commitment", { record: c });
+  }));
+  $$("#files-panel [data-cm-del]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("Delete this commitment?")) return;
+    try { await api("/api/commitments/" + encodeURIComponent(b.dataset.cmDel), { method: "DELETE" }); } catch (e) { toast(e.message || "Couldn't delete.", true); return; }
+    await refreshCommitData(); renderCommitPanel();
+  }));
+  $$("#files-panel [data-cm-diary]").forEach((b) => b.addEventListener("click", () => {
+    const c = (state.commitments || []).find((x) => String(x.id) === String(b.dataset.cmDiary));
+    if (c) openDiaryComposerForCommitment(c);
+  }));
+  $$("#files-panel [data-sugg-keep]").forEach((b) => b.addEventListener("click", () => keepSuggestion(b.dataset.suggKeep)));
+  $$("#files-panel [data-sugg-drop]").forEach((b) => b.addEventListener("click", () => dropSuggestion(b.dataset.suggDrop)));
+  $$("#files-panel [data-dec-edit]").forEach((b) => b.addEventListener("click", () => {
+    const d = (state.decisions || []).find((x) => String(x.id) === String(b.dataset.decEdit));
+    if (d) openCommitEditor("decision", { record: d });
+  }));
+  $$("#files-panel [data-dec-del]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("Delete this decision?")) return;
+    try { await api("/api/decisions/" + encodeURIComponent(b.dataset.decDel), { method: "DELETE" }); } catch (e) { toast(e.message || "Couldn't delete.", true); return; }
+    await refreshCommitData(); renderCommitPanel();
+  }));
+  $$("#files-panel [data-dec-diary]").forEach((b) => b.addEventListener("click", () => {
+    const d = (state.decisions || []).find((x) => String(x.id) === String(b.dataset.decDiary));
+    if (d) openDiaryComposerForDecision(d);
+  }));
+}
+
+async function setCommitStatus(id, status) {
+  try {
+    await api("/api/commitments/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify({ status }) });
+  } catch (e) { toast(e.message || "Couldn't update.", true); return; }
+  await refreshCommitData();
+  if (state.globalCommitView) renderGlobalCommits(); else renderCommitPanel();
+  toast(status === "done" ? "Marked done." : "Reopened.");
+}
+
+/** Keep a suggestion: open the editor pre-filled so the user confirms the details. */
+function keepSuggestion(id) {
+  const s = (state.commitSuggestions || []).find((x) => String(x.id) === String(id));
+  if (!s) return;
+  const msg = (state.messages || []).find((m) => String(m.id) === String(s.message_id));
+  openCommitEditor(s.class === "decision" ? "decision" : "commitment", {
+    suggestion: s,
+    text: msg ? msg.body : "",
+  });
+}
+
+async function dropSuggestion(id) {
+  try { await api("/api/suggestions/" + encodeURIComponent(id) + "/dismiss", { method: "POST" }); }
+  catch (e) { toast(e.message || "Couldn't dismiss.", true); return; }
+  await refreshCommitData();
+  renderCommitPanel();
+  refreshInlineSuggestions();
+}
+
+/** Add a commitment to the diary using the existing appointments store. */
+function openDiaryComposerForCommitment(c) {
+  if (!state.conv) return;
+  const start = new Date(c.due_date + "T" + (c.due_time || "09:00"));
+  if (isNaN(start.getTime())) { toast("Add a due date first to place it in the diary.", true); return; }
+  state.panel = "diary";
+  renderConversationDetail();
+  state.diaryDraft = {
+    convId: state.conv.id,
+    messageId: "",
+    title: c.text.slice(0, 80),
+    start: toLocalInput(start),
+    end: toLocalInput(new Date(start.getTime() + 60 * 60 * 1000)),
+    location: "",
+    desc: "From a commitment tracked in Relay.",
+  };
+  renderDiaryComposer();
+}
+
+function openDiaryComposerForDecision(d) {
+  if (!state.conv) return;
+  state.panel = "diary";
+  renderConversationDetail();
+  const at = d.decided_at ? new Date(d.decided_at) : new Date();
+  state.diaryDraft = {
+    convId: state.conv.id,
+    messageId: "",
+    title: "Decision: " + d.text.slice(0, 60),
+    start: toLocalInput(at),
+    end: toLocalInput(new Date(at.getTime() + 30 * 60 * 1000)),
+    location: "",
+    desc: "Logged in Relay's decision log.",
+  };
+  renderDiaryComposer();
+}
+
+/* ---------- message context menu (right-click / long-press) ---------- */
+
+function closeCommitMenu() {
+  if (state._commitMenu) { state._commitMenu.remove(); state._commitMenu = null; }
+  document.removeEventListener("keydown", commitMenuEsc);
+}
+
+function commitMenuEsc(ev) {
+  if (ev.key === "Escape") closeCommitMenu();
+}
+
+/** Open the per-message menu at (x, y): mark as commitment / decision. */
+function openCommitMenu(msgId, x, y) {
+  closeCommitMenu();
+  const msg = (state.messages || []).find((m) => String(m.id) === String(msgId));
+  if (!msg) return;
+  const menu = document.createElement("div");
+  menu.className = "cm-menu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML = `
+    <button role="menuitem" data-act="commit">${icon("check")}Mark as commitment</button>
+    <button role="menuitem" data-act="decision">${icon("card")}Log as decision</button>`;
+  document.body.appendChild(menu);
+  // Clamp into the viewport.
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + "px";
+  menu.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + "px";
+  state._commitMenu = menu;
+  menu.querySelector('[data-act="commit"]').addEventListener("click", () => {
+    closeCommitMenu();
+    openCommitEditor("commitment", { messageId: msg.id, text: msg.body || "" });
+  });
+  menu.querySelector('[data-act="decision"]').addEventListener("click", () => {
+    closeCommitMenu();
+    openCommitEditor("decision", { messageId: msg.id, text: msg.body || "" });
+  });
+  setTimeout(() => document.addEventListener("click", function out(ev) {
+    if (state._commitMenu && !state._commitMenu.contains(ev.target)) { closeCommitMenu(); document.removeEventListener("click", out); }
+  }), 0);
+  document.addEventListener("keydown", commitMenuEsc);
+  const first = menu.querySelector("button");
+  if (first) first.focus();
+}
+
+/** Wire right-click + ≥500ms long-press + Menu-key on message bubbles. */
+function wireMessageMenus() {
+  const wrap = $("#msgs");
+  if (!wrap) return;
+  let pressTimer = null, pressMsg = null, pressX = 0, pressY = 0;
+  const clearPress = () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } pressMsg = null; };
+  wrap.addEventListener("contextmenu", (ev) => {
+    const el = ev.target.closest(".msg");
+    if (!el || !el.dataset.mid) return;
+    ev.preventDefault();
+    clearPress();
+    openCommitMenu(el.dataset.mid, ev.clientX, ev.clientY);
+  });
+  wrap.addEventListener("touchstart", (ev) => {
+    const el = ev.target.closest(".msg");
+    if (!el || !el.dataset.mid || ev.touches.length !== 1) return;
+    const t = ev.touches[0];
+    pressMsg = el.dataset.mid; pressX = t.clientX; pressY = t.clientY;
+    clearTimeout(pressTimer);
+    pressTimer = setTimeout(() => { if (pressMsg) openCommitMenu(pressMsg, pressX, pressY); pressMsg = null; }, 500);
+  }, { passive: true });
+  wrap.addEventListener("touchmove", clearPress, { passive: true });
+  wrap.addEventListener("touchend", clearPress, { passive: true });
+  wrap.addEventListener("touchcancel", clearPress, { passive: true });
+  // Keyboard: Shift+F10 or the Menu key on a focused message.
+  wrap.addEventListener("keydown", (ev) => {
+    if (ev.key !== "ContextMenu" && !(ev.shiftKey && ev.key === "F10")) return;
+    const el = ev.target.closest(".msg");
+    if (!el || !el.dataset.mid) return;
+    ev.preventDefault();
+    const r = el.getBoundingClientRect();
+    openCommitMenu(el.dataset.mid, r.left + 24, r.top + 24);
+  });
+}
+
+/* ---------- commitment / decision editor ---------- */
+
+function closeCommitEditor() {
+  if (state._commitEditor) { state._commitEditor.remove(); state._commitEditor = null; }
+  document.removeEventListener("keydown", commitEditorEsc);
+}
+
+function commitEditorEsc(ev) {
+  if (ev.key === "Escape") closeCommitEditor();
+}
+
+/**
+ * Editor modal for commitments and decisions.
+ * opts: { record? } (edit), { messageId?, text?, suggestion? } (create).
+ * Saving a suggestion confirm POSTs to /suggestions/:id/confirm so the
+ * learning loop records the confirm; everything else uses the CRUD routes.
+ */
+function openCommitEditor(kind, opts) {
+  closeCommitEditor();
+  const o = opts || {};
+  const rec = o.record || null;
+  const sugg = o.suggestion || null;
+  const conv = state.conv;
+  const members = (conv && conv.members) || [];
+  const isNew = !rec;
+  let fields = "";
+  if (kind === "commitment") {
+    const owner = rec ? rec.owner : (sugg && sugg.owner) || "me";
+    const dueDate = rec ? rec.due_date : (sugg && sugg.due_date) || "";
+    const dueTime = rec ? rec.due_time : (sugg && sugg.due_time) || "";
+    const ownerOpts = [`<option value="me"${owner === "me" ? " selected" : ""}>You</option>`]
+      .concat(members.map((m) => `<option value="${esc(m.id)}"${String(owner) === String(m.id) ? " selected" : ""}>${esc(m.name)}</option>`)).join("");
+    fields = `
+      <label class="ce-field">Commitment<textarea id="ce-text" rows="3">${esc(rec ? rec.text : (o.text || ""))}</textarea></label>
+      <div class="ce-row">
+        <label class="ce-field">Who's on the hook?<select id="ce-owner">${ownerOpts}</select></label>
+      </div>
+      <div class="ce-row">
+        <label class="ce-field">Due date<input type="date" id="ce-due" value="${esc(dueDate)}"></label>
+        <label class="ce-field">Time (optional)<input type="time" id="ce-time" value="${esc(dueTime)}"></label>
+      </div>
+      ${sugg ? `<div class="cm-hint">${esc(sugg.reason)}</div>` : ""}`;
+  } else {
+    let parts = ["me"];
+    try { parts = rec ? JSON.parse(rec.participants || "[]") : ["me", ...members.map((m) => m.id)]; } catch { parts = ["me"]; }
+    const boxes = [`<label class="ce-check"><input type="checkbox" data-ce-part="me"${parts.includes("me") ? " checked" : ""}> You</label>`]
+      .concat(members.map((m) => `<label class="ce-check"><input type="checkbox" data-ce-part="${esc(m.id)}"${parts.includes(m.id) ? " checked" : ""}> ${esc(m.name)}</label>`)).join("");
+    const decided = rec && rec.decided_at ? toLocalInput(new Date(rec.decided_at)) : toLocalInput(new Date());
+    fields = `
+      <label class="ce-field">Decision<textarea id="ce-text" rows="3">${esc(rec ? rec.text : (o.text || ""))}</textarea></label>
+      <div class="ce-field"><span class="ce-label">Decided by</span><div class="ce-parts">${boxes}</div></div>
+      <label class="ce-field">When<input type="datetime-local" id="ce-decided" value="${esc(decided)}"></label>
+      ${sugg ? `<div class="cm-hint">${esc(sugg.reason)}</div>` : ""}`;
+  }
+  const wrap = document.createElement("div");
+  wrap.className = "modal-wrap";
+  wrap.innerHTML = `<div class="modal ce-modal" role="dialog" aria-modal="true" aria-label="${kind === "commitment" ? "Commitment" : "Decision"}">
+    <div class="modal-head">${icon(kind === "commitment" ? "check" : "card")}<span class="modal-title">${isNew ? "New" : "Edit"} ${kind === "commitment" ? "commitment" : "decision"}</span><button class="modal-x" id="ce-x" aria-label="Cancel">${icon("close")}</button></div>
+    ${fields}
+    <div class="ef-actions"><span class="ef-hint">Saved on this device only — never sent anywhere</span><button class="ef-send" id="ce-save">${isNew ? "Save" : "Save changes"}</button></div>
+  </div>`;
+  document.body.appendChild(wrap);
+  state._commitEditor = wrap;
+  $("#ce-x").addEventListener("click", closeCommitEditor);
+  wrap.addEventListener("click", (ev) => { if (ev.target === wrap) closeCommitEditor(); });
+  document.addEventListener("keydown", commitEditorEsc);
+  $("#ce-save").addEventListener("click", () => saveCommitEditor(kind, o));
+  const t = $("#ce-text");
+  if (t) { t.focus(); }
+}
+
+async function saveCommitEditor(kind, opts) {
+  const o = opts || {};
+  const rec = o.record || null;
+  const sugg = o.suggestion || null;
+  const text = String($("#ce-text").value || "").trim();
+  if (!text) { toast(kind === "commitment" ? "Give the commitment some text." : "Give the decision some text.", true); return; }
+  try {
+    if (kind === "commitment") {
+      const payload = {
+        text,
+        owner: String($("#ce-owner").value || "me"),
+        due_date: String($("#ce-due").value || ""),
+        due_time: String($("#ce-time").value || ""),
+      };
+      if (sugg) {
+        await api("/api/suggestions/" + encodeURIComponent(sugg.id) + "/confirm", { method: "POST", body: JSON.stringify(payload) });
+      } else if (rec) {
+        await api("/api/commitments/" + encodeURIComponent(rec.id), { method: "PATCH", body: JSON.stringify(payload) });
+      } else {
+        await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/commitments",
+          { method: "POST", body: JSON.stringify({ ...payload, message_id: o.messageId || "" }) });
+      }
+      toast(sugg ? "Kept — commitment saved." : rec ? "Commitment updated." : "Commitment saved.");
+    } else {
+      const parts = $$( "[data-ce-part]", state._commitEditor).filter((c) => c.checked).map((c) => c.dataset.cePart);
+      const decidedRaw = String($("#ce-decided").value || "");
+      const decidedAt = decidedRaw && !isNaN(new Date(decidedRaw).getTime()) ? new Date(decidedRaw).toISOString() : new Date().toISOString();
+      const payload = { text, participants: parts.length ? parts : ["me"], decided_at: decidedAt };
+      if (sugg) {
+        await api("/api/suggestions/" + encodeURIComponent(sugg.id) + "/confirm", { method: "POST", body: JSON.stringify(payload) });
+      } else if (rec) {
+        await api("/api/decisions/" + encodeURIComponent(rec.id), { method: "PATCH", body: JSON.stringify(payload) });
+      } else {
+        await api("/api/conversations/" + encodeURIComponent(state.conv.id) + "/decisions",
+          { method: "POST", body: JSON.stringify({ ...payload, message_id: o.messageId || "" }) });
+      }
+      toast(sugg ? "Kept — decision logged." : rec ? "Decision updated." : "Decision logged.");
+    }
+  } catch (e) { toast(e.message || "Couldn't save.", true); return; }
+  closeCommitEditor();
+  await refreshCommitData();
+  if (state.panel === "commit") renderCommitPanel();
+  refreshInlineSuggestions();
+}
+
+/* ---------- inline suggestion chips in the thread ---------- */
+
+function suggestionForMessage(msgId) {
+  return (state.commitSuggestions || []).find((s) => String(s.message_id) === String(msgId));
+}
+
+function suggestionChipHtml(s) {
+  return `<button class="sugg-chip" data-chip-keep="${s.id}" title="${esc(s.reason)}">
+    ${icon(s.class === "decision" ? "card" : "check")}
+    <span>Suggested ${s.class === "decision" ? "decision" : "commitment"} — tap to review</span>
+  </button>
+  <button class="sugg-chip dismiss" data-chip-drop="${s.id}" aria-label="Dismiss suggestion" title="Dismiss">${icon("close")}</button>`;
+}
+
+/** Re-render only the inline chips (after keep/dismiss) without a full redraw. */
+function refreshInlineSuggestions() {
+  $$("#msgs .sugg-row").forEach((row) => {
+    const s = suggestionForMessage(row.dataset.mid);
+    if (!s) { row.remove(); return; }
+    row.innerHTML = suggestionChipHtml(s);
+  });
+}
+
+function wireInlineSuggestions() {
+  $$("#msgs [data-chip-keep]").forEach((b) => b.addEventListener("click", (ev) => { ev.stopPropagation(); keepSuggestion(b.dataset.chipKeep); }));
+  $$("#msgs [data-chip-drop]").forEach((b) => b.addEventListener("click", (ev) => { ev.stopPropagation(); dropSuggestion(b.dataset.chipDrop); }));
+}
+
 function renderConversationDetail() {
   const conv = state.conv;
   if (!conv) { location.hash = "#/conversations"; return; }
@@ -1555,10 +2225,12 @@ function renderConversationDetail() {
     // Messages already on screen keep their place quietly; only genuinely
     // new ones replay the pop-in animation.
     const isNew = !seen.has(m.id);
-    body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}${isNew ? "" : " msg-old"}">
+    const sugg = suggestionForMessage(m.id);
+    body += `<div class="msg ${out ? "out" : "in"}${m.status === "failed" ? " failed" : ""}${isNew ? "" : " msg-old"}" data-mid="${m.id}" tabindex="0">
       ${!out && conv.is_group ? `<div class="sender-name">${esc(senderName(m))}</div>` : ""}
       <div class="bubble">${m.subject ? `<div class="subject">${esc(m.subject)}</div>` : ""}<span class="bubble-text">${bubbleText(m)}</span>${bubbleAtts(m)}</div>
       ${meetingChipFor(m)}
+      ${sugg ? `<div class="sugg-row" data-mid="${m.id}">${suggestionChipHtml(sugg)}</div>` : ""}
       <div class="meta-line">${chanPill(m.channel)}<span>${fmtTime(m.created_at)}</span>${m.status === "failed" ? `<span style="color:var(--red);font-weight:700">· failed to send</span><button class="retry-btn" data-retry="${m.id}" title="Try sending again">${icon("retry")}Retry</button>` : ""}${canReply ? `<button class="reply-btn" data-reply="${m.id}" title="Reply to this email in thread">${icon("reply")}Reply</button>` : ""}</div>
     </div>`;
   }
@@ -1579,6 +2251,7 @@ function renderConversationDetail() {
             </div>
             <button class="nav-action diary-toggle${state.panel === "diary" ? " on" : ""}" id="diary-toggle" aria-label="Appointment diary" title="Appointment diary">${icon("calendar")}${diaryWeekAppts().length ? `<span class="ft-badge">${diaryWeekAppts().length}</span>` : ""}</button>
             <button class="nav-action files-toggle${state.panel === "files" ? " on" : ""}" id="files-toggle" aria-label="Shared files" title="Shared files">${icon("files")}${state.files.length ? `<span class="ft-badge">${state.files.length}</span>` : ""}</button>
+            <button class="nav-action commit-toggle${state.panel === "commit" ? " on" : ""}" id="commit-toggle" aria-label="Commitments and decisions" title="Commitments and decisions">${icon("check")}${openCommitCount() ? `<span class="ft-badge">${openCommitCount()}</span>` : ""}</button>
             <button class="nav-action" id="conv-archive" aria-label="${conv.archived ? "Unarchive conversation" : "Archive conversation"}" title="${conv.archived ? "Unarchive conversation" : "Archive conversation"}">${icon("box")}</button>
             ${conv.is_group ? `<button class="nav-action" id="grp-edit">Edit</button>` : ""}
           </div>
@@ -1612,13 +2285,17 @@ function renderConversationDetail() {
   const ge = $("#grp-edit");
   if (ge) ge.addEventListener("click", () => openGroupSheet(conv));
 
-  // Side panel: shared files and the appointment diary.
+  // Side panel: shared files, the appointment diary, and the commitments tracker.
   $("#files-toggle").addEventListener("click", () => { state.panel = state.panel === "files" ? null : "files"; renderConversationDetail(); });
   $("#diary-toggle").addEventListener("click", () => { state.panel = state.panel === "diary" ? null : "diary"; renderConversationDetail(); });
+  $("#commit-toggle").addEventListener("click", () => { state.panel = state.panel === "commit" ? null : "commit"; renderConversationDetail(); });
   const fpc = $("#fp-close");
   if (fpc) fpc.addEventListener("click", () => { state.panel = null; renderConversationDetail(); });
   wireFilesPanel();
   wireDiaryPanel();
+  wireCommitPanel();
+  wireMessageMenus();
+  wireInlineSuggestions();
   // Invitation cards: accept / decline inbound invites.
   $$("#msgs [data-appt-accept]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptAccept, "accepted")));
   $$("#msgs [data-appt-decline]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptDecline, "declined")));
@@ -1863,6 +2540,7 @@ async function refreshConversation() {
     if (state.messages.length !== before) {
       await refreshFiles();
       await refreshDiary();
+      await refreshCommitData(); // new inbound messages may carry new suggestions
       const sc = $("#msgs");
       const nearBottom = sc && (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120);
       renderConversationDetail();
@@ -2494,6 +3172,10 @@ function renderSettings() {
             <div class="rlabel" style="flex:1"><div class="t1">Notification sound</div><div class="t2">A soft chime plays with each notification.</div></div>
             <label class="switch"><input type="checkbox" id="sound-toggle" ${state.sound ? "checked" : ""} aria-label="Notification sound"><span class="track"><span class="thumb"></span></span></label>
           </div>
+          <div class="group-row">
+            <div class="rlabel" style="flex:1"><div class="t1">Commitment nudges</div><div class="t2">A reminder when a tracked commitment is due or overdue. Quiet hours 10pm–7am.</div></div>
+            <label class="switch"><input type="checkbox" id="commit-nudges-toggle" ${state.commitNudges ? "checked" : ""} aria-label="Commitment nudges"><span class="track"><span class="thumb"></span></span></label>
+          </div>
         </div>
 
         <div class="group-caption">Email sending · SMTP</div>
@@ -2566,6 +3248,7 @@ function renderSettings() {
 
   $("#notify-toggle").addEventListener("change", (e) => { setNotify(e.target.checked); });
   $("#sound-toggle").addEventListener("change", (e) => { setSound(e.target.checked); });
+  $("#commit-nudges-toggle").addEventListener("change", (e) => { setCommitNudges(e.target.checked); });
 
   $("#migrate-mail").addEventListener("click", async () => {
     const el = $("#migrate-result");
@@ -2641,6 +3324,7 @@ async function route() {
       renderConversationDetail();
       state.timer = setInterval(refreshConversation, 10000);
     } else if (parts[0] === "conversations") {
+      state.globalCommitView = false;
       await pollConversations();
       renderConversations();
       // Data arrives via the global poller below; re-render only when the
@@ -2659,6 +3343,11 @@ async function route() {
     } else if (parts[0] === "group" && parts[1] === "new") {
       await loadContacts();
       renderNewGroup();
+    } else if (parts[0] === "commitments") {
+      await pollConversations();
+      state._globalAll = null;
+      await renderGlobalCommits();
+      state.timer = setInterval(() => { if ((location.hash || "") === "#/commitments") { state._globalAll = null; renderGlobalCommits(); } }, 15000);
     } else if (parts[0] === "settings") {
       await loadSettings();
       renderSettings();
