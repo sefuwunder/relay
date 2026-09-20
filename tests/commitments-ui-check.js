@@ -84,7 +84,7 @@ load("app.js", `\n;globalThis.__APP__ = { state, renderConversationDetail, rende
   commitPanelHtml, groupCommitments, clientDay, openCommitMenu, closeCommitMenu,
   openCommitEditor, saveCommitEditor, keepSuggestion, dropSuggestion, setCommitStatus,
   renderGlobalCommits, checkCommitNudges, refreshCommitData, refreshGlobalCommits,
-  globalCommitRowHtml, openCommitCount };`);
+  commitToggleHtml, openCommitCount };`);
 const A = globalThis.__APP__;
 const { state } = A;
 
@@ -106,6 +106,7 @@ function resetState() {
   state.panel = null; state.commitTab = "open"; state.files = []; state.diary = [];
   state.pendingFiles = []; state.commitments = []; state.commitSuggestions = []; state.decisions = [];
   state.globalCommits = []; state.globalCommitView = false; state._globalAll = null;
+  state._globalAllErr = false; state.archivedOpen = false; state.commitPanelOpen = false;
   state._nudgeSeen = {}; state.commitNudges = true; state.notify = true; state.sound = false;
   state.search = ""; state.globalCommitSearch = ""; state.globalCommitTab = "open";
   fetchCalls.length = 0; notifs.length = 0;
@@ -299,8 +300,8 @@ resetState();
   state.archivedConversations = [];
   A.renderConversations();
   const html = document.getElementById("app").innerHTML;
-  ok("global row above list", html.includes('id="commit-global"'));
-  ok("global row shows badge", html.includes("ft-badge"));
+  ok("global toggle above list", html.includes('id="commit-slide-toggle"'));
+  ok("global toggle shows badge", html.includes("ft-badge"));
 }
 
 // ---------- nudges ----------
@@ -380,8 +381,8 @@ resetState();
   allCommits = [{ id: "k1", text: "One", status: "open" }, { id: "k2", text: "Two", status: "open" }];
   await A.refreshGlobalCommits();
   ok("refreshGlobalCommits caches the list", state.globalCommits.length === 2);
-  const row = A.globalCommitRowHtml();
-  ok("global row shows the open count", />2</.test(row) || row.includes(">2<"));
+  const row = A.commitToggleHtml();
+  ok("global toggle shows the open count", />2</.test(row) || row.includes(">2<"));
 }
 resetState();
 {

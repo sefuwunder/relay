@@ -41,6 +41,9 @@ const state = {
   globalCommitView: false, // the global commitments view is showing
   globalCommitTab: "open", // global view tab: "open" | "decisions"
   globalCommitSearch: "",
+  archivedOpen: (() => { try { return localStorage.getItem("relay_archived_open") === "1"; } catch { return false; } })(), // archived threads start folded
+  commitPanelOpen: (() => { try { return localStorage.getItem("relay_commit_panel") === "1"; } catch { return false; } })(), // slide-down commitments under the conversation search
+  _globalAllErr: false, // last global commitments fetch failed
   commitNudges: (() => { try { return localStorage.getItem("relay_commit_nudges") !== "0"; } catch { return true; } })(),
   _nudgeSeen: {},      // "commitId@YYYY-MM-DD" already notified this session
   _commitMenu: null,   // open message context menu element
@@ -1418,7 +1421,11 @@ function renderConversations(skipIfSame) {
   // The 15s timer re-renders this view; skip the rewrite (and its entrance
   // animation) when nothing on screen would change.
   const sig = q + "|" + list.map((c) => [c.id, c.last_at, c.unread, c.last_body, c.title].join("~")).join("|")
-    + "|arch|" + arch.map((c) => [c.id, c.last_at, c.unread, c.title].join("~")).join("|");
+    + "|arch|" + (state.archivedOpen ? "1" : "0") + "|" + arch.map((c) => [c.id, c.last_at, c.unread, c.title].join("~")).join("|")
+    + (state.commitPanelOpen && state._globalAll
+      ? "|cm|" + state._globalAll.commitments.map((c) => [c.id, c.status, c.due_date, c.text].join("~")).join("|")
+        + "|dc|" + state._globalAll.decisions.map((d) => [d.id, d.text].join("~")).join("|")
+      : "|cm-|");
   if (skipIfSame && sig === state.convListSig) return;
   state.convListSig = sig;
   const rowHtml = (c) => `
@@ -1439,18 +1446,26 @@ function renderConversations(skipIfSame) {
       <div class="nav-bar"><div class="nav-title">Conversations</div>
         <button class="nav-action" id="new-group">${icon("plus")}Group</button></div>
       <div class="search-wrap"><div class="search-field">${icon("search")}<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
-      ${globalCommitRowHtml()}
+      ${commitToggleHtml()}
+      ${commitSlideHtml()}
       <div class="scroll">
         ${list.length ? list.map(rowHtml).join("")
         : `<div class="empty">${icon("burst", "big")}<h3>No conversations yet</h3><p>Your inner circle lives here.<br>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
-        ${arch.length ? `<div class="group-caption">Archived · ${arch.length}</div>${arch.map(rowHtml).join("")}` : ""}
+        ${arch.length ? archivedFoldHtml(arch, rowHtml) : ""}
       </div>
       ${tabBar("conversations")}
     </div>`;
   bindTabs(app);
   $("#new-group").addEventListener("click", () => { location.hash = "#/group/new"; });
-  const cgr = $("#commit-global");
-  if (cgr) cgr.addEventListener("click", () => { location.hash = "#/commitments"; });
+  const cst = $("#commit-slide-toggle");
+  if (cst) cst.addEventListener("click", toggleCommitPanel);
+  const at = $("#arch-toggle");
+  if (at) at.addEventListener("click", () => {
+    state.archivedOpen = !state.archivedOpen;
+    try { localStorage.setItem("relay_archived_open", state.archivedOpen ? "1" : "0"); } catch { /* noop */ }
+    renderConversations();
+  });
+  if (state.commitPanelOpen) bindGlobalCommits(app, () => renderConversations());
   const qi = $("#q");
   qi.addEventListener("input", () => { state.search = qi.value; renderConversations(); const nq = $("#q"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
   $$(".conv-row", app).forEach((r) => r.addEventListener("click", () => { location.hash = "#/conversations/" + r.dataset.id; }));
@@ -1458,12 +1473,44 @@ function renderConversations(skipIfSame) {
 
 // ---------- global commitments view ----------
 
-function globalCommitRowHtml() {
+/** The commitments toggle row under the conversation search: slides the panel open/closed. */
+function commitToggleHtml() {
   const n = (state.globalCommits || []).length;
-  return `<button class="commit-global-row" id="commit-global" aria-label="Open commitments">
+  const open = !!state.commitPanelOpen;
+  return `<button class="commit-global-row commit-slide-toggle" id="commit-slide-toggle" aria-expanded="${open}" aria-controls="commit-slide" aria-label="Commitments, toggle panel">
     ${icon("check")}<span class="cgr-title">Commitments</span>
     ${n ? `<span class="ft-badge">${n}</span>` : `<span class="cgr-hint">none open</span>`}
+    <span class="fold-caret" aria-hidden="true">${open ? "▾" : "▸"}</span>
   </button>`;
+}
+
+/** The slide-down commitments panel beneath the conversation search (reuses the global UI). */
+function commitSlideHtml() {
+  const open = !!state.commitPanelOpen;
+  return `<div class="commit-slide${open ? " open" : ""}" id="commit-slide"><div class="cs-clip"><div class="cs-body">${open ? globalCommitsInnerHtml("cs-list") : ""}</div></div></div>`;
+}
+
+/** The archived-threads section: a foldable header, folded by default. */
+function archivedFoldHtml(arch, rowHtml) {
+  const open = !!state.archivedOpen;
+  return `<div class="arch-fold">
+    <button class="arch-head" id="arch-toggle" aria-expanded="${open}" aria-controls="arch-body">
+      <span class="fold-caret" aria-hidden="true">${open ? "▾" : "▸"}</span><span class="arch-title">Archived · ${arch.length}</span>
+    </button>
+    <div class="arch-body${open ? " open" : ""}" id="arch-body"><div class="arch-clip"${open ? "" : " inert"}>${arch.map(rowHtml).join("")}</div></div>
+  </div>`;
+}
+
+/** Slide the commitments panel open or closed; the choice survives reloads. */
+function toggleCommitPanel() {
+  state.commitPanelOpen = !state.commitPanelOpen;
+  try { localStorage.setItem("relay_commit_panel", state.commitPanelOpen ? "1" : "0"); } catch { /* noop */ }
+  renderConversations();
+  if (state.commitPanelOpen && !state._globalAll && !state._globalAllErr) {
+    ensureGlobalAll()
+      .then(() => { state._globalAllErr = false; renderConversations(); })
+      .catch(() => { state._globalAllErr = true; renderConversations(); });
+  }
 }
 
 function globalRowFor(kind, r) {
@@ -1480,38 +1527,68 @@ function globalRowFor(kind, r) {
   </div>`;
 }
 
-/** The searchable global Open | Decisions view. */
-async function renderGlobalCommits() {
-  state.globalCommitView = true;
+/** Fetch and cache the full commitments + decisions lists for the global views. */
+async function ensureGlobalAll() {
+  if (!state._globalAll) {
+    const [c, d] = await Promise.all([api("/api/commitments/all"), api("/api/decisions/all")]);
+    state._globalAll = { commitments: c.commitments || [], decisions: d.decisions || [] };
+  }
+  return state._globalAll;
+}
+
+/** The grouped Open list / Decisions list, rendered from the cached global data. */
+function globalCommitsItemsHtml() {
   const tab = state.globalCommitTab;
   const q = (state.globalCommitSearch || "").toLowerCase();
   const match = (r) => !q || (r.text || "").toLowerCase().includes(q) || (r.conversation_title || "").toLowerCase().includes(q);
   let items = [];
   if (tab === "open") {
-    try {
-      if (!state._globalAll) {
-        const [c, d] = await Promise.all([api("/api/commitments/all"), api("/api/decisions/all")]);
-        state._globalAll = { commitments: c.commitments || [], decisions: d.decisions || [] };
-      }
-      const g = groupCommitments(state._globalAll.commitments.filter(match));
-      const groups = [["overdue", "Overdue"], ["today", "Today"], ["week", "This week"], ["later", "Later"], ["nodate", "No date"]];
-      for (const [key, label] of groups) {
-        if (!g[key].length) continue;
-        items.push(`<div class="cm-group"><div class="cm-group-label${key === "overdue" ? " overdue" : ""}">${label} · ${g[key].length}</div>${g[key].map((r) => globalRowFor("commitment", r)).join("")}</div>`);
-      }
-    } catch { items = [`<div class="cm-empty"><p>Couldn't load commitments.</p></div>`]; }
+    const g = groupCommitments(state._globalAll.commitments.filter(match));
+    const groups = [["overdue", "Overdue"], ["today", "Today"], ["week", "This week"], ["later", "Later"], ["nodate", "No date"]];
+    for (const [key, label] of groups) {
+      if (!g[key].length) continue;
+      items.push(`<div class="cm-group"><div class="cm-group-label${key === "overdue" ? " overdue" : ""}">${label} · ${g[key].length}</div>${g[key].map((r) => globalRowFor("commitment", r)).join("")}</div>`);
+    }
   } else {
-    try {
-      if (!state._globalAll) {
-        const [c, d] = await Promise.all([api("/api/commitments/all"), api("/api/decisions/all")]);
-        state._globalAll = { commitments: c.commitments || [], decisions: d.decisions || [] };
-      }
-      const decs = state._globalAll.decisions.filter(match);
-      items = decs.length ? decs.map((r) => globalRowFor("decision", r))
-        : [`<div class="cm-empty">${icon("card", "big")}<p>No decisions logged yet.</p></div>`];
-    } catch { items = [`<div class="cm-empty"><p>Couldn't load decisions.</p></div>`]; }
+    const decs = state._globalAll.decisions.filter(match);
+    items = decs.length ? decs.map((r) => globalRowFor("decision", r))
+      : [`<div class="cm-empty">${icon("card", "big")}<p>No decisions logged yet.</p></div>`];
   }
-  const n = (state._globalAll && tab === "open") ? state._globalAll.commitments.length : (state._globalAll ? state._globalAll.decisions.length : 0);
+  return items.join("") || `<div class="cm-empty">${icon("check", "big")}<p>No open commitments.<br>Everything's handled — nice.</p></div>`;
+}
+
+/** Search + tabs + list, shared by the full-page global view and the slide-down panel. */
+function globalCommitsInnerHtml(listCls) {
+  const tab = state.globalCommitTab;
+  const n = state._globalAll ? (tab === "open" ? state._globalAll.commitments.length : state._globalAll.decisions.length) : 0;
+  const body = state._globalAll ? globalCommitsItemsHtml()
+    : (state._globalAllErr ? `<div class="cm-empty"><p>Couldn't load commitments.</p></div>`
+      : `<div class="cs-loading">Loading commitments…</div>`);
+  return `<div class="search-wrap"><div class="search-field">${icon("search")}<input id="gq" placeholder="Search commitments and decisions" value="${esc(state.globalCommitSearch || "")}"></div></div>
+    <div class="cm-tabs global-tabs" role="tablist">
+      <button class="cm-tab${tab === "open" ? " on" : ""}" data-gtab="open" role="tab" aria-selected="${tab === "open"}">Open${tab === "open" && n ? ` <span class="fp-count">${n}</span>` : ""}</button>
+      <button class="cm-tab${tab === "decisions" ? " on" : ""}" data-gtab="decisions" role="tab" aria-selected="${tab === "decisions"}">Decisions${tab === "decisions" && n ? ` <span class="fp-count">${n}</span>` : ""}</button>
+    </div>
+    <div class="${listCls}">${body}</div>`;
+}
+
+/** Bind search / tabs / row navigation inside a rendered global-commitments block. */
+function bindGlobalCommits(app, rerender) {
+  const gq = $("#gq");
+  if (gq) gq.addEventListener("input", () => { state.globalCommitSearch = gq.value; rerender(); const nq = $("#gq"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
+  $$("[data-gtab]", app).forEach((b) => b.addEventListener("click", () => { state.globalCommitTab = b.dataset.gtab; rerender(); }));
+  $$("[data-goto]", app).forEach((r) => {
+    const go = () => { state.globalCommitView = false; state._pendingPanel = "commit"; state._globalAll = null; location.hash = "#/conversations/" + r.dataset.goto; };
+    r.addEventListener("click", go);
+    r.addEventListener("keydown", (ev) => { if (ev.key === "Enter") go(); });
+  });
+}
+
+/** The searchable global Open | Decisions view. */
+async function renderGlobalCommits() {
+  state.globalCommitView = true;
+  try { await ensureGlobalAll(); state._globalAllErr = false; }
+  catch { state._globalAllErr = true; }
   const app = $("#app");
   app.innerHTML = `
     <div class="view">
@@ -1519,24 +1596,12 @@ async function renderGlobalCommits() {
         <button class="nav-back" id="gback">${icon("back")}Conversations</button>
         <div style="flex:1"><div class="nav-title small">Commitments</div></div>
       </div>
-      <div class="search-wrap"><div class="search-field">${icon("search")}<input id="gq" placeholder="Search commitments and decisions" value="${esc(state.globalCommitSearch || "")}"></div></div>
-      <div class="cm-tabs global-tabs" role="tablist">
-        <button class="cm-tab${tab === "open" ? " on" : ""}" data-gtab="open" role="tab" aria-selected="${tab === "open"}">Open${tab === "open" && n ? ` <span class="fp-count">${n}</span>` : ""}</button>
-        <button class="cm-tab${tab === "decisions" ? " on" : ""}" data-gtab="decisions" role="tab" aria-selected="${tab === "decisions"}">Decisions${tab === "decisions" && n ? ` <span class="fp-count">${n}</span>` : ""}</button>
-      </div>
-      <div class="scroll cm-global-list">${items.join("") || `<div class="cm-empty">${icon("check", "big")}<p>No open commitments.<br>Everything's handled — nice.</p></div>`}</div>
+      ${globalCommitsInnerHtml("scroll cm-global-list")}
       ${tabBar("conversations")}
     </div>`;
   bindTabs(app);
   $("#gback").addEventListener("click", () => { state.globalCommitView = false; location.hash = "#/conversations"; });
-  const gq = $("#gq");
-  gq.addEventListener("input", () => { state.globalCommitSearch = gq.value; renderGlobalCommits(); const nq = $("#gq"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
-  $$("[data-gtab]", app).forEach((b) => b.addEventListener("click", () => { state.globalCommitTab = b.dataset.gtab; renderGlobalCommits(); }));
-  $$("[data-goto]", app).forEach((r) => {
-    const go = () => { state.globalCommitView = false; state._pendingPanel = "commit"; state._globalAll = null; location.hash = "#/conversations/" + r.dataset.goto; };
-    r.addEventListener("click", go);
-    r.addEventListener("keydown", (ev) => { if (ev.key === "Enter") go(); });
-  });
+  bindGlobalCommits(app, () => renderGlobalCommits());
 }
 
 // ---------- message view ----------

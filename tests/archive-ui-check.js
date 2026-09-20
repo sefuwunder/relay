@@ -8,8 +8,9 @@ const pub = path.join(__dirname, "..", "public");
 
 function stubEl(id) {
   const el = {
-    id: id || "", innerHTML: "", textContent: "", value: "", className: "", style: {},
+    id: id || "", textContent: "", value: "", className: "", style: {},
     checked: false, dataset: {}, files: [], scrollTop: 0, scrollHeight: 0, clientHeight: 0,
+    _html: "",
     _l: {},
     addEventListener(t, fn) { (this._l[t] = this._l[t] || []).push(fn); },
     removeEventListener() {}, remove() {},
@@ -19,6 +20,15 @@ function stubEl(id) {
     focus() {}, click() {}, setAttribute() {},
     fire(t, e) { (this._l[t] || []).forEach((fn) => fn(e || {})); },
   };
+  // Emulate DOM node replacement: setting #app's innerHTML discards the old
+  // subtree, so cached selector stubs from the previous render go stale.
+  Object.defineProperty(el, "innerHTML", {
+    get() { return this._html; },
+    set(v) {
+      this._html = String(v);
+      if (id === "app") { for (const k of Object.keys(selCache)) delete selCache[k]; }
+    },
+  });
   return el;
 }
 const store = {};
@@ -85,10 +95,21 @@ function ok(name, cond) { if (cond) { pass++; } else { fail++; console.log("FAIL
   ok("loadConversations keeps active and archived lists separate",
     state.conversations.length === 1 && state.archivedConversations.length === 1);
   A.renderConversations();
+  const folded = document.getElementById("app").innerHTML;
+  ok("archived section starts folded", folded.includes('id="arch-toggle"') && folded.includes('aria-expanded="false"'));
+  ok("folded section still shows the count", folded.includes("Archived · 1"));
+  ok("folded archived rows are inert", folded.includes('class="arch-clip" inert'));
+  ok("active conversation still renders", folded.includes("Alma"));
+  document.querySelector("#arch-toggle").fire("click");
   const html = document.getElementById("app").innerHTML;
   ok("list shows an Archived section with the count", html.includes("Archived · 1"));
-  ok("archived conversation renders as a row", html.includes('data-id="c2"') && html.includes("Old group"));
-  ok("active conversation still renders", html.includes("Alma"));
+  ok("expanding the fold reveals archived rows", html.includes('data-id="c2"') && html.includes("Old group") && html.includes('class="arch-body open"'));
+  ok("expanded archived rows are no longer inert", !html.includes('arch-clip" inert'));
+  ok("fold-open persists to localStorage", localStorage.getItem("relay_archived_open") === "1");
+  document.querySelector("#arch-toggle").fire("click");
+  const refolded = document.getElementById("app").innerHTML;
+  ok("folding again collapses the section", refolded.includes('aria-expanded="false"') && refolded.includes('class="arch-clip" inert'));
+  ok("fold-closed persists to localStorage", localStorage.getItem("relay_archived_open") === "0");
 
   // --- list: search covers the archived section too ---
   state.search = "old group";
