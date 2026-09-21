@@ -37,13 +37,15 @@ const state = {
   commitments: [],     // open commitments in the open conversation (cached)
   commitSuggestions: [], // pending suggestions in the open conversation (cached)
   decisions: [],       // decisions in the open conversation (cached)
-  globalCommits: [],   // open commitments across conversations (cached for the global row)
   globalCommitView: false, // the global commitments view is showing
   globalCommitTab: "open", // global view tab: "open" | "decisions"
   globalCommitSearch: "",
   archivedOpen: (() => { try { return localStorage.getItem("relay_archived_open") === "1"; } catch { return false; } })(), // archived threads start folded
-  commitPanelOpen: (() => { try { return localStorage.getItem("relay_commit_panel") === "1"; } catch { return false; } })(), // slide-down commitments under the conversation search
   _globalAllErr: false, // last global commitments fetch failed
+  _commitSearch: null,  // { q, loading, err, commitments, decisions } — cached conversation-search matches
+  _commitSearchTimer: 0, // debounce timer for the commitments/decisions search
+  _commitSearchToken: 0, // invalidates stale in-flight search fetches
+  _pendingMsg: null,    // message id to scroll to after opening a conversation
   commitNudges: (() => { try { return localStorage.getItem("relay_commit_nudges") !== "0"; } catch { return true; } })(),
   _nudgeSeen: {},      // "commitId@YYYY-MM-DD" already notified this session
   _commitMenu: null,   // open message context menu element
@@ -1289,9 +1291,6 @@ async function pollConversations() {
   checkNotifications(prev);
   updateTitle();
   checkCommitNudges().catch(() => {});
-  // Keep the global-row badge fresh; a single small query, awaited so the
-  // first render already shows the current count.
-  await refreshGlobalCommits().catch(() => {});
 }
 
 /**
@@ -1479,11 +1478,8 @@ function renderConversations(skipIfSame) {
   // The 15s timer re-renders this view; skip the rewrite (and its entrance
   // animation) when nothing on screen would change.
   const sig = q + "|" + list.map((c) => [c.id, c.last_at, c.unread, c.last_body, c.title].join("~")).join("|")
-    + "|arch|" + (state.archivedOpen ? "1" : "0") + "|" + arch.map((c) => [c.id, c.last_at, c.unread, c.title].join("~")).join("|")
-    + (state.commitPanelOpen && state._globalAll
-      ? "|cm|" + state._globalAll.commitments.map((c) => [c.id, c.status, c.due_date, c.text].join("~")).join("|")
-        + "|dc|" + state._globalAll.decisions.map((d) => [d.id, d.text].join("~")).join("|")
-      : "|cm-|");
+    + "|arch|" + (state.archivedOpen ? "1" : "0") + "|" + arch.map((c) => [c.id, c.last_at, c.unread, c.title].join("|")).join("|")
+    + commitSearchSig();
   if (skipIfSame && sig === state.convListSig) return;
   state.convListSig = sig;
   const rowHtml = (c) => `
@@ -1504,48 +1500,121 @@ function renderConversations(skipIfSame) {
       <div class="nav-bar"><div class="nav-title">Conversations</div>
         <button class="nav-action" id="new-group">${icon("plus")}Group</button></div>
       <div class="search-wrap"><div class="search-field">${icon("search")}<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
-      ${commitToggleHtml()}
-      ${commitSlideHtml()}
       <div class="scroll">
         ${list.length ? list.map(rowHtml).join("")
         : `<div class="empty">${icon("burst", "big")}<h3>No conversations yet</h3><p>Your inner circle lives here.<br>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
+        ${commitSearchSectionHtml()}
         ${arch.length ? archivedFoldHtml(arch, rowHtml) : ""}
       </div>
       ${tabBar("conversations")}
     </div>`;
   bindTabs(app);
   $("#new-group").addEventListener("click", () => { location.hash = "#/group/new"; });
-  const cst = $("#commit-slide-toggle");
-  if (cst) cst.addEventListener("click", toggleCommitPanel);
   const at = $("#arch-toggle");
   if (at) at.addEventListener("click", () => {
     state.archivedOpen = !state.archivedOpen;
     try { localStorage.setItem("relay_archived_open", state.archivedOpen ? "1" : "0"); } catch { /* noop */ }
     renderConversations();
   });
-  if (state.commitPanelOpen) bindGlobalCommits(app, () => renderConversations());
+  bindCommitSearchRows(app);
   const qi = $("#q");
-  qi.addEventListener("input", () => { state.search = qi.value; renderConversations(); const nq = $("#q"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
+  qi.addEventListener("input", () => { state.search = qi.value; scheduleCommitSearch(); renderConversations(); const nq = $("#q"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
   $$(".conv-row", app).forEach((r) => r.addEventListener("click", () => { location.hash = "#/conversations/" + r.dataset.id; }));
 }
 
-// ---------- global commitments view ----------
+// ---------- commitments & decisions in the conversation search ----------
 
-/** The commitments toggle row under the conversation search: slides the panel open/closed. */
-function commitToggleHtml() {
-  const n = (state.globalCommits || []).length;
-  const open = !!state.commitPanelOpen;
-  return `<button class="commit-global-row commit-slide-toggle" id="commit-slide-toggle" aria-expanded="${open}" aria-controls="commit-slide" aria-label="Commitments, toggle panel">
-    ${icon("check")}<span class="cgr-title">Commitments</span>
-    ${n ? `<span class="ft-badge">${n}</span>` : `<span class="cgr-hint">none open</span>`}
-    <span class="fold-caret" aria-hidden="true">${open ? "▾" : "▸"}</span>
-  </button>`;
+/** Debounced fetch of commitments + decisions matching the conversation search
+ *  query. Results are cached per query so the 15s poller never refetches;
+ *  an empty/short query fetches nothing at all. */
+function scheduleCommitSearch() {
+  const q = state.search.trim();
+  if (state._commitSearch && state._commitSearch.q === q) return; // cached
+  if (state._commitSearchTimer) { clearTimeout(state._commitSearchTimer); state._commitSearchTimer = 0; }
+  if (q.length < 2) { state._commitSearch = null; return; }
+  state._commitSearchTimer = setTimeout(() => {
+    state._commitSearchTimer = 0;
+    fetchCommitSearch(q);
+  }, 250);
 }
 
-/** The slide-down commitments panel beneath the conversation search (reuses the global UI). */
-function commitSlideHtml() {
-  const open = !!state.commitPanelOpen;
-  return `<div class="commit-slide${open ? " open" : ""}" id="commit-slide"><div class="cs-clip"><div class="cs-body">${open ? globalCommitsInnerHtml("cs-list") : ""}</div></div></div>`;
+async function fetchCommitSearch(q) {
+  const token = ++state._commitSearchToken;
+  state._commitSearch = { q, loading: true };
+  renderConversations();
+  try {
+    const [c, d] = await Promise.all([
+      api("/api/commitments/all?q=" + encodeURIComponent(q) + "&include_archived=1"),
+      api("/api/decisions/all?q=" + encodeURIComponent(q) + "&include_archived=1"),
+    ]);
+    if (state._commitSearchToken !== token || state.search.trim() !== q) return; // stale
+    state._commitSearch = { q, loading: false, commitments: c.commitments || [], decisions: d.decisions || [] };
+  } catch {
+    if (state._commitSearchToken !== token) return;
+    state._commitSearch = { q, loading: false, err: true };
+  }
+  if ((location.hash || "#/conversations") === "#/conversations") renderConversations();
+}
+
+/** Signature bits for the cached search section, so the 15s poller keeps it. */
+function commitSearchSig() {
+  const s = state._commitSearch;
+  if (!s) return "|cs-|";
+  const rows = (s.commitments || []).map((c) => ["c", c.id, c.status, c.due_date, c.text].join("~"))
+    .concat((s.decisions || []).map((d) => ["d", d.id, d.text, d.decided_at].join("~")));
+  return "|cs|" + s.q + "|" + (s.loading ? "loading" : s.err ? "err" : "") + "|" + rows.join("|");
+}
+
+/** The "Commitments & decisions" section under the conversation results. */
+function commitSearchSectionHtml() {
+  const s = state._commitSearch;
+  if (!s) return "";
+  const rows = (s.commitments || []).map((c) => globalRowFor("commitment", c, { panel: null }))
+    .concat((s.decisions || []).map((d) => globalRowFor("decision", d, { panel: null })));
+  const n = rows.length;
+  const body = s.loading ? `<div class="csq-empty">Searching commitments &amp; decisions…</div>`
+    : s.err ? `<div class="csq-empty">Couldn't search commitments &amp; decisions.</div>`
+    : n ? rows.join("")
+    : `<div class="csq-empty">No commitments or decisions match.</div>`;
+  return `<div class="csq-section">
+    <div class="csq-head"><span class="csq-label">Commitments &amp; decisions${n && !s.loading && !s.err ? ` · ${n}` : ""}</span><a class="csq-all" href="#/commitments">View all</a></div>
+    <div class="csq-rows">${body}</div>
+  </div>`;
+}
+
+/** Wire row navigation inside the search section (no tabs/search of its own). */
+function bindCommitSearchRows(app) {
+  bindGotoRows(app);
+}
+
+/** Row click → open the conversation; scroll to the source message when known. */
+function bindGotoRows(app) {
+  $$("[data-goto]", app).forEach((r) => {
+    const go = () => {
+      state.globalCommitView = false;
+      state._globalAll = null;
+      if (r.dataset.panel) state._pendingPanel = r.dataset.panel;
+      if (r.dataset.msg) state._pendingMsg = r.dataset.msg;
+      location.hash = "#/conversations/" + r.dataset.goto;
+    };
+    r.addEventListener("click", go);
+    r.addEventListener("keydown", (ev) => { if (ev.key === "Enter") go(); });
+  });
+}
+
+/** After a conversation opens from a search row, scroll to the source message. */
+function scrollToPendingMessage() {
+  const mid = state._pendingMsg;
+  state._pendingMsg = null;
+  if (!mid) return;
+  const nodes = document.querySelectorAll('#msgs [data-mid]');
+  for (const n of nodes) {
+    if (n.getAttribute && n.getAttribute("data-mid") === mid) {
+      try { n.scrollIntoView({ block: "center" }); } catch { /* noop */ }
+      try { n.classList.add("msg-flash"); setTimeout(() => n.classList.remove("msg-flash"), 1600); } catch { /* noop */ }
+      break;
+    }
+  }
 }
 
 /** The archived-threads section: a foldable header, folded by default. */
@@ -1559,27 +1628,27 @@ function archivedFoldHtml(arch, rowHtml) {
   </div>`;
 }
 
-/** Slide the commitments panel open or closed; the choice survives reloads. */
-function toggleCommitPanel() {
-  state.commitPanelOpen = !state.commitPanelOpen;
-  try { localStorage.setItem("relay_commit_panel", state.commitPanelOpen ? "1" : "0"); } catch { /* noop */ }
-  renderConversations();
-  if (state.commitPanelOpen && !state._globalAll && !state._globalAllErr) {
-    ensureGlobalAll()
-      .then(() => { state._globalAllErr = false; renderConversations(); })
-      .catch(() => { state._globalAllErr = true; renderConversations(); });
-  }
+/** Resolve decision participant ids to display names via the conversation's members. */
+function decisionNames(r, conv) {
+  let parts = [];
+  try { parts = JSON.parse(r.participants || "[]"); } catch { parts = []; }
+  const members = (conv && conv.members) || [];
+  return parts.map((id) => id === "me" ? "You"
+    : ((members.find((x) => String(x.id) === String(id)) || {}).name || "Someone"));
 }
 
-function globalRowFor(kind, r) {
+function globalRowFor(kind, r, opts) {
   const conv = (state.conversations || []).find((c) => String(c.id) === String(r.conversation_id));
   const cname = r.conversation_title || (conv ? conv.title : "");
+  const panelAttr = opts && opts.panel === null ? "" : "commit";
   const when = kind === "commitment" ? fmtDue(r) : (r.decided_at ? new Date(r.decided_at).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "");
   const overdue = kind === "commitment" && r.due_date && r.due_date < clientDay(0);
-  return `<div class="cm-item${overdue ? " overdue" : ""}" data-goto="${r.conversation_id}" data-panel="${kind === "decision" ? "commit" : "commit"}" role="button" tabindex="0" title="Open conversation">
+  const owner = kind === "decision" ? (decisionNames(r, conv).join(", ") || "You") : cname;
+  return `<div class="cm-item${overdue ? " overdue" : ""}" data-goto="${r.conversation_id}" data-panel="${panelAttr}" data-msg="${esc(r.message_id || "")}" role="button" tabindex="0" title="Open conversation">
+    <span class="cm-kind">${icon(kind === "commitment" ? "check" : "scales")}</span>
     <div class="cm-body">
       <div class="cm-text">${esc(r.text)}</div>
-      <div class="cm-meta"><span class="cm-owner">${esc(cname)}</span>${when ? `<span class="cm-due${overdue ? " overdue" : ""}">${kind === "commitment" ? icon("clock") : ""}${esc(when)}</span>` : ""}</div>
+      <div class="cm-meta">${kind === "decision" ? `<span class="cm-owner">${esc(owner)}</span><span class="cm-owner">${esc(cname)}</span>` : `<span class="cm-owner">${esc(cname)}</span>`}${r.archived ? `<span class="arch-badge" title="Archived conversation">${icon("box")}</span>` : ""}${when ? `<span class="cm-due${overdue ? " overdue" : ""}">${kind === "commitment" ? icon("clock") : ""}${esc(when)}</span>` : ""}</div>
     </div>
     ${icon("chevR")}
   </div>`;
@@ -1635,11 +1704,7 @@ function bindGlobalCommits(app, rerender) {
   const gq = $("#gq");
   if (gq) gq.addEventListener("input", () => { state.globalCommitSearch = gq.value; rerender(); const nq = $("#gq"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
   $$("[data-gtab]", app).forEach((b) => b.addEventListener("click", () => { state.globalCommitTab = b.dataset.gtab; rerender(); }));
-  $$("[data-goto]", app).forEach((r) => {
-    const go = () => { state.globalCommitView = false; state._pendingPanel = "commit"; state._globalAll = null; location.hash = "#/conversations/" + r.dataset.goto; };
-    r.addEventListener("click", go);
-    r.addEventListener("keydown", (ev) => { if (ev.key === "Enter") go(); });
-  });
+  bindGotoRows(app);
 }
 
 /** The searchable global Open | Decisions view. */
@@ -2032,17 +2097,7 @@ async function refreshCommitData() {
     state.commitments = c.commitments || [];
     state.commitSuggestions = s.suggestions || [];
     state.decisions = d.decisions || [];
-    // Any commit mutation can change the global-row badge; refresh it too.
-    await refreshGlobalCommits().catch(() => {});
   } catch { state.commitments = []; state.commitSuggestions = []; state.decisions = []; }
-}
-
-/** Refresh the global open-commitment list (global row badge + global view). */
-async function refreshGlobalCommits() {
-  try {
-    const r = await api("/api/commitments/all");
-    state.globalCommits = r.commitments || [];
-  } catch { state.globalCommits = []; }
 }
 
 function openCommitCount() {
@@ -3655,6 +3710,7 @@ async function route() {
     if (parts[0] === "conversations" && parts[1]) {
       await loadConversation(parts[1]);
       renderConversationDetail();
+      scrollToPendingMessage();
       state.timer = setInterval(refreshConversation, 10000);
     } else if (parts[0] === "conversations") {
       state.globalCommitView = false;

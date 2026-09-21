@@ -64,9 +64,12 @@ const fetchCalls = [];
 global.fetch = async (url, opts) => {
   fetchCalls.push({ url: String(url), opts: opts || {} });
   const u = String(url);
+  const qm = u.match(/[?&]q=([^&]*)/);
+  const qq = qm ? decodeURIComponent(qm[1]).toLowerCase() : "";
+  const qkeep = (r) => !qq || (r.text || "").toLowerCase().includes(qq);
   if (u.includes("/api/commitments/due")) return { ok: true, json: async () => ({ commitments: dueList }) };
-  if (u.includes("/api/commitments/all")) return { ok: true, json: async () => ({ commitments: allCommits }) };
-  if (u.includes("/api/decisions/all")) return { ok: true, json: async () => ({ decisions: allDecisions }) };
+  if (u.includes("/api/commitments/all")) return { ok: true, json: async () => ({ commitments: allCommits.filter(qkeep) }) };
+  if (u.includes("/api/decisions/all")) return { ok: true, json: async () => ({ decisions: allDecisions.filter(qkeep) }) };
   if (u.includes("/commitments?status=open")) return { ok: true, json: async () => ({ commitments: [] }) };
   if (u.includes("/suggestions")) return { ok: true, json: async () => ({ suggestions: [] }) };
   if (u.includes("/decisions")) return { ok: true, json: async () => ({ decisions: [] }) };
@@ -83,8 +86,9 @@ load("dates.js", "\n;globalThis.RelayDates = RelayDates;");
 load("app.js", `\n;globalThis.__APP__ = { state, renderConversationDetail, renderConversations,
   commitPanelHtml, groupCommitments, clientDay, openCommitMenu, closeCommitMenu,
   openCommitEditor, saveCommitEditor, keepSuggestion, dropSuggestion, setCommitStatus,
-  renderGlobalCommits, checkCommitNudges, refreshCommitData, refreshGlobalCommits,
-  commitToggleHtml, openCommitCount };`);
+  renderGlobalCommits, checkCommitNudges, refreshCommitData, scheduleCommitSearch,
+  fetchCommitSearch, commitSearchSectionHtml, bindGotoRows, scrollToPendingMessage,
+  globalRowFor, openCommitCount };`);
 const A = globalThis.__APP__;
 const { state } = A;
 
@@ -105,8 +109,10 @@ function resetState() {
   state.seenMsgIds = new Set();
   state.panel = null; state.commitTab = "open"; state.files = []; state.diary = [];
   state.pendingFiles = []; state.commitments = []; state.commitSuggestions = []; state.decisions = [];
-  state.globalCommits = []; state.globalCommitView = false; state._globalAll = null;
-  state._globalAllErr = false; state.archivedOpen = false; state.commitPanelOpen = false;
+  state.globalCommitView = false; state._globalAll = null;
+  state._globalAllErr = false; state.archivedOpen = false;
+  state._commitSearch = null; state._commitSearchTimer = 0; state._commitSearchToken = 0;
+  state._pendingMsg = null;
   state._nudgeSeen = {}; state.commitNudges = true; state.notify = true; state.sound = false;
   state.search = ""; state.globalCommitSearch = ""; state.globalCommitTab = "open";
   fetchCalls.length = 0; notifs.length = 0;
@@ -292,16 +298,91 @@ resetState();
   ok("global decisions tab", dhtml.includes("Launch Tuesday"));
 }
 
-// ---------- conversations list: global row ----------
+// ---------- conversations list: commitments & decisions search ----------
+// (setTimeout runs synchronously in this harness, so the 250ms debounce fires immediately.)
+const flushSearch = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
 resetState();
 {
-  state.globalCommits = [{ id: "k1", text: "x" }, { id: "k2", text: "y" }];
+  allCommits = [{ id: "k1", text: "Send the contract", conversation_id: "c1", conversation_title: "Danyetta", status: "open", due_date: "", message_id: "m1" }];
+  allDecisions = [{ id: "d1", text: "Unrelated call", conversation_id: "c1", conversation_title: "Danyetta", decided_at: "2026-09-19T10:00:00", participants: '["me"]', message_id: "m3" }];
   state.conversations = [conv()];
   state.archivedConversations = [];
+  state.search = "contract";
+  A.scheduleCommitSearch();
+  await flushSearch();
+  const html = document.getElementById("app").innerHTML;
+  ok("search triggers one fetch per endpoint", fetchCalls.filter((c) => c.url.includes("/api/commitments/all")).length === 1
+    && fetchCalls.filter((c) => c.url.includes("/api/decisions/all")).length === 1);
+  ok("search section renders below the conversation results", html.includes("csq-section") && html.indexOf("No conversations yet") < html.indexOf("csq-section"));
+  ok("section labels + counts the matches", html.includes("Commitments &amp; decisions · 1"));
+  ok("matching commitment row renders with deep-link + anchor", html.includes("Send the contract") && html.includes('data-goto="c1"') && html.includes('data-msg="m1"'));
+  ok("View all links to the full commitments view", html.includes('href="#/commitments"'));
+}
+resetState();
+{
+  allCommits = [];
+  allDecisions = [{ id: "d1", text: "Launch Tuesday", conversation_id: "c1", conversation_title: "Danyetta", decided_at: "2026-09-19T10:00:00", participants: '["me"]', message_id: "m3" }];
+  state.conversations = [conv()];
+  state.archivedConversations = [];
+  state.search = "launch";
+  A.scheduleCommitSearch();
+  await flushSearch();
+  const html = document.getElementById("app").innerHTML;
+  ok("matching decision row renders", html.includes("Launch Tuesday"));
+  ok("decision row shows participant names", html.includes(">You<"));
+}
+resetState();
+{
+  allCommits = [{ id: "k1", text: "Send the contract", conversation_id: "c1", status: "open", message_id: "m1" }];
+  allDecisions = [];
+  state.conversations = [conv()];
+  state.archivedConversations = [];
+  state.search = "zzz-no-match";
+  A.scheduleCommitSearch();
+  await flushSearch();
+  const html = document.getElementById("app").innerHTML;
+  ok("no-match query shows the one-line empty state", html.includes("csq-section") && html.includes("No commitments or decisions match."));
+}
+resetState();
+{
+  state.conversations = [conv()];
+  state.archivedConversations = [];
+  state.search = "";
+  A.scheduleCommitSearch();
   A.renderConversations();
   const html = document.getElementById("app").innerHTML;
-  ok("global toggle above list", html.includes('id="commit-slide-toggle"'));
-  ok("global toggle shows badge", html.includes("ft-badge"));
+  ok("empty query renders no search section", !html.includes("csq-section"));
+  ok("empty query issues no /all fetches", !fetchCalls.some((c) => c.url.includes("/api/commitments/all") || c.url.includes("/api/decisions/all")));
+}
+resetState();
+{
+  // Archived conversations' rows carry the archive badge.
+  allCommits = [{ id: "k2", text: "Book the venue", conversation_id: "c2", conversation_title: "Old group", status: "open", archived: 1, message_id: "m2" }];
+  allDecisions = [];
+  state.conversations = [conv()];
+  state.archivedConversations = [];
+  state.search = "venue";
+  A.scheduleCommitSearch();
+  await flushSearch();
+  const html = document.getElementById("app").innerHTML;
+  ok("archived row flagged with the archive badge", html.includes("Book the venue") && html.includes("arch-badge"));
+}
+resetState();
+{
+  state.conversations = [conv()];
+  state.archivedConversations = [];
+  const app = document.getElementById("app");
+  const listeners = {};
+  const fakeRow = { dataset: { goto: "c1", msg: "m9", panel: "" }, addEventListener(t, fn) { listeners[t] = fn; } };
+  const orig = app.querySelectorAll;
+  app.querySelectorAll = () => [fakeRow];
+  A.bindGotoRows(app);
+  app.querySelectorAll = orig;
+  listeners.click();
+  ok("search row click deep-links to the conversation", global.location.hash === "#/conversations/c1");
+  ok("search row click anchors the source message", A.state._pendingMsg === "m9");
+  listeners.keydown({ key: "Enter" });
+  ok("Enter key on a row navigates too", global.location.hash === "#/conversations/c1");
 }
 
 // ---------- nudges ----------
@@ -375,22 +456,20 @@ freezeAt(12);
 }
 unfreeze();
 
-// ---------- global badge + cache invalidation ----------
+// ---------- search-section cache: same query doesn't refetch ----------
 resetState();
 {
-  allCommits = [{ id: "k1", text: "One", status: "open" }, { id: "k2", text: "Two", status: "open" }];
-  await A.refreshGlobalCommits();
-  ok("refreshGlobalCommits caches the list", state.globalCommits.length === 2);
-  const row = A.commitToggleHtml();
-  ok("global toggle shows the open count", />2</.test(row) || row.includes(">2<"));
-}
-resetState();
-{
-  // CRUD funnels through refreshCommitData, which must also refresh the
-  // global cache so the row badge never goes stale.
-  allCommits = [{ id: "k9", text: "Fresh", status: "open" }];
-  await A.refreshCommitData();
-  ok("refreshCommitData invalidates the global cache", state.globalCommits.length === 1 && state.globalCommits[0].id === "k9");
+  allCommits = [{ id: "k1", text: "Send the contract", conversation_id: "c1", status: "open", message_id: "m1" }];
+  allDecisions = [];
+  state.conversations = [conv()];
+  state.archivedConversations = [];
+  state.search = "contract";
+  A.scheduleCommitSearch();
+  await flushSearch();
+  const n = fetchCalls.length;
+  A.scheduleCommitSearch();
+  await flushSearch();
+  ok("repeat query is served from the cache", fetchCalls.length === n);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -740,11 +740,6 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
 .ce-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 400; background: var(--field); border: 1px solid var(--hairline); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
 
 /* global commitments row + view */
-.commit-global-row { display: flex; align-items: center; gap: 10px; width: 100%; border: none; background: var(--card); border-bottom: 1px solid var(--hairline); padding: 12px 16px; font: inherit; font-size: 14px; font-weight: 600; color: var(--label); cursor: pointer; text-align: left; }
-.commit-global-row .ic { width: 18px; height: 18px; color: var(--blue-deep); }
-.commit-global-row .ft-badge { margin-left: auto; }
-.cgr-title { flex: 1; }
-.cgr-hint { font-size: 12px; font-weight: 400; color: var(--label-3); }
 .global-tabs { padding: 10px 16px 0; }
 .cm-global-list { padding: 12px 16px calc(84px + env(safe-area-inset-bottom)); }
 .cm-global-list .cm-item { cursor: pointer; align-items: center; }
@@ -802,23 +797,31 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
   .cal-badges { align-items: flex-start; }
 }
 
-/* ---------- archived fold + commitments slide-down ---------- */
+/* ---------- archived fold + commitments/decisions search section ---------- */
 .arch-head { display: flex; align-items: center; gap: 8px; margin: 18px 16px 6px; padding: 2px 0; background: none; border: none; font: inherit; font-size: 13px; font-weight: 600; color: var(--label-3); text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; text-align: left; }
 .arch-head:active { opacity: 0.6; }
 .fold-caret { display: inline-block; width: 14px; flex: none; font-size: 10px; color: var(--label-3); }
 .arch-body { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.22s ease; }
 .arch-body.open { grid-template-rows: 1fr; }
 .arch-clip { overflow: hidden; min-height: 0; }
-.commit-slide-toggle .fold-caret { margin-left: 2px; }
-/* The global-row badge is absolutely positioned for the tab-bar row; inside the
-   slide toggle it should flow inline with the title instead of floating away. */
-.commit-slide-toggle { position: relative; }
-.commit-slide-toggle .ft-badge { position: static; margin-left: auto; }
-.commit-slide { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.22s ease; background: var(--card); }
-.commit-slide.open { grid-template-rows: 1fr; border-bottom: 1px solid var(--hairline); }
-.cs-clip { overflow: hidden; min-height: 0; }
-.cs-loading { padding: 20px 16px; text-align: center; color: var(--label-3); font-size: 14px; }
-.cs-list { max-height: 44vh; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 2px 16px 14px; }
+/* Commitments & decisions section inside the conversation search results. */
+.csq-section { margin: 14px 16px 6px; }
+.csq-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 0 8px; }
+.csq-label { font-size: 13px; font-weight: 600; color: var(--label-3); text-transform: uppercase; letter-spacing: 0.5px; }
+.csq-all { font-size: 13px; font-weight: 600; color: var(--blue-deep); text-decoration: none; }
+.csq-all:active { opacity: 0.6; }
+.csq-rows .cm-item { cursor: pointer; align-items: center; margin-bottom: 8px; }
+.csq-empty { padding: 14px 4px; font-size: 13px; color: var(--label-3); }
+.cm-kind { flex: none; width: 18px; height: 18px; color: var(--label-3); margin-right: 2px; }
+.cm-kind .ic { width: 18px; height: 18px; }
+.cm-meta .arch-badge { margin-left: 6px; }
+/* Flash highlight when jumping to a message from a search result. */
+.msg-flash { animation: msg-flash 1.6s ease; }
+@keyframes msg-flash { 0%, 40% { background: rgba(181,84,63,0.16); border-radius: 14px; } 100% { background: transparent; } }
+@media (prefers-color-scheme: dark) {
+  @keyframes msg-flash { 0%, 40% { background: rgba(217,138,111,0.22); border-radius: 14px; } 100% { background: transparent; } }
+}
 @media (prefers-reduced-motion: reduce) {
-  .arch-body, .commit-slide { transition: none; }
+  .arch-body { transition: none; }
+  .msg-flash { animation: none; }
 }

@@ -57,6 +57,11 @@ const ICONS = {
     '<path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"/>',
   check:
     '<path d="M4.5 12.5l5.5 5.5L19.5 6.5" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>',
+  scales:
+    '<path d="M12 4v16M8 20h8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>' +
+    '<path d="M5 6.5h14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>' +
+    '<path d="M5 6.5L2.8 13h4.4L5 6.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>' +
+    '<path d="M19 6.5l-2.2 6.5h4.4L19 6.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>',
   box:
     '<rect x="4" y="9" width="16" height="11" rx="1.5" fill="currentColor"/>' +
     '<rect x="2.5" y="4.5" width="19" height="4.5" rx="1.5" fill="currentColor"/>' +
