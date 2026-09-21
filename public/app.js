@@ -14,6 +14,7 @@ const CHAN_META = {
   email: { label: "Email", ic: "email" },
   sms: { label: "SMS", ic: "sms" },
   matrix: { label: "Matrix", ic: "matrix" },
+  agent: { label: "AI agent", ic: "burst" },
 };
 
 const state = {
@@ -2602,6 +2603,8 @@ function renderConversationDetail() {
   const keepSubj = $("#subject") ? $("#subject").value : "";
   const ch = selectedChannel();
   const memberNames = conv.members.map((m) => m.name).join(", ");
+  const isAgent = (conv.members || []).some((m) => m.kind === "agent");
+  const agentMember = isAgent ? conv.members.find((m) => m.kind === "agent") : null;
   const app = $("#app");
 
   let body = "";
@@ -2637,7 +2640,7 @@ function renderConversationDetail() {
             ${avatarHtml(conv.title, conv.is_group ? "#8e8e93" : (conv.members[0]?.color || "#8e8e93"), 48, conv.is_group, conv.is_group ? null : conv.members[0]?.avatar_url)}
             <div style="flex:1;min-width:0">
               <div class="nav-title small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(conv.title)}</div>
-              <div style="font-size:12px;color:var(--label-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(memberNames)}${conv.is_group ? " · " + (conv.members.length + 1) + "/8" : ""}</div>
+              <div style="font-size:12px;color:var(--label-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(memberNames)}${conv.is_group ? " · " + (conv.members.length + 1) + "/8" : ""}${isAgent ? ` <span class="agent-badge">${icon("burst")}AI agent</span>` : ""}</div>
             </div>
             <button class="nav-action diary-toggle${state.panel === "diary" ? " on" : ""}" id="diary-toggle" aria-label="Appointment diary" title="Appointment diary">${icon("calendar")}${diaryWeekAppts().length ? `<span class="ft-badge">${diaryWeekAppts().length}</span>` : ""}</button>
             <button class="nav-action files-toggle${state.panel === "files" ? " on" : ""}" id="files-toggle" aria-label="Shared files" title="Shared files">${icon("files")}${state.files.length ? `<span class="ft-badge">${state.files.length}</span>` : ""}</button>
@@ -2647,20 +2650,21 @@ function renderConversationDetail() {
           </div>
           <div class="msg-scroll" id="msgs">${body || `<div class="empty">${icon("send", "big")}<h3>Start the conversation</h3><p>Pick a channel below and send the first message.</p></div>`}</div>
           <div class="chan-bar">
-            ${conv.channels.length ? `
+            ${isAgent ? `<div class="chan-hint">${icon("burst")}Chatting 1:1 with your AI agent.</div>`
+            : conv.channels.length ? `
               <div class="seg" id="seg">${conv.channels.map((c) =>
                 `<button data-ch="${c}" class="${c === ch ? "on" : ""}">${icon(CHAN_META[c].ic)}${CHAN_META[c].label}</button>`).join("")}</div>
               ${hints.length ? `<div class="chan-hint">${hints.join(" ")}</div>` : ""}`
             : `<div class="chan-hint">No channels available yet. ${hints.join(" ") || "Add contact details in the People tab."}</div>`}
           </div>
           <div class="composer">
-              ${state.replyTo ? `<div class="reply-bar"><span>${icon("reply")}Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply" aria-label="Cancel reply">${icon("close")}</button></div>` : ""}
+              ${state.replyTo && !isAgent ? `<div class="reply-bar"><span>${icon("reply")}Replying to <b>${esc(state.replyTo.subject || "(no subject)")}</b> — threads under the original email</span><button id="reply-cancel" title="Cancel reply" aria-label="Cancel reply">${icon("close")}</button></div>` : ""}
             ${state.eventForm ? eventFormHtml() : ""}
             <div class="grow">
               ${pending.length ? `<div class="pending-files" id="pending">${pending.map((f, i) => `
                 <span class="pchip">${icon(attIconName(attKind(f.type)))}<span class="pchip-name">${esc(f.name)}</span><span class="pchip-size">${esc(fmtSize(f.size))}</span><button class="pchip-x" data-pchip="${i}" aria-label="Remove ${esc(f.name)}">${icon("close")}</button></span>`).join("")}</div>` : ""}
               <div class="subject-line${ch === "email" && !state.replyTo ? " show" : ""}" id="subj-wrap"><input class="text-input" id="subject" placeholder="Subject"></div>
-              <textarea id="draft" rows="1" placeholder="Message ${ch ? CHAN_META[ch].label : ""}…"></textarea>
+              <textarea id="draft" rows="1" placeholder="Message ${isAgent && agentMember ? esc(agentMember.name) : (ch ? CHAN_META[ch].label : "")}…"></textarea>
             </div>
             ${ch === "email" ? `<button class="attach-btn" id="attach" aria-label="Attach files" title="Attach files (25 MB max each)">${icon("paperclip")}</button><input type="file" id="filepick" multiple hidden><button class="cal-btn${state.eventForm ? " on" : ""}" id="calinvite" aria-label="Send calendar invitation" title="Send calendar invitation">${icon("calendar")}</button>` : ""}
             <button class="send-btn" id="send" aria-label="Send" ${ch ? "" : "disabled"}>${icon("send")}</button>
@@ -2854,7 +2858,7 @@ async function sendMsg() {
   const files = state.pendingFiles.slice();
   const event = state.pendingEvent;
   if (!body.trim() && !files.length && !event) return;
-  if ((files.length || event) && ch !== "email") { toast("Invitations and files go out by email — switch channels or drop them.", true); return; }
+  if ((files.length && ch !== "email" && ch !== "agent") || (event && ch !== "email")) { toast("Invitations and files go out by email — switch channels or drop them.", true); return; }
   state.sending = true;
   $("#send").disabled = true;
   const clearEvent = () => { state.pendingEvent = null; state.eventDraft = null; state.eventForm = false; };
@@ -2880,6 +2884,14 @@ async function sendMsg() {
     state.pendingFiles = [];
     clearEvent();
     state.dropDraft = true; // the send consumed the draft — don't restore it
+    if (ch === "agent") {
+      // The agent's reply lands server-side right after our message —
+      // reload so it appears immediately instead of waiting for the refresh.
+      try {
+        const m2 = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages?limit=100");
+        state.messages = m2.messages || [];
+      } catch { /* background refresh will catch up */ }
+    }
     await refreshFiles();
     await refreshDiary();
     renderConversationDetail();
@@ -2967,6 +2979,7 @@ function renderPeople() {
           <button class="person-card card" data-id="${c.id}">
             ${avatarHtml(c.name, c.color, 72, false, c.avatar_url)}
             <div class="pname">${esc(c.name)}</div>
+            ${c.kind === "agent" ? `<span class="agent-badge">${icon("burst")}AI agent</span>` : ""}
             <div class="chan-dots">${["email", "sms", "matrix"].map((ch) =>
               `<span class="chan-dot ${ch}" style="${c.channels.includes(ch) ? "" : "opacity:.18;filter:grayscale(1)"}" title="${CHAN_META[ch].label}"></span>`).join("")}</div>
           </button>`).join("")}
@@ -2975,7 +2988,7 @@ function renderPeople() {
           <div>${full ? `Full — ${state.maxPeople} max` : "Add person"}</div>
         </button>
       </div>
-      <div class="hint" style="text-align:center;padding:0 24px 24px">Relay is for your inner circle — up to ${state.maxPeople || 8} people, ${state.maxPeople || 8} per group. Tap a person to see their channels, then message them. Archived people don't count against the limit.</div>
+      <div class="hint" style="text-align:center;padding:0 24px 24px">Relay is for your inner circle — up to ${state.maxPeople || 8} people and AI agents, ${state.maxPeople || 8} per group. Tap a person to see their channels, then message them. Archived people don't count against the limit.</div>
       ${state.archivedContacts.length ? `
       <div class="group-caption">Archived · ${state.archivedContacts.length}</div>
       <div class="group-card card">
@@ -3277,7 +3290,12 @@ function drawVcfTab(body, close) {
 function renderPersonDetail(id) {
   const c = state.contacts.find((x) => x.id === id) || state.archivedContacts.find((x) => x.id === id);
   if (!c) { location.hash = "#/people"; return; }
-  const rows = [
+  const isAgent = c.kind === "agent";
+  const who = isAgent ? "agent" : "person";
+  const rows = isAgent ? [
+    { t1: "Endpoint", t2: c.agent_url_set ? "Saved" : "Not set", badge: true },
+    { t1: "Secret", t2: c.has_agent_secret ? "Saved" : "Not set", badge: true },
+  ] : [
     { ch: "email", t1: "Email", t2: c.email || "Not set" },
     { ch: "sms", t1: "SMS · Google Voice", t2: c.gv_number || "Not set" },
     { ch: "matrix", t1: "Matrix", t2: c.matrix_id || c.matrix_room_id || "Not set" },
@@ -3294,22 +3312,22 @@ function renderPersonDetail(id) {
         <div class="profile-hero">
           ${avatarHtml(c.name, c.color, 72, false, c.avatar_url)}
           <h2>${esc(c.name)}</h2>
-          <div class="sub">${c.archived ? icon("box") + " Archived · " : ""}${c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet"}</div>
+          <div class="sub">${c.archived ? icon("box") + " Archived · " : ""}${isAgent ? `<span class="agent-badge">${icon("burst")}AI agent</span>` : (c.channels.length ? c.channels.map((ch) => CHAN_META[ch].label).join(" · ") : "No channels yet")}</div>
         </div>
         <div style="padding:0 32px"><button class="btn" id="message" style="width:100%">Message</button></div>
-        <div class="group-caption">Channels</div>
+        <div class="group-caption">${isAgent ? "Agent" : "Channels"}</div>
         <div class="group-card card">
           ${rows.map((r) => `
-            <div class="group-row"><span class="chan-dot ${r.ch}"></span>
+            <div class="group-row">${r.badge ? `<span class="agent-badge">${icon("burst")}</span>` : `<span class="chan-dot ${r.ch}"></span>`}
               <div class="rlabel"><div class="t1">${r.t1}</div><div class="t2">${esc(r.t2)}</div></div>
             </div>`).join("")}
         </div>
         ${c.notes ? `<div class="group-caption">Notes</div><div class="group-card card"><div class="group-row"><div class="rlabel"><div class="t1" style="font-weight:400">${esc(c.notes)}</div></div></div></div>` : ""}
         <div style="padding:8px 32px 32px;display:flex;flex-direction:column;gap:10px">
           ${c.archived
-            ? `<button class="btn" id="unarchive" style="width:100%">Unarchive person</button>`
-            : `<button class="btn" id="archive" style="width:100%">${icon("box")}Archive person</button>`}
-          <button class="btn danger" id="del" style="width:100%">Remove person</button>
+            ? `<button class="btn" id="unarchive" style="width:100%">Unarchive ${who}</button>`
+            : `<button class="btn" id="archive" style="width:100%">${icon("box")}Archive ${who}</button>`}
+          <button class="btn danger" id="del" style="width:100%">Remove ${who}</button>
         </div>
       </div>
       ${tabBar("people")}
@@ -3339,14 +3357,18 @@ function renderPersonDetail(id) {
 // ---------- contact sheet (new/edit) ----------
 
 function openContactSheet(existing) {
-  const c = existing || { name: "", email: "", gv_number: "", matrix_id: "", matrix_room_id: "", notes: "", photo: "", color: "#8e8e93" };
+  const c = existing || { kind: "person", name: "", email: "", gv_number: "", matrix_id: "", matrix_room_id: "", notes: "", photo: "", color: "#8e8e93" };
+  let kind = c.kind === "agent" ? "agent" : "person";
   let photoData = c.photo || "";
   const scrim = document.createElement("div");
   scrim.className = "sheet-scrim";
   scrim.innerHTML = `
     <div class="sheet" role="dialog" aria-modal="true">
       <div class="grabber"></div>
-      <h3>${existing ? "Edit person" : "Add person"}</h3>
+      <h3 id="f-title">${existing ? "Edit person" : "Add person"}</h3>
+      <div class="seg" id="f-kind-seg" style="margin-bottom:12px">
+        <button data-kind="person" class="${kind === "agent" ? "" : "on"}">${icon("people")}Person</button><button data-kind="agent" class="${kind === "agent" ? "on" : ""}">${icon("burst")}AI agent</button>
+      </div>
       <div class="photo-row">
         <div id="f-photo-preview">${avatarHtml(c.name || "?", c.color || "#8e8e93", 72, false, photoData || null)}</div>
         <div style="flex:1;min-width:0">
@@ -3359,6 +3381,7 @@ function openContactSheet(existing) {
         <input type="file" id="f-photo-file" accept="image/*" style="display:none">
       </div>
       <div class="field"><label>Name</label><input class="text-input" id="f-name" value="${esc(c.name)}" placeholder="Ada Lovelace" maxlength="60"></div>
+      <div id="f-person-fields" style="${kind === "agent" ? "display:none" : ""}">
       <div class="field"><label>Email</label><input class="text-input" id="f-email" value="${esc(c.email)}" placeholder="ada@example.com" inputmode="email"></div>
       <div class="field"><label>Google Voice number</label><input class="text-input" id="f-gv" value="${esc(c.gv_number)}" placeholder="5551234567" inputmode="tel">
         <div class="hint">Their Google Voice number — Relay texts it through the GV email gateway.</div></div>
@@ -3367,13 +3390,35 @@ function openContactSheet(existing) {
         <div style="display:flex;gap:8px"><input class="text-input" id="f-room" value="${esc(c.matrix_room_id)}" placeholder="!abc:matrix.org" style="flex:1">
         <button class="btn secondary small" id="pick-room" type="button">Browse</button></div>
         <div class="hint">A DM room you're both in. Create it in Element first, then pick it here.</div></div>
+      </div>
+      <div id="f-agent-fields" style="${kind === "agent" ? "" : "display:none"}">
+      <div class="field"><label>Endpoint URL</label><input class="text-input" id="f-agent-url" inputmode="url" placeholder="http://127.0.0.1:3009/api/chat">
+        <div class="hint">Any agent that accepts POST {session, message} and replies with {text} — Milton's /api/chat works as-is.${existing && existing.agent_url_set ? " Endpoint saved — re-enter to change it." : ""}</div></div>
+      <div class="field"><label>Secret <span style="font-weight:400">(optional)</span></label><input class="text-input" id="f-agent-secret" type="password" placeholder="${existing && existing.has_agent_secret ? "Saved — leave blank to keep" : ""}">
+        <div class="hint">Sent as X-Agent-Secret header.</div></div>
+      </div>
       <div class="field"><label>Notes</label><textarea class="text-area" id="f-notes" placeholder="Anything worth remembering…">${esc(c.notes)}</textarea></div>
-      <button class="btn" id="save" style="width:100%;margin-top:4px">${existing ? "Save" : "Add person"}</button>
+      <button class="btn" id="save" style="width:100%;margin-top:4px">${existing ? "Save" : (kind === "agent" ? "Add agent" : "Add person")}</button>
       <div style="height:8px"></div>
     </div>`;
   document.body.appendChild(scrim);
   const close = () => scrim.remove();
   scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+
+  // Kind toggle: show the agent fields or the person fields, live, no save needed.
+  const setKind = (k) => {
+    kind = k;
+    $$("#f-kind-seg button", scrim).forEach((b) => b.classList.toggle("on", b.dataset.kind === k));
+    $("#f-person-fields", scrim).style.display = k === "agent" ? "none" : "";
+    $("#f-agent-fields", scrim).style.display = k === "agent" ? "" : "none";
+    $("#f-title", scrim).textContent = (existing ? "Edit " : "Add ") + (k === "agent" ? "agent" : "person");
+    $("#save", scrim).textContent = existing ? "Save" : (k === "agent" ? "Add agent" : "Add person");
+  };
+  scrim.addEventListener("click", (e) => {
+    const kb = e.target && typeof e.target.closest === "function" ? e.target.closest("#f-kind-seg button") : null;
+    if (kb && kb.dataset && kb.dataset.kind) setKind(kb.dataset.kind);
+  });
+  setKind(kind); // single source of truth for the initial visibility + labels
 
   const refreshPreview = () => {
     $("#f-photo-preview", scrim).innerHTML = avatarHtml($("#f-name", scrim).value || "?", c.color || "#8e8e93", 72, false, photoData || null);
@@ -3418,14 +3463,23 @@ function openContactSheet(existing) {
   $("#save", scrim).addEventListener("click", async () => {
     const vals = {
       name: $("#f-name", scrim).value.trim(),
-      email: $("#f-email", scrim).value.trim(),
-      gv_number: $("#f-gv", scrim).value.trim(),
-      matrix_id: $("#f-mxid", scrim).value.trim(),
-      matrix_room_id: $("#f-room", scrim).value.trim(),
       notes: $("#f-notes", scrim).value.trim(),
       photo: photoData,
+      kind,
     };
-    if (!vals.name) { toast("Give them a name.", true); return; }
+    if (kind === "agent") {
+      const url = $("#f-agent-url", scrim).value.trim();
+      if (!url) { toast("Give the agent an endpoint URL.", true); return; }
+      vals.agent_url = url;
+      const sec = $("#f-agent-secret", scrim).value;
+      vals.agent_secret = (existing && existing.has_agent_secret && !sec) ? "__KEEP__" : sec;
+    } else {
+      vals.email = $("#f-email", scrim).value.trim();
+      vals.gv_number = $("#f-gv", scrim).value.trim();
+      vals.matrix_id = $("#f-mxid", scrim).value.trim();
+      vals.matrix_room_id = $("#f-room", scrim).value.trim();
+    }
+    if (!vals.name) { toast(kind === "agent" ? "Give the agent a name." : "Give them a name.", true); return; }
     try {
       if (existing) await api("/api/contacts/" + existing.id, { method: "PATCH", body: JSON.stringify(vals) });
       else await api("/api/contacts", { method: "POST", body: JSON.stringify(vals) });
@@ -3443,6 +3497,8 @@ function openContactSheet(existing) {
 
 function renderNewGroup() {
   const picked = new Set();
+  const members = state.contacts.filter((c) => c.kind !== "agent");
+  const hasAgents = state.contacts.some((c) => c.kind === "agent");
   const app = $("#app");
   const draw = () => {
     app.innerHTML = `
@@ -3454,12 +3510,12 @@ function renderNewGroup() {
         <div class="field"><label>Matrix room <span style="font-weight:400">(optional)</span></label><input class="text-input" id="g-room" placeholder="!xyz:matrix.org"></div></div>
         <div class="group-caption">Members · ${picked.size + 1} of ${state.maxPeople || 8} (you included)</div>
         <div class="group-card card">
-          ${state.contacts.map((c) => `
+          ${members.map((c) => `
             <div class="pick-row${picked.has(c.id) ? " on" : ""}" data-id="${c.id}">
               <span class="check">✓</span>${avatarHtml(c.name, c.color, 48, false, c.avatar_url)}<span class="pname">${esc(c.name)}</span>
             </div>`).join("") || `<div class="empty"><p>Add people first.</p></div>`}
         </div>
-        <div class="hint" style="padding:0 20px 24px">Only channels every member has set up can be used in the group.</div>
+        <div class="hint" style="padding:0 20px 24px">Only channels every member has set up can be used in the group.${hasAgents ? " AI agents chat 1:1 — they can't join groups (v1)." : ""}</div>
       </div>
       ${tabBar("people")}
     </div>`;

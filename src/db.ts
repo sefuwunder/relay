@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-export type Channel = "email" | "sms" | "matrix";
+export type Channel = "email" | "sms" | "matrix" | "agent";
 
 export interface Contact {
   id: string;
@@ -18,6 +18,12 @@ export interface Contact {
   color: string;
   notes: string;
   photo: string; // custom avatar data URL; falls back to Gravatar when empty
+  /** "person" (default) or "agent" — an AI agent chatted with 1:1 via its endpoint URL. */
+  kind: "person" | "agent";
+  /** Agent endpoint URL (e.g. http://127.0.0.1:3009/api/chat); "" for people. */
+  agent_url: string;
+  /** Secret sent as the X-Agent-Secret header; "" when unset. */
+  agent_secret: string;
   archived: number;
   created_at: string;
 }
@@ -76,6 +82,9 @@ export function openDb(path: string): Database {
       color TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT '',
       archived INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL DEFAULT 'person',
+      agent_url TEXT NOT NULL DEFAULT '',
+      agent_secret TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS conversations (
@@ -203,6 +212,19 @@ export function openDb(path: string): Database {
   if (!cols.some((c) => c.name === "photo")) {
     db.exec("ALTER TABLE contacts ADD COLUMN photo TEXT NOT NULL DEFAULT ''");
   }
+  // Migration: AI agent contacts (older DBs lack the columns). Every existing
+  // contact is a person — backfill kind explicitly for rows created before
+  // the DEFAULT existed.
+  if (!cols.some((c) => c.name === "kind")) {
+    db.exec("ALTER TABLE contacts ADD COLUMN kind TEXT NOT NULL DEFAULT 'person'");
+    db.exec("UPDATE contacts SET kind = 'person' WHERE kind IS NULL OR kind = ''");
+  }
+  if (!cols.some((c) => c.name === "agent_url")) {
+    db.exec("ALTER TABLE contacts ADD COLUMN agent_url TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "agent_secret")) {
+    db.exec("ALTER TABLE contacts ADD COLUMN agent_secret TEXT NOT NULL DEFAULT ''");
+  }
   // Migration: original email Message-ID for reply threading (older DBs lack it).
   const msgCols = db.query("PRAGMA table_info(messages)").all() as { name: string }[];
   if (!msgCols.some((c) => c.name === "message_id")) {
@@ -252,12 +274,24 @@ export function countActiveContacts(): number {
   return (db.query("SELECT COUNT(*) AS n FROM contacts WHERE archived = 0").get() as any).n as number;
 }
 
-export function createContact(c: Omit<Contact, "id" | "created_at" | "archived"> & { archived?: number }): Contact {
+export function createContact(c: Omit<Contact, "id" | "created_at" | "archived" | "kind" | "agent_url" | "agent_secret"> & {
+  archived?: number; kind?: "person" | "agent"; agent_url?: string; agent_secret?: string;
+}): Contact {
   if (countActiveContacts() >= MAX_PEOPLE) throw new Error(`Relay keeps things small — ${MAX_PEOPLE} contacts maximum.`);
-  const row: Contact = { photo: "", ...c, archived: c.archived ? 1 : 0, id: uid(), created_at: now() };
+  const kind: "person" | "agent" = c.kind === "agent" ? "agent" : "person";
+  let agent_url = String(c.agent_url ?? "").trim();
+  let agent_secret = String(c.agent_secret ?? "");
+  if (kind === "agent") {
+    if (!/^https?:\/\//.test(agent_url)) throw new Error("Give the agent an endpoint URL (http:// or https://).");
+  } else {
+    // People never carry agent credentials.
+    agent_url = "";
+    agent_secret = "";
+  }
+  const row: Contact = { photo: "", ...c, kind, agent_url, agent_secret, archived: c.archived ? 1 : 0, id: uid(), created_at: now() };
   db.query(
-    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, photo, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.photo, row.archived, row.created_at);
+    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, photo, kind, agent_url, agent_secret, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.photo, row.kind, row.agent_url, row.agent_secret, row.archived, row.created_at);
   return row;
 }
 
@@ -266,9 +300,14 @@ export function updateContact(id: string, patch: Partial<Omit<Contact, "id" | "c
   if (!cur) return null;
   const next = { ...cur, ...patch };
   if ("archived" in patch) next.archived = patch.archived ? 1 : 0;
+  next.kind = next.kind === "agent" ? "agent" : "person";
+  if (next.kind === "person") {
+    next.agent_url = "";
+    next.agent_secret = "";
+  }
   db.query(
-    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ?, photo = ?, archived = ? WHERE id = ?"
-  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, next.photo, next.archived, id);
+    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ?, photo = ?, kind = ?, agent_url = ?, agent_secret = ?, archived = ? WHERE id = ?"
+  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, next.photo, next.kind, next.agent_url, next.agent_secret, next.archived, id);
   return next;
 }
 
@@ -324,6 +363,11 @@ export function createGroup(name: string, memberIds: string[], matrixRoomId = ""
   const unique = [...new Set(memberIds)];
   if (unique.length === 0) throw new Error("Add at least one person to the group.");
   if (unique.length + 1 > MAX_PEOPLE) throw new Error(`Groups are small by design — ${MAX_PEOPLE} people maximum, you included.`);
+  // v1: agents chat 1:1 only.
+  for (const mid of unique) {
+    const m = getContact(mid);
+    if (m && m.kind === "agent") throw new Error("AI agents chat 1:1 only — they can't join groups (v1).");
+  }
   const conv: Conversation = { id: uid(), name: name.trim() || "Group", is_group: 1, matrix_room_id: matrixRoomId, last_read_at: now(), created_at: now() };
   db.query("INSERT INTO conversations (id, name, is_group, matrix_room_id, last_read_at, created_at) VALUES (?, ?, 1, ?, ?, ?)").run(
     conv.id, conv.name, conv.matrix_room_id, conv.last_read_at, conv.created_at

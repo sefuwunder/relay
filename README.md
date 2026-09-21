@@ -59,6 +59,33 @@ The ✓ toggle in the conversation header opens the **Commitments panel** (Open 
 - **Nudges** (on by default, `relay_commit_nudges`): due-today and overdue items surface one desktop notification per day, quiet hours 22:00–07:00, digest when several are due.
 - New APIs: `GET/POST /api/conversations/:id/commitments`, `PATCH/DELETE /api/commitments/:id`, `GET /api/conversations/:id/suggestions`, `POST /api/suggestions/:id/confirm|dismiss`, `GET/POST /api/conversations/:id/decisions`, `PATCH/DELETE /api/decisions/:id`, `GET /api/commitments/all`, `GET /api/decisions/all` (searchable), `GET /api/commitments/due`, `POST /api/commitments/:id/nudge`, and JSON/CSV export. Everything is local SQLite — no network, no models, no new dependencies.
 
+## AI agent contacts
+
+Contacts can be people — or AI agents you chat with 1:1 inside Relay. Add one from the People tab as an **agent** with its endpoint URL; typing in the conversation sends your message straight to it and its reply lands in the thread.
+
+**Generic agent contract.** Any agent works if it exposes:
+
+```
+POST {agent_url}   Content-Type: application/json
+  → { "session": "relay:<conversation_id>", "message": "…" }
+  ← { "text": "…", … }     (extra fields are ignored; `reply` or a bare
+                             string response is accepted as a courtesy)
+```
+
+No model or LLM calls happen inside Relay — it's plain `fetch` against the agent's own endpoint. The reference implementation is **Milton**: `POST http://127.0.0.1:3009/api/chat` already speaks exactly this contract (`{session, message}` → `{...reply, text, ...}`), so pointing an agent contact at it works with no changes on Milton's side.
+
+**Secrets discipline.** `agent_url` and `agent_secret` never leave the server: they live in `relay.db`, are never logged (failure logs name only the agent), and every API response that carries a contact strips them — clients only ever see `agent_url_set` and `has_agent_secret` booleans. Rotating the secret works like Settings: PATCH `agent_secret` with `"__KEEP__"` keeps the stored value, `""` clears it.
+
+**How sends work.**
+
+- The session id is `relay:<conversation_id>`, stable per thread, so the agent can keep its own conversation memory keyed on it.
+- The secret (when set) goes out as the `X-Agent-Secret` header.
+- 30-second timeout. The outbound message is recorded **first**; if the agent errors, times out, or answers empty, nothing is dropped — an inbound *"Agent unreachable: …"* notice lands in the thread (the endpoint URL is scrubbed from the reason).
+- **v1 limits:** agents chat 1:1 only — they can't join groups (`POST /api/conversations` with an agent in `member_ids` is rejected). Text-only: files you attach are stored on your outbound message, but the agent receives only the text, and an in-thread notice says so. Agent contacts have no email/SMS/Matrix (the channel picker shows only "agent" in their conversations).
+- Agents count toward the **8-contact cap** like everyone else.
+
+New APIs: `POST /api/contacts` accepts `kind: "agent"` with `agent_url` (required, must start with `http://` or `https://`) and optional `agent_secret`; `PATCH /api/contacts/:id` accepts `kind`, `agent_url`, `agent_secret` with `__KEEP__` semantics.
+
 ## Wide-screen reflow
 
 Stretch the window and the UI opens up: at ≥1100px the conversation view gains the persistent Shared files panel while the thread uses the rest; at ≥1400px the People grid goes six-wide. Everything stays glass, and animations still respect `prefers-reduced-motion`.
@@ -123,7 +150,7 @@ Google tokens are stored in the gitignored `./data/config.json` next to your oth
 | GET/PATCH/DELETE | `/api/contacts/:id` | delete removes their 1:1 conversations |
 | GET/POST | `/api/conversations` | POST creates a group |
 | GET/PATCH/DELETE | `/api/conversations/:id` | detail includes `channels` + `hints` |
-| GET/POST | `/api/conversations/:id/messages` | POST `{channel, body, subject?}`; multipart `files[]` for attachments (email only) |
+| GET/POST | `/api/conversations/:id/messages` | POST `{channel, body, subject?}`; multipart `files[]` for attachments (email only; agent convs use `channel: "agent"` and are text-only) |
 | POST | `/api/conversations/:id/messages/:mid/retry` | re-sends a failed message with its stored attachments |
 | GET | `/api/conversations/:id/files` | recently shared files (newest first) for the widget |
 | GET | `/api/attachments/:id` | download / inline preview of one file |

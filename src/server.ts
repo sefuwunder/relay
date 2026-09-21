@@ -435,6 +435,8 @@ function cleanPhoto(v: unknown): string | null {
 }
 
 export function contactChannels(c: Contact): Channel[] {
+  // AI agents chat 1:1 through their endpoint URL — no email/SMS/Matrix for them.
+  if (c.kind === "agent") return [];
   const out: Channel[] = [];
   if (c.email) out.push("email");
   if (normDigits(c.gv_number).length === 10) out.push("sms");
@@ -446,6 +448,8 @@ export function contactChannels(c: Contact): Channel[] {
 export function conversationChannels(conv: Conversation, members: Contact[]): Channel[] {
   const out: Channel[] = [];
   if (!members.length) return out;
+  // v1: an agent conversation is 1:1 with the agent and only speaks "agent".
+  if (members.some((m) => m.kind === "agent")) return ["agent"];
   if (smtpReady() && members.every((m) => m.email)) out.push("email");
   if (smtpReady() && members.every((m) => normDigits(m.gv_number).length === 10)) out.push("sms");
   if (matrixReady()) {
@@ -456,7 +460,7 @@ export function conversationChannels(conv: Conversation, members: Contact[]): Ch
 
 /** Why a channel is unavailable — shown as a hint in the UI. */
 export function channelHints(conv: Conversation, members: Contact[]): Record<Channel, string> {
-  const hints = { email: "", sms: "", matrix: "" } as Record<Channel, string>;
+  const hints = { email: "", sms: "", matrix: "", agent: "" } as Record<Channel, string>;
   if (!smtpReady()) {
     hints.email = "Add SMTP in Settings to send email.";
     hints.sms = "Add SMTP in Settings to send SMS via Google Voice.";
@@ -594,6 +598,97 @@ async function sendConversationMessage(convId: string, channel: Channel, body: s
   const roomId = conv.is_group ? conv.matrix_room_id : members[0].matrix_room_id;
   const eventId = await matrixSend(settings.matrix, roomId, text);
   return recordSent(retryOfId, { conversation_id: convId, channel, direction: "out", body: text, subject: "", external_id: `matrix:${eventId}`, status: "sent" });
+}
+
+/**
+ * Extract the agent's reply text from its raw response body. The contract is
+ * JSON with a `text` string; `reply` or a bare JSON string is accepted as a
+ * courtesy, otherwise the raw body is used as-is.
+ */
+function extractAgentText(rawBody: string): string {
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.text === "string") return parsed.text.trim();
+      if (typeof parsed.reply === "string") return parsed.reply.trim();
+    }
+    if (typeof parsed === "string") return parsed.trim();
+  } catch { /* not JSON — treat as plain text below */ }
+  return rawBody.trim();
+}
+
+const AGENT_ATTACHMENT_NOTICE = "📎 Relay v1 is text-only — I got your message, but I can't see attachments yet.";
+
+/**
+ * Chat 1:1 with an AI agent contact over plain HTTP (no model/LLM calls here —
+ * the agent lives at its own endpoint URL).
+ *
+ * The outbound row is recorded FIRST; an agent-side failure never deletes it.
+ * Failures surface as an inbound "Agent unreachable: …" notice in the thread.
+ * The endpoint URL and secret never reach logs or clients.
+ */
+async function sendAgentMessage(convId: string, body: string, attachments: MailAttachment[]) {
+  const conv = getConversation(convId);
+  if (!conv) throw new Error("Conversation not found.");
+  const members = conversationMembers(convId);
+  const agent = members.find((m) => m.kind === "agent");
+  if (!agent || !agent.agent_url) throw new Error("That agent has no endpoint set.");
+  const text = body.trim();
+  if (!text && !attachments.length) throw new Error("Write a message first.");
+
+  const out = insertTracked({
+    conversation_id: convId, channel: "agent", direction: "out", body: text,
+    subject: "", external_id: "", participants: [agent.id], status: "sent",
+  });
+  if (attachments.length) {
+    // Files are kept on the outbound row for the user's reference; the agent
+    // only ever receives the text.
+    await saveMessageAttachments(out.id, attachments);
+    insertTracked({
+      conversation_id: convId, channel: "agent", direction: "in", body: AGENT_ATTACHMENT_NOTICE,
+      subject: "", external_id: "", participants: [agent.id], status: "",
+    });
+    if (!text) return out; // attachments only — nothing to send to the agent
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(agent.agent_url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(agent.agent_secret ? { "x-agent-secret": agent.agent_secret } : {}),
+      },
+      body: JSON.stringify({ session: "relay:" + convId, message: text }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const rawBody = await res.text();
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const replyText = extractAgentText(rawBody).slice(0, 20000);
+    if (!replyText) throw new Error("empty reply");
+    insertTracked({
+      conversation_id: convId, channel: "agent", direction: "in", body: replyText,
+      subject: "", external_id: "", participants: [agent.id], status: "",
+    });
+    return out;
+  } catch (e) {
+    clearTimeout(timer);
+    const msg = errMsg(e);
+    const timedOut = (e as Error)?.name === "AbortError" || /abort|timed out/i.test(msg);
+    let reason = timedOut
+      ? "timed out after 30s"
+      : msg.split(agent.agent_url).join("[endpoint]").slice(0, 120);
+    if (!reason) reason = "unknown error";
+    insertTracked({
+      conversation_id: convId, channel: "agent", direction: "in",
+      body: `Agent unreachable: ${reason}`,
+      subject: "", external_id: "", participants: [agent.id], status: "",
+    });
+    console.log(`agent "${agent.name}" unreachable: ${reason}`);
+    return out;
+  }
 }
 
 // On a retry, flip the original failed row to sent instead of inserting a duplicate.
@@ -1032,6 +1127,13 @@ const server = (Bun as any).serve({
       }
 
       // ----- settings -----
+      // Strip an agent contact's credentials before it leaves the server, the
+      // same way the settings endpoint strips secrets below: clients only ever
+      // learn whether an endpoint URL / secret is set.
+      function sanitizeContact(c: Contact) {
+        const { agent_url, agent_secret, ...rest } = c as any;
+        return { ...rest, agent_url_set: !!agent_url, has_agent_secret: !!agent_secret };
+      }
       if (path === "/api/settings" && method === "GET") {
         return json({
           smtp: { ...settings.smtp, pass: undefined, hasPass: !!settings.smtp.pass },
@@ -1192,7 +1294,7 @@ const server = (Bun as any).serve({
 
       // ----- contacts -----
       if (path === "/api/contacts" && method === "GET") {
-        const withMeta = (c: Contact) => ({ ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarFor(c) });
+        const withMeta = (c: Contact) => ({ ...sanitizeContact(c), channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarFor(c) });
         return json({
           contacts: listActiveContacts().map(withMeta),
           archived: listArchivedContacts().map(withMeta),
@@ -1205,18 +1307,31 @@ const server = (Bun as any).serve({
         if (!name) return json({ error: "Give them a name." }, 400);
         const photo = cleanPhoto(b.photo);
         if (photo === null) return json({ error: "That photo didn't work — try a JPEG, PNG, WebP or GIF." }, 400);
+        const kind = b.kind === "agent" ? "agent" : "person";
+        let agent_url = "", agent_secret = "";
+        if (kind === "agent") {
+          agent_url = String(b.agent_url || "").trim();
+          if (!/^https?:\/\//.test(agent_url)) return json({ error: "Give the agent an endpoint URL (http:// or https://)." }, 400);
+          agent_secret = String(b.agent_secret ?? "");
+        }
+        if (countActiveContacts() >= MAX_PEOPLE) {
+          return json({ error: `Your inner circle is full (${MAX_PEOPLE} max). Archive someone else first.` }, 400);
+        }
         const c = createContact({
           name,
-          email: String(b.email || "").trim().toLowerCase(),
-          gv_number: String(b.gv_number || "").trim(),
-          matrix_id: String(b.matrix_id || "").trim(),
-          matrix_room_id: String(b.matrix_room_id || "").trim(),
+          kind,
+          agent_url,
+          agent_secret,
+          email: kind === "agent" ? "" : String(b.email || "").trim().toLowerCase(),
+          gv_number: kind === "agent" ? "" : String(b.gv_number || "").trim(),
+          matrix_id: kind === "agent" ? "" : String(b.matrix_id || "").trim(),
+          matrix_room_id: kind === "agent" ? "" : String(b.matrix_room_id || "").trim(),
           color: String(b.color || "") || pickColor(name),
           notes: String(b.notes || "").trim(),
           photo: photo || "",
         });
         dmFor(c.id);
-        return json({ contact: c }, 201);
+        return json({ contact: sanitizeContact(c) }, 201);
       }
       {
         const m = path.match(/^\/api\/contacts\/([^/]+)$/);
@@ -1225,10 +1340,12 @@ const server = (Bun as any).serve({
           if (method === "GET") {
             const c = getContact(id);
             if (!c) return json({ error: "not found" }, 404);
-            return json({ contact: { ...c, channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarFor(c) } });
+            return json({ contact: { ...sanitizeContact(c), channels: contactChannels(c), conversation_id: dmFor(c.id).id, avatar_url: avatarFor(c) } });
           }
           if (method === "PATCH") {
             const b = await readBody(req);
+            const cur = getContact(id);
+            if (!cur) return json({ error: "not found" }, 404);
             const patch: any = {};
             for (const k of ["name", "email", "gv_number", "matrix_id", "matrix_room_id", "color", "notes"]) {
               if (k in b) patch[k] = String(b[k] ?? "").trim();
@@ -1241,14 +1358,30 @@ const server = (Bun as any).serve({
             }
             if (patch.email) patch.email = patch.email.toLowerCase();
             if (patch.name !== undefined && !patch.name) return json({ error: "Give them a name." }, 400);
-            const cur = getContact(id);
-            if (!cur) return json({ error: "not found" }, 404);
             if (patch.archived === 0 && cur.archived === 1 && countActiveContacts() >= MAX_PEOPLE) {
               return json({ error: `Your inner circle is full (${MAX_PEOPLE} max). Archive someone else first.` }, 400);
             }
+            // kind / agent fields with __KEEP__ semantics (like settings secrets):
+            // absent or "__KEEP__" keeps the stored value, "" clears, else sets.
+            let kind: "person" | "agent" = cur.kind === "agent" ? "agent" : "person";
+            if ("kind" in b && b.kind !== "__KEEP__") kind = b.kind === "agent" ? "agent" : "person";
+            let agent_url = cur.agent_url || "";
+            let agent_secret = cur.agent_secret || "";
+            if ("agent_url" in b && b.agent_url !== "__KEEP__") agent_url = String(b.agent_url ?? "").trim();
+            if ("agent_secret" in b && b.agent_secret !== "__KEEP__") agent_secret = String(b.agent_secret ?? "");
+            if (kind === "agent") {
+              if (!/^https?:\/\//.test(agent_url)) return json({ error: "Give the agent an endpoint URL (http:// or https://)." }, 400);
+              patch.agent_url = agent_url;
+              patch.agent_secret = agent_secret;
+            } else {
+              // agent→person: agent fields are cleared.
+              patch.agent_url = "";
+              patch.agent_secret = "";
+            }
+            patch.kind = kind;
             const c = updateContact(id, patch);
             if (!c) return json({ error: "not found" }, 404);
-            return json({ contact: c });
+            return json({ contact: sanitizeContact(c) });
           }
           if (method === "DELETE") {
             const removed = deleteContact(id);
@@ -1282,8 +1415,12 @@ const server = (Bun as any).serve({
         const b = await readBody(req);
         const memberIds = (Array.isArray(b.member_ids) ? b.member_ids : []).map(String);
         for (const mid of memberIds) if (!getContact(mid)) return json({ error: "Unknown contact in group." }, 400);
-        const conv = createGroup(String(b.name || ""), memberIds, String(b.matrix_room_id || "").trim());
-        return json({ conversation: conv }, 201);
+        try {
+          const conv = createGroup(String(b.name || ""), memberIds, String(b.matrix_room_id || "").trim());
+          return json({ conversation: conv }, 201);
+        } catch (e) {
+          return json({ error: errMsg(e) }, 400);
+        }
       }
       {
         const m = path.match(/^\/api\/conversations\/([^/]+)$/);
@@ -1297,7 +1434,7 @@ const server = (Bun as any).serve({
               conversation: {
                 ...conv, is_group: !!conv.is_group,
                 title: conv.is_group ? conv.name : members[0]?.name || "Conversation",
-                members: members.map((x) => ({ ...x, channels: contactChannels(x), avatar_url: avatarFor(x) })),
+                members: members.map((x) => ({ ...sanitizeContact(x), channels: contactChannels(x), avatar_url: avatarFor(x) })),
                 channels: conversationChannels(conv, members),
                 hints: channelHints(conv, members),
               },
@@ -1362,9 +1499,15 @@ const server = (Bun as any).serve({
               return json({ error: errMsg(e) }, 400);
             }
             const b = fields;
+            const members0 = conversationMembers(id);
+            const isAgentConv = members0.some((m) => m.kind === "agent");
             const channel = b.channel as Channel;
-            if (!["email", "sms", "matrix"].includes(channel)) return json({ error: "Pick a channel." }, 400);
-            if (files.length && channel !== "email") {
+            if (isAgentConv) {
+              if (channel !== "agent") return json({ error: "This conversation is with an AI agent — just type and send." }, 400);
+            } else if (!["email", "sms", "matrix"].includes(channel)) {
+              return json({ error: "Pick a channel." }, 400);
+            }
+            if (files.length && channel !== "email" && channel !== "agent") {
               return json({ error: "Files can only be sent by email for now — switch to the Email channel to attach them." }, 400);
             }
             // Inline calendar invitation: the details ride along as a
@@ -1414,7 +1557,9 @@ const server = (Bun as any).serve({
             try {
               const bodyText = String(b.body || "") || (invite ? `📅 Calendar invitation: ${invite.title}` : "");
               const subjText = String(b.subject || "") || (invite ? `Invitation: ${invite.title}` : "");
-              const msg = await sendConversationMessage(id, channel, bodyText, subjText, typeof b.in_reply_to === "string" ? b.in_reply_to : undefined, undefined, sendFiles);
+              const msg = isAgentConv
+                ? await sendAgentMessage(id, bodyText, sendFiles)
+                : await sendConversationMessage(id, channel, bodyText, subjText, typeof b.in_reply_to === "string" ? b.in_reply_to : undefined, undefined, sendFiles);
               recordInvite(msg.id);
               return json({ message: withAttachments([msg])[0] }, 201);
             } catch (e) {

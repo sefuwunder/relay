@@ -206,6 +206,8 @@ body {
 .chan-pill.email { background: rgba(10,132,255,0.14); color: var(--blue); }
 .chan-pill.sms { background: rgba(48,209,88,0.16); color: #1f9d44; }
 .chan-pill.matrix { background: rgba(191,90,242,0.15); color: var(--purple); }
+.agent-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; padding: 3px 8px; border-radius: 999px; white-space: nowrap; background: rgba(181,84,63,0.14); color: var(--due); }
+.agent-badge .ic { width: 1.35em; height: 1.35em; vertical-align: -0.3em; margin-right: 1px; }
 @media (prefers-color-scheme: dark) {
   .chan-pill.sms { color: var(--green); }
 }
