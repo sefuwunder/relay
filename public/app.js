@@ -188,7 +188,8 @@ function apptStatusChip(status) {
 }
 
 /** Calendar invitation card rendered inline in the bubble. Inbound invites the
-    user hasn't answered get Accept / Decline buttons. */
+    user hasn't answered get Accept / Decline buttons. Unresponded invites
+    (sent or received) get a one-tap remove button — no confirmation. */
 function inviteCard(m, a) {
   const ap = m.appointment;
   const title = ap ? ap.title : (a.filename || "Calendar invitation");
@@ -196,11 +197,15 @@ function inviteCard(m, a) {
   const loc = ap && ap.location ? `<div class="inv-loc">${icon("pin")}<span>${esc(ap.location)}</span></div>` : "";
   const desc = ap && ap.description ? `<div class="inv-desc">${esc(ap.description)}</div>` : "";
   const status = ap ? apptStatusChip(ap.status) : "";
+  const unresponded = ap && (ap.status === "sent" || ap.status === "received");
+  const removeBtn = unresponded
+    ? `<button class="inv-remove" data-appt-remove="${esc(ap.id)}" aria-label="Remove invitation" title="Remove invitation">${icon("close")}</button>`
+    : "";
   const actions = ap && m.direction === "in" && ap.status === "received"
     ? `<div class="inv-actions"><button class="inv-btn accept" data-appt-accept="${esc(ap.id)}">Accept</button><button class="inv-btn decline" data-appt-decline="${esc(ap.id)}">Decline</button></div>`
     : "";
   return `<div class="invite-card">
-    <div class="inv-head">${icon("calendar")}<div class="inv-meta"><div class="inv-title">${esc(title)}</div>${when ? `<div class="inv-when">${when}</div>` : ""}</div>${status}</div>
+    <div class="inv-head">${icon("calendar")}<div class="inv-meta"><div class="inv-title">${esc(title)}</div>${when ? `<div class="inv-when">${when}</div>` : ""}</div>${status}${removeBtn}</div>
     ${loc}${desc}${actions}
   </div>`;
 }
@@ -586,6 +591,8 @@ function bubbleAtts(m) {
     const url = attachUrl(a.id);
     const label = esc(a.filename || "file");
     if (a.mime === "text/calendar" || /\.ics$/i.test(a.filename || "")) {
+      // Removed invites (user-deleted or 24h auto-dropped) leave no card.
+      if (m.appointment && m.appointment.status === "removed") return "";
       return inviteCard(m, a);
     }
     if (kind === "image") {
@@ -2043,6 +2050,24 @@ function renderSidePanel() {
   wireCommitPanel();
 }
 
+/** Remove an unresponded invitation from its card. No confirmation modal — a
+    pending invite is cheap and can be re-sent. Answered invites never get a
+    remove button, so this path can't touch them. */
+async function removeAppointment(id) {
+  const conv = state.conv;
+  if (!conv) return;
+  try {
+    await api("/api/conversations/" + encodeURIComponent(conv.id) + "/appointments/" + encodeURIComponent(id), { method: "DELETE" });
+    for (const m of state.messages) {
+      if (m.appointment && String(m.appointment.id) === String(id)) m.appointment.status = "removed";
+    }
+    await refreshDiary();
+    renderConversationDetail();
+    toast("Invitation removed.");
+  } catch (e) {
+    toast(e.message || "Couldn't remove the invitation.", true);
+  }
+}
 /** Accept or decline an invitation from its card: sends a real METHOD:REPLY
     RSVP email to the organizer when one is known. */
 async function setApptStatus(id, status) {
@@ -2661,9 +2686,10 @@ function renderConversationDetail() {
   wireCommitPanel();
   wireMessageMenus();
   wireInlineSuggestions();
-  // Invitation cards: accept / decline inbound invites.
+  // Invitation cards: accept / decline inbound invites; remove unresponded ones.
   $$("#msgs [data-appt-accept]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptAccept, "accepted")));
   $$("#msgs [data-appt-decline]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptDecline, "declined")));
+  $$("#msgs [data-appt-remove]").forEach((b) => b.addEventListener("click", () => removeAppointment(b.dataset.apptRemove)));
   // Ad-hoc meeting chips: open the diary composer pre-filled.
   $$("#msgs [data-mtg]").forEach((b) => b.addEventListener("click", () => openDiaryComposer(b.dataset.mtg)));
   $$("#msgs [data-att]").forEach((b) => b.addEventListener("click", () => {
@@ -2898,11 +2924,15 @@ async function retryMsg(id) {
 async function refreshConversation() {
   const conv = state.conv;
   if (!conv) return;
+  // Appointment signature: the silent 24h invite sweep changes no message
+  // rows, so count alone wouldn't notice a card disappearing.
+  const apptSig = (msgs) => msgs.map((m) => m.id + ":" + (m.appointment ? m.appointment.id + "/" + m.appointment.status : "-")).join("|");
   try {
     const m = await api("/api/conversations/" + encodeURIComponent(conv.id) + "/messages?limit=100");
     const before = state.messages.length;
+    const beforeAppts = apptSig(state.messages);
     state.messages = m.messages || [];
-    if (state.messages.length !== before) {
+    if (state.messages.length !== before || apptSig(state.messages) !== beforeAppts) {
       await refreshFiles();
       await refreshDiary();
       await refreshCommitData(); // new inbound messages may carry new suggestions

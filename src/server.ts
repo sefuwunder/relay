@@ -9,6 +9,7 @@ import {
   listMessages, insertMessage, hasExternalId, kvGet, kvSet, MAX_PEOPLE,
   insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, searchConversationAttachments, deleteConversationData,
   insertAppointment, listAppointments, getAppointment, getAppointmentByUid, getAppointmentsForMessages, setAppointmentStatus,
+  removeAppointment, sweepStaleAppointments,
   type Contact, type Conversation, type Channel, type Message, type Attachment, type Appointment,
 } from "./db";
 import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
@@ -620,6 +621,9 @@ let lastPoll: { mail: string | null; matrix: string | null; mailError: string | 
 };
 
 async function pollMail() {
+  // Silent 24h auto-drop for unresponded invites: one indexed UPDATE, no
+  // notifications, no logging. Runs regardless of mail configuration.
+  try { sweepStaleAppointments(); } catch { /* never break the poll */ }
   if (!imapReady()) return;
   try {
     const mails = await fetchUnseen(settings.imap, 50);
@@ -1549,7 +1553,7 @@ const server = (Bun as any).serve({
           const apptId = decodeURIComponent(m[2]);
           if (!getConversation(id)) return json({ error: "not found" }, 404);
           const appt = getAppointment(apptId);
-          if (!appt || appt.conversation_id !== id) return json({ error: "not found" }, 404);
+          if (!appt || appt.conversation_id !== id || appt.status === "removed") return json({ error: "not found" }, 404);
           let body: any = {};
           try {
             body = await readBody(req);
@@ -1562,6 +1566,22 @@ const server = (Bun as any).serve({
         }
       }
       {
+        // Remove an unresponded invitation (sent with no reply yet, or
+        // received but not answered). No confirmation: a pending invite is
+        // cheap and can be re-sent. Answered invites are history — the route
+        // 404s on anything that isn't pending, and 'removed' rows stay gone.
+        const m = path.match(/^\/api\/conversations\/([^/]+)\/appointments\/([^/]+)$/);
+        if (m && method === "DELETE") {
+          const id = decodeURIComponent(m[1]);
+          const apptId = decodeURIComponent(m[2]);
+          if (!getConversation(id)) return json({ error: "not found" }, 404);
+          const appt = getAppointment(apptId);
+          if (!appt || appt.conversation_id !== id || appt.status === "removed") return json({ error: "not found" }, 404);
+          if (appt.status !== "sent" && appt.status !== "received") return json({ error: "not found" }, 404);
+          return json({ appointment: removeAppointment(apptId), removed: true });
+        }
+      }
+      {
         // RSVP to an invitation: updates the diary and, when the invitation
         // names an organizer, emails them a real METHOD:REPLY .ics.
         const m = path.match(/^\/api\/conversations\/([^/]+)\/appointments\/([^/]+)\/rsvp$/);
@@ -1570,7 +1590,7 @@ const server = (Bun as any).serve({
           const apptId = decodeURIComponent(m[2]);
           if (!getConversation(id)) return json({ error: "not found" }, 404);
           const appt = getAppointment(apptId);
-          if (!appt || appt.conversation_id !== id) return json({ error: "not found" }, 404);
+          if (!appt || appt.conversation_id !== id || appt.status === "removed") return json({ error: "not found" }, 404);
           let body: any = {};
           try {
             body = await readBody(req);

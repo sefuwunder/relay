@@ -614,6 +614,12 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
 .inv-btn.accept { background: var(--green); color: #fff; }
 .inv-btn.decline { background: rgba(120,120,128,0.16); color: var(--label-1); }
 .inv-btn:active { transform: scale(0.97); }
+/* One-tap remove for unresponded invites (sent / received). Quiet by design:
+   a small ✕ in the card header, no confirmation. */
+.inv-remove { border: none; background: transparent; color: var(--label-2); width: 30px; height: 30px; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 0; }
+.inv-remove .ic { width: 15px; height: 15px; }
+.inv-remove:hover { background: rgba(120,120,128,0.18); color: var(--label-1); }
+.inv-remove:active { transform: scale(0.94); }
 .appt-status { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; padding: 3px 8px; border-radius: 999px; background: rgba(120,120,128,0.18); color: var(--label-2); white-space: nowrap; }
 .appt-status.st-received { background: rgba(37,99,235,0.16); color: var(--blue); }
 .appt-status.st-accepted { background: rgba(22,163,74,0.16); color: var(--green); }

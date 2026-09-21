@@ -133,6 +133,7 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_appt_conv ON appointments(conversation_id, starts_at);
     CREATE INDEX IF NOT EXISTS idx_appt_msg ON appointments(message_id);
     CREATE INDEX IF NOT EXISTS idx_appt_uid ON appointments(uid);
+    CREATE INDEX IF NOT EXISTS idx_appt_sweep ON appointments(status, created_at);
     CREATE TABLE IF NOT EXISTS kv (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL DEFAULT ''
@@ -408,7 +409,7 @@ export interface Appointment {
   location: string;
   description: string;
   organizer: string;
-  /** sent | received | accepted | declined | cancelled */
+  /** sent | received | accepted | declined | cancelled | planned | removed */
   status: string;
   created_at: string;
 }
@@ -440,9 +441,10 @@ export function insertAppointment(a: {
   return row;
 }
 
-/** Every appointment in a conversation, chronological. */
+/** Every appointment in a conversation, chronological. Removed (unresponded,
+    user-deleted or 24h-auto-dropped) invites are hidden from the diary. */
 export function listAppointments(convId: string): Appointment[] {
-  return db.query("SELECT * FROM appointments WHERE conversation_id = ? ORDER BY starts_at, created_at")
+  return db.query("SELECT * FROM appointments WHERE conversation_id = ? AND status != 'removed' ORDER BY starts_at, created_at")
     .all(convId) as Appointment[];
 }
 
@@ -470,6 +472,33 @@ export function getAppointmentsForMessages(messageIds: string[]): Map<string, Ap
 export function setAppointmentStatus(id: string, status: string): Appointment | null {
   db.query("UPDATE appointments SET status = ? WHERE id = ?").run(status, id);
   return getAppointment(id);
+}
+
+/**
+ * Mark an unresponded invitation as removed. The row stays (UID dedupe keeps
+ * working, so a re-polled copy of the same invite can't resurrect it), but the
+ * card no longer renders and the diary panel stops listing it. Callers must
+ * only pass appointments whose status is 'sent' or 'received'.
+ */
+export function removeAppointment(id: string): Appointment | null {
+  db.query("UPDATE appointments SET status = 'removed' WHERE id = ?").run(id);
+  return getAppointment(id);
+}
+
+/**
+ * Silently drop unresponded invites older than 24h (by creation time). One
+ * indexed UPDATE, no per-conversation fan-out, no notifications, no logging —
+ * they simply stop rendering. Never touches responded invites
+ * (accepted/declined/cancelled) or diary entries ('planned'). The cutoff is
+ * an ISO string (same shape as created_at) so the comparison is exact.
+ * Returns the number of rows moved (for tests; the server never logs it).
+ */
+export function sweepStaleAppointments(cutoffIso?: string): number {
+  const cutoff = cutoffIso || new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const r = db.query(
+    "UPDATE appointments SET status = 'removed' WHERE status IN ('sent','received') AND created_at < ?"
+  ).run(cutoff);
+  return Number((r as any).changes || 0);
 }
 
 /** All attachments for a set of message ids, in one query. */
