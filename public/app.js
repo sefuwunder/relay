@@ -206,6 +206,15 @@ function inviteCard(m, a) {
 /** Parsed meeting suggestions for the messages on screen, keyed by message id.
  *  Rebuilt on every conversation render; powers the "Add to diary" chips. */
 const mtgCache = new Map();
+/** Agreement slots already chipped this render ("start|end") — two
+ *  affirmations of the same proposal only ever produce one chip. */
+const mtgAgreedSlots = new Set();
+/** Agreement lookback: how far back (messages / time) an affirmation may
+ *  reach for the proposal it confirms. */
+const AGREE_LOOKBACK_N = 10;
+const AGREE_LOOKBACK_MS = 48 * 3600 * 1000;
+/** Deadline-ish words: a date/time in such a message is not a meeting proposal. */
+const AGREE_DEADLINE_RE = /\b(due|deadline|deadlines|submit(?:ted|ting)?|expires?|expiration)\b/i;
 
 /** "Tue 1:00 PM" from a UTC ISO instant, in local time. */
 function fmtMtgWhen(iso) {
@@ -230,17 +239,63 @@ function toLocalInput(d) {
 }
 
 /** Inline "Add to diary" chip for a message that looks like an ad-hoc meeting
- *  request. Empty string when there's nothing to offer: no detection library,
- *  no meeting cue + date/time, or a diary entry already exists for the message. */
+ *  request — or an affirmative reply confirming a proposal earlier in the
+ *  thread (see agreementChipFor). Empty string when there's nothing to offer:
+ *  no detection library, no meeting cue + date/time, no confirmable proposal,
+ *  or a diary entry already exists for the message. */
 function meetingChipFor(m) {
   if (!m || !m.body || typeof RelayDates === "undefined") return "";
   if (m.appointment) return "";
   if ((state.diary || []).some((a) => a.message_id && String(a.message_id) === String(m.id))) return "";
   let det = null;
   try { det = RelayDates.detectMeetingRequest(m.body); } catch { return ""; }
-  if (!det) return "";
+  if (!det) return agreementChipFor(m);
   mtgCache.set(m.id, { msg: m, det });
   return `<button class="mtg-chip" data-mtg="${esc(m.id)}" title="Add this to your diary">${icon("calendar")}<span>Add to diary · ${esc(fmtMtgWhen(det.start))}</span></button>`;
+}
+
+/** "Add to diary" chip on an affirmative reply ("Yes, see you then.") that
+ *  confirms a meeting proposal earlier in the same conversation. The chip
+ *  inherits the proposal's concrete date+time and its tooltip names the
+ *  source message, so the inherited time never looks hallucinated.
+ *  Conservative by design: the proposal must carry a concrete date AND an
+ *  explicit time (never a defaulted 09:00), must not read like a deadline,
+ *  must sit within the lookback window, and the slot must not already be in
+ *  the diary. A bare "yes" with no proposal nearby produces nothing. */
+function agreementChipFor(m) {
+  if (!m || !m.body || typeof RelayDates === "undefined") return "";
+  let aff = null;
+  try { aff = RelayDates.detectAffirmation(m.body); } catch { return ""; }
+  if (!aff) return "";
+  const msgs = state.messages || [];
+  const idx = msgs.findIndex((x) => String(x.id) === String(m.id));
+  if (idx < 0) return "";
+  const mAt = new Date(m.created_at).getTime();
+  let proposal = null, pdet = null;
+  for (let i = idx - 1, n = 0; i >= 0 && n < AGREE_LOOKBACK_N; i++, n++) {
+    const p = msgs[i];
+    if (!p || !p.body || p.appointment) continue;
+    const pAt = new Date(p.created_at).getTime();
+    if (isNaN(pAt) || isNaN(mAt) || mAt - pAt > AGREE_LOOKBACK_MS) break;
+    if (AGREE_DEADLINE_RE.test(p.body)) continue;
+    let dt = null;
+    try { dt = RelayDates.parseDateTime(p.body, pAt); } catch { continue; }
+    if (!dt || !dt.timeExplicit) continue;
+    proposal = p; pdet = dt; break; // most recent proposal wins
+  }
+  if (!proposal || !pdet) return "";
+  const slotKey = pdet.start + "|" + pdet.end;
+  if (mtgAgreedSlots.has(slotKey)) return "";
+  const diary = state.diary || [];
+  const covered = diary.some((a) =>
+    (a.message_id && (String(a.message_id) === String(m.id) || String(a.message_id) === String(proposal.id))) ||
+    (a.starts_at && a.ends_at && a.starts_at < pdet.end && a.ends_at > pdet.start));
+  if (covered) return "";
+  mtgAgreedSlots.add(slotKey);
+  const snippet = String(proposal.body).trim().replace(/\s+/g, " ").slice(0, 80);
+  const det = { start: pdet.start, end: pdet.end, matchedText: pdet.matchedText, cue: "agreement", fromText: snippet };
+  mtgCache.set(m.id, { msg: m, det });
+  return `<button class="mtg-chip" data-mtg="${esc(m.id)}" title="Add to diary — time from &quot;${esc(snippet)}&quot;">${icon("calendar")}<span>Add to diary · ${esc(fmtMtgWhen(det.start))}</span></button>`;
 }
 
 /** Open the diary-entry composer pre-filled from a flagged message. */
@@ -255,7 +310,9 @@ function openDiaryComposer(mid) {
     start: toLocalInput(new Date(det.start)),
     end: toLocalInput(new Date(det.end)),
     location: "",
-    desc: String(msg.body || "").slice(0, 500),
+    desc: det.fromText
+      ? (String(msg.body || "").slice(0, 300) + `\n(time from: "${det.fromText}")`).slice(0, 500)
+      : String(msg.body || "").slice(0, 500),
   };
   renderDiaryComposer();
 }
@@ -2458,6 +2515,7 @@ function renderConversationDetail() {
   const conv = state.conv;
   if (!conv) { location.hash = "#/conversations"; return; }
   mtgCache.clear(); // rebuilt per render by meetingChipFor
+  mtgAgreedSlots.clear();
   // Preserve the in-progress draft across re-renders (file picks, refreshes).
   const keepDraft = $("#draft") ? $("#draft").value : "";
   const keepSubj = $("#subject") ? $("#subject").value : "";

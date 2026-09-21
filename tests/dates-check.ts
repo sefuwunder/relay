@@ -3,7 +3,7 @@
 // 10:00 LOCAL), and expectations are built with local Date arithmetic so the
 // suite passes in any timezone.
 // Run: bun tests/dates-check.ts
-import { parseDateTime, detectMeetingRequest } from "../src/dates";
+import { parseDateTime, detectMeetingRequest, detectAffirmation } from "../src/dates";
 
 let pass = 0, fail = 0;
 function ok(name: string, cond: any) {
@@ -153,6 +153,54 @@ for (const text of negatives) {
   const r = detectMeetingRequest("call tomorrow at 1pm?", NOW);
   ok("cue reported", r!.cue === "call");
   ok("empty text", detectMeetingRequest("", NOW) === null);
+}
+
+// ---------- explicit-time flag (drives agreement inheritance) ----------
+{
+  const r = parseDateTime("tomorrow 10:30 - 11:30?", NOW);
+  ok("range time is explicit", r!.timeExplicit === true);
+  ok("range start", startOf(r) === at(2026, 9, 21, 10, 30));
+  const r2 = parseDateTime("call tomorrow", NOW);
+  ok("date-only time is not explicit", r2!.timeExplicit === false);
+  const r3 = parseDateTime("meet tonight", NOW);
+  ok("tonight alone is not explicit", r3!.timeExplicit === false);
+  const r4 = parseDateTime("lunch friday morning", NOW);
+  ok("morning is explicit", r4!.timeExplicit === true);
+  const r5 = parseDateTime("sync day after tomorrow for 30 min", NOW);
+  ok("duration-only is not explicit", r5!.timeExplicit === false);
+}
+
+// ---------- agreement affirmations ----------
+{
+  const affs: Array<[string, string]> = [
+    ["Yes, see you then.", "yes"],
+    ["Yes.", "yes"],
+    ["yes", "yes"],
+    ["SOUNDS GOOD", "sounds good"],
+    ["Sounds good", "sounds good"],
+    ["works for me", "works for me"],
+    ["that works!", "that works"],
+    ["perfect", "perfect"],
+    ["confirmed", "confirmed"],
+    ["looking forward to it", "looking forward to it"],
+    ["deal.", "deal"],
+    ["ok, see you then", "ok"],
+  ];
+  for (const [text, want] of affs) {
+    ok(`affirmation: ${text}`, detectAffirmation(text) === want);
+  }
+  const rejects = [
+    "yes but I can't make it",
+    "sounds good, however I have a conflict",
+    "Did you send it?",
+    "yesterday",
+    "yes " + "and ".repeat(30),          // too long
+    "the meeting is confirmed for tuesday at 3pm", // carries its own date
+    "",
+  ];
+  for (const text of rejects) {
+    ok(`not an affirmation: ${text.slice(0, 30)}`, detectAffirmation(text) === null);
+  }
 }
 
 console.log(`dates: ${pass} passed, ${fail} failed`);

@@ -8,9 +8,11 @@
 import RelayDates from "../public/dates.js";
 
 export const parseDateTime: (text: string, nowMs?: number) => {
-  start: string; end: string; matchedText: string;
+  start: string; end: string; matchedText: string; timeExplicit: boolean;
 } | null = RelayDates.parseDateTime;
 
 export const detectMeetingRequest: (text: string, nowMs?: number) => {
   start: string; end: string; matchedText: string; cue: string;
 } | null = RelayDates.detectMeetingRequest;
+
+export const detectAffirmation: (text: string) => string | null = RelayDates.detectAffirmation;

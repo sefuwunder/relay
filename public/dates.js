@@ -29,6 +29,14 @@
  * BOTH a parseable date/time expression AND a meeting-ish cue (meet, call,
  * talk, coffee, lunch, catch up, "free at…?", …). Plain deadlines like
  * "the report is due tomorrow" do not flag.
+ *
+ * AGREEMENT RULE (detectAffirmation + agreementChipFor in app.js): a short
+ * affirmative reply with no date/time of its own ("Yes, see you then.") can
+ * inherit the time from the most recent meeting proposal (concrete date AND
+ * explicit time, not a deadline) in the previous ~10 messages / 48h of the
+ * same conversation. The chip's tooltip names the source message so the
+ * inherited time never looks hallucinated. Bare "yes" with no proposal in the
+ * window never flags.
  */
 
 var DAY_MS = 86400000;
@@ -119,10 +127,15 @@ function parseDateTime(text, nowMs) {
   if (!m) return null;
   var out = resolveGroups(m.groups || {}, now);
   if (!out) return null;
+  var gg = m.groups || {};
   return {
     start: new Date(out.start).toISOString(),
     end: new Date(out.end).toISOString(),
     matchedText: m[0].trim(),
+    // True when the message named an explicit time ("10:30", "noon",
+    // "morning"); false when the time is just the 09:00 date-only default.
+    // Agreement detection only inherits explicit times, never defaults.
+    timeExplicit: !!(gg.tod || gg.h12 || gg.h24),
   };
 }
 
@@ -203,9 +216,45 @@ function detectMeetingRequest(text, nowMs) {
   return { start: dt.start, end: dt.end, matchedText: dt.matchedText, cue: cueM[0].trim().toLowerCase() };
 }
 
+// Agreement affirmations: short affirmative replies ("Yes.", "Yes, see you
+// then.", "Sounds good") that confirm a meeting proposal made earlier in the
+// thread. A tight curated list — the reply must be short, carry no date/time
+// of its own, and contain no contradiction ("yes, but…"). The meeting time is
+// inherited from the proposal by the caller (see agreementChipFor in app.js);
+// this only says "this message sounds like an agreement".
+var AFFIRM_PHRASES = [
+  "sounds good", "works for me", "that works", "see you then",
+  "looking forward to it", "perfect", "confirmed", "deal",
+];
+var AFFIRM_WORDS = ["yes", "yeah", "yep", "yup", "ya", "sure", "ok", "okay", "great", "awesome"];
+// Contradictions that disqualify an otherwise affirmative-looking reply.
+var AFFIRM_NO_RE = /\b(but|however|though|although|unless|can'?t|cannot|won'?t|not yet)\b/i;
+
+function detectAffirmation(text) {
+  var t = String(text || "").trim().toLowerCase().replace(/[.!…]+$/, "").trim();
+  if (!t || t.length > 80 || t.indexOf("?") !== -1) return null;
+  var hit = null, i, w, rest;
+  for (i = 0; i < AFFIRM_PHRASES.length; i++) {
+    var p = AFFIRM_PHRASES[i];
+    if (t === p || (t.indexOf(p) === 0 && /^[\s,;:]/.test(t.slice(p.length)))) { hit = p; break; }
+  }
+  if (!hit) {
+    for (i = 0; i < AFFIRM_WORDS.length; i++) {
+      w = AFFIRM_WORDS[i];
+      if (t === w || (t.indexOf(w) === 0 && /^[\s,;:.!]/.test(t.slice(w.length)))) { hit = w; break; }
+    }
+  }
+  if (!hit) return null;
+  var tail = t.slice(hit.length);
+  if (tail.length > 50) return null;
+  if (AFFIRM_NO_RE.test(tail)) return null;
+  return hit;
+}
+
 var RelayDates = {
   parseDateTime: parseDateTime,
   detectMeetingRequest: detectMeetingRequest,
+  detectAffirmation: detectAffirmation,
 };
 
 if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
