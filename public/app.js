@@ -272,11 +272,12 @@ function agreementChipFor(m) {
   if (idx < 0) return "";
   const mAt = new Date(m.created_at).getTime();
   let proposal = null, pdet = null;
-  for (let i = idx - 1, n = 0; i >= 0 && n < AGREE_LOOKBACK_N; i++, n++) {
+  for (let i = idx - 1, n = 0; i >= 0 && n < AGREE_LOOKBACK_N; i--, n++) {
     const p = msgs[i];
     if (!p || !p.body || p.appointment) continue;
     const pAt = new Date(p.created_at).getTime();
-    if (isNaN(pAt) || isNaN(mAt) || mAt - pAt > AGREE_LOOKBACK_MS) break;
+    // continue (not break): messages may not be perfectly chronological.
+    if (isNaN(pAt) || isNaN(mAt) || mAt - pAt > AGREE_LOOKBACK_MS) continue;
     if (AGREE_DEADLINE_RE.test(p.body)) continue;
     let dt = null;
     try { dt = RelayDates.parseDateTime(p.body, pAt); } catch { continue; }

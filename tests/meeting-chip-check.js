@@ -224,6 +224,69 @@ ok("draft cached", state.diaryDraft && state.diaryDraft.convId === "c1" && state
   A.openDiaryComposer("m1"); // restore the composer draft the save-tests below expect
 }
 
+// ---------- agreement chips: real email bodies with quoted cruft ----------
+// The real-world miss: the affirmation arrives as an email body carrying the
+// quoted reply, an attribution header, and a signature — none of which may
+// kill the affirmation. Also: an HTML body.
+{
+  const at = (d, h, mi) => new Date(2026, 8, d, h, mi).toISOString();
+  const savedMessages = state.messages;
+  const emailAffirm =
+    "Yes, see you then.\n\nOn Sun, Sep 20, 2026 at 7:58 PM Dan wrote:\n" +
+    "> tomorrow 10:30 - 11:30?\n\n-- \nDan Smith\nCEO, Example Corp";
+  state.messages = [
+    msg("e2", "tomorrow 10:30 - 11:30?", { created_at: at(20, 19, 58) }),
+    msg("e3", emailAffirm, { created_at: at(20, 20, 0) }),
+  ];
+  state.diary = [];
+  A.renderConversationDetail();
+  let html = document.getElementById("app").innerHTML;
+  ok("chip on affirmation with quoted reply + signature", html.includes('data-mtg="e3"'));
+  const e = A.mtgCache.get("e3");
+  ok("quoted affirmation inherits tomorrow 10:30 local", e && new Date(e.det.start).getTime() === new Date(2026, 8, 21, 10, 30).getTime());
+  ok("tooltip still names the source proposal", html.includes("tomorrow 10:30 - 11:30?"));
+
+  // HTML body variant.
+  state.messages = [
+    msg("e2", "tomorrow 10:30 - 11:30?", { created_at: at(20, 19, 58) }),
+    msg("e4", "<div>Yes, see you then.</div><div><br></div><div>Dan</div>", { created_at: at(20, 20, 0) }),
+  ];
+  A.renderConversationDetail();
+  html = document.getElementById("app").innerHTML;
+  ok("chip on HTML affirmation body", html.includes('data-mtg="e4"'));
+
+  // Greeting + affirmation on line two.
+  state.messages = [
+    msg("e2", "tomorrow 10:30 - 11:30?", { created_at: at(20, 19, 58) }),
+    msg("e5", "Hi Dan,\nYes, see you then.", { created_at: at(20, 20, 0) }),
+  ];
+  A.renderConversationDetail();
+  html = document.getElementById("app").innerHTML;
+  ok("chip when affirmation follows a greeting line", html.includes('data-mtg="e5"'));
+
+  // Quoted-only "yes" (no own words) -> no chip.
+  state.messages = [
+    msg("e2", "tomorrow 10:30 - 11:30?", { created_at: at(20, 19, 58) }),
+    msg("e6", "On Sun, Sep 20, 2026 at 7:58 PM Dan wrote:\n> let's do it\n> yes", { created_at: at(20, 20, 0) }),
+  ];
+  A.renderConversationDetail();
+  html = document.getElementById("app").innerHTML;
+  ok("no chip on quoted-only yes", !html.includes("data-mtg="));
+
+  // Unsorted message order: an older message between proposal and affirmation
+  // must not abort the lookback (break -> continue hardening).
+  state.messages = [
+    msg("u1", "tomorrow 10:30 - 11:30?", { created_at: at(20, 19, 58) }),
+    msg("u0", "hello from last week", { created_at: at(13, 9, 0) }),
+    msg("u2", "yes", { created_at: at(20, 20, 0) }),
+  ];
+  A.renderConversationDetail();
+  html = document.getElementById("app").innerHTML;
+  ok("chip survives unsorted message order", html.includes('data-mtg="u2"'));
+
+  state.messages = savedMessages; state.diary = []; A.renderConversationDetail();
+}
+
 // Saving POSTs the entry to the diary store — same appointments endpoint.
 (async () => {
   document.getElementById("dc-title").value = "Call";

@@ -230,25 +230,72 @@ var AFFIRM_WORDS = ["yes", "yeah", "yep", "yup", "ya", "sure", "ok", "okay", "gr
 // Contradictions that disqualify an otherwise affirmative-looking reply.
 var AFFIRM_NO_RE = /\b(but|however|though|although|unless|can'?t|cannot|won'?t|not yet)\b/i;
 
+// Strip common HTML entities to their plain-text equivalents.
+var HTML_ENTITIES = { amp: "&", lt: "<", gt: ">", nbsp: " ", quot: '"', "#39": "'", apos: "'" };
+function decodeEntities(s) {
+  return String(s).replace(/&([a-zA-Z#0-9]+);/g, function (m, e) {
+    return e in HTML_ENTITIES ? HTML_ENTITIES[e] : m;
+  });
+}
+
+/** The sender's own words, minus email cruft: quoted reply lines, attribution
+ *  headers ("On … wrote:", "-----Original Message-----"), and signatures.
+ *  Returns the remaining non-empty lines, trimmed. Quoted "yes" lines do not
+ *  count as the sender's own words — this is what lets detectAffirmation stay
+ *  conservative on real email bodies. */
+function firstUtterance(text) {
+  var t = String(text || "");
+  // Looks like HTML? Convert to text: block tags become newlines, the rest
+  // are stripped, entities decoded.
+  if (/<[a-zA-Z][^>]*>/.test(t)) {
+    t = t
+      .replace(/<(br|p|div|li|tr|h[1-6])[^>]*>/gi, "\n")
+      .replace(/<\/(p|div|li|tr|h[1-6]|blockquote)>|<\/blockquote[^>]*>/gi, "\n")
+      .replace(/<[^>]+>/g, " ");
+    t = decodeEntities(t);
+  }
+  var lines = t.split(/\r?\n/);
+  var out = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    // Signature delimiter: everything from here down is not the sender.
+    if (/^(-- ?|__|~~)$/.test(line)) break;
+    // Quoted reply lines and attribution headers belong to the other side.
+    if (/^[>|»]/.test(line)) continue;
+    if (/^on .+wrote:?\s*$/i.test(line)) continue;
+    if (/^.*\bwrote:\s*$/.test(line)) continue;
+    if (/^-+\s*original message\s*-+$/i.test(line)) continue;
+    if (/^sent from (my|an) (iphone|ipad|android)/i.test(line)) break;
+    out.push(line);
+  }
+  return out;
+}
+
 function detectAffirmation(text) {
-  var t = String(text || "").trim().toLowerCase().replace(/[.!…]+$/, "").trim();
-  if (!t || t.length > 80 || t.indexOf("?") !== -1) return null;
-  var hit = null, i, w, rest;
-  for (i = 0; i < AFFIRM_PHRASES.length; i++) {
-    var p = AFFIRM_PHRASES[i];
-    if (t === p || (t.indexOf(p) === 0 && /^[\s,;:]/.test(t.slice(p.length)))) { hit = p; break; }
-  }
-  if (!hit) {
-    for (i = 0; i < AFFIRM_WORDS.length; i++) {
-      w = AFFIRM_WORDS[i];
-      if (t === w || (t.indexOf(w) === 0 && /^[\s,;:.!]/.test(t.slice(w.length)))) { hit = w; break; }
+  var lines = firstUtterance(text).slice(0, 3);
+  if (!lines.length) lines = [String(text || "").trim()];
+  for (var li = 0; li < lines.length; li++) {
+    var t = lines[li].toLowerCase().replace(/[.!…]+$/, "").trim();
+    if (!t || t.length > 80 || t.indexOf("?") !== -1) continue;
+    var hit = null, i, w;
+    for (i = 0; i < AFFIRM_PHRASES.length; i++) {
+      var p = AFFIRM_PHRASES[i];
+      if (t === p || (t.indexOf(p) === 0 && /^[\s,;:]/.test(t.slice(p.length)))) { hit = p; break; }
     }
+    if (!hit) {
+      for (i = 0; i < AFFIRM_WORDS.length; i++) {
+        w = AFFIRM_WORDS[i];
+        if (t === w || (t.indexOf(w) === 0 && /^[\s,;:.!]/.test(t.slice(w.length)))) { hit = w; break; }
+      }
+    }
+    if (!hit) continue;
+    var tail = t.slice(hit.length);
+    if (tail.length > 50) continue;
+    if (AFFIRM_NO_RE.test(tail)) continue;
+    return hit;
   }
-  if (!hit) return null;
-  var tail = t.slice(hit.length);
-  if (tail.length > 50) return null;
-  if (AFFIRM_NO_RE.test(tail)) return null;
-  return hit;
+  return null;
 }
 
 var RelayDates = {

@@ -189,6 +189,29 @@ for (const text of negatives) {
   for (const [text, want] of affs) {
     ok(`affirmation: ${text}`, detectAffirmation(text) === want);
   }
+  // Email cruft: quotes, attribution headers, signatures, HTML must not kill
+  // the affirmation; the sender's own words still count.
+  const crufty: Array<[string, string]> = [
+    ["Yes, see you then.\n\nOn Sun, Sep 20, 2026 at 7:58 PM Dan wrote:\n> tomorrow 10:30 - 11:30?", "yes"],
+    ["Yes, see you then.\n> tomorrow 10:30 - 11:30?", "yes"],
+    ["Yes, see you then.\n-----Original Message-----\nFrom: Dan <dan@x.com>\ntomorrow 10:30 - 11:30?", "yes"],
+    ["Hi Dan,\nYes, see you then.", "yes"],
+    ["Sounds good.\n\n-- \nDan Smith\nCEO, Example Corp\n+1 555-0100\nsent from somewhere else entirely", "sounds good"],
+    ["<div>Yes, see you then.</div><div><br></div><div>Dan</div>", "yes"],
+    ["<div><b>Sounds good</b></div><blockquote>tomorrow 10:30 - 11:30?</blockquote>", "sounds good"],
+  ];
+  for (const [text, want] of crufty) {
+    ok(`affirmation through email cruft: ${text.slice(0, 40)}`, detectAffirmation(text) === want);
+  }
+  const cruftRejects = [
+    "On Sun, Sep 20, 2026 at 7:58 PM Dan wrote:\n> let's meet tomorrow at 10:30?\n> yes", // quoted "yes" is not the sender's own words
+    "> yes",                                                      // quote-only
+    "Sounds good, but I can't make it.\n> tomorrow 10:30 - 11:30?", // contradiction survives cruft
+    "-- \nDan Smith",                                             // signature only
+  ];
+  for (const text of cruftRejects) {
+    ok(`not an affirmation through cruft: ${text.slice(0, 30)}`, detectAffirmation(text) === null);
+  }
   const rejects = [
     "yes but I can't make it",
     "sounds good, however I have a conflict",
