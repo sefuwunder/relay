@@ -15,7 +15,7 @@ import {
 import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
 import { fetchIcalFeed, previewFromFeedText, type CalPreviewEvent } from "./calfeed";
 import { sendMail, validateSmtp, gvGatewayAddress, newMessageId, type SmtpConfig, type MailAttachment } from "./smtp";
-import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, lookupEnvelopesByMessageId, type ImapConfig, type SentMailItem, type InboundAttachment, type UnseenMail } from "./imap";
+import { fetchUnseen, validateImap, extractEmail, harvestSentContacts, harvestRecentSms, gvNumberFrom, latestGvForward, latestEmailWith, fetchInboxBody, fetchInboxMessageId, stripGvFooter, stripEmailQuotes, fetchMailAttachments, fetchSentMail, parseGvNumber, parseMissedCall, lookupEnvelopesByMessageId, type ImapConfig, type SentMailItem, type InboundAttachment, type UnseenMail } from "./imap";
 import { matrixSend, matrixSync, validateMatrix, matrixRooms, type MatrixConfig } from "./matrix";
 import {
   googleAuthUrl, exchangeCode, refreshAccessToken, googleAccountEmail, listGoogleContacts,
@@ -730,6 +730,19 @@ async function pollMail() {
       const extId = `mail:${m.uid}`;
       if (hasExternalId(extId)) continue;
       const rawFrom = m.from || "";
+      // Google Voice missed-call alerts become a 📞 message in the caller's
+      // conversation instead of an email thread.
+      const missed = parseMissedCall(rawFrom, m.subject || "", m.body || "");
+      if (missed) {
+        const caller = byGv.get(missed.digits) || null;
+        if (!caller) continue; // not from someone we track
+        insertTracked({
+          conversation_id: dmFor(caller.id).id, channel: "sms", direction: "in",
+          body: `📞 Missed call from ${missed.name}`, subject: "",
+          external_id: extId, message_id: m.messageId || "", status: "",
+        });
+        continue;
+      }
       const gvNum = gvNumberFrom(rawFrom, m.subject || "", m.returnPath || "");
       let contact: Contact | null = null;
       let channel: Channel = "email";

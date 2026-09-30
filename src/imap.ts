@@ -988,6 +988,23 @@ export function gvNumberFrom(from: string, subject: string, returnPath: string):
   return parseGvNumber(from) || (GV_BOUNCE_RE.test(returnPath) ? subjectPhone(subject) : "");
 }
 
+/**
+ * Google Voice missed-call notification: sent from voice-noreply@google.com
+ * with subject "New missed call from <Name>." and a text body containing
+ * "You missed a call from <Name> (<phone>)." Returns the caller name and the
+ * normalized 10-digit phone, or null when the mail isn't such a notification.
+ */
+export function parseMissedCall(from: string, subject: string, body: string): { name: string; digits: string } | null {
+  if (!(from || "").toLowerCase().includes("voice-noreply@google.com")) return null;
+  if (!/^new missed call from\b/i.test(subject || "")) return null;
+  const m = (body || "").match(/you missed a call from\s+(.+?)\s*\(?(\d{3})\)?[.\s-]*(\d{3})[.\s-]*(\d{4})/i);
+  if (!m) return null;
+  const digits = (m[2] + m[3] + m[4]).replace(/\D/g, "");
+  if (digits.length !== 10) return null;
+  const name = (m[1] || "").trim().replace(/^["'“”]+|["'“”]+$/g, "");
+  return { name: name || "Unknown", digits };
+}
+
 /** Display name from an envelope addrText: `"Acela (SMS)" <...>` or `Acela (SMS) <...>` or "". */
 function displayNameOf(addrText: string): string {
   const t = (addrText || "").trim();
