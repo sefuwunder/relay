@@ -20,6 +20,8 @@ export interface ImapConfig {
   user: string;
   pass: string;
   secure?: boolean; // default true; false = plain TCP (test stub only)
+  /** Mailbox polled for note-style emails (Apple Mail "Notes" convention). Default "Notes". */
+  notes_folder?: string;
 }
 
 export interface StarredMail {
@@ -646,15 +648,17 @@ export interface UnseenMail {
   to: string[];
   subject: string;
   date: string;
+  /** Full INTERNALDATE as ISO UTC ("" when unparseable). */
+  dateTime: string;
   snippet: string; // 280-char preview for list views
   body: string;    // fuller decoded text (4000 chars) for stored messages
   returnPath: string;
   messageId: string; // ENVELOPE message-id — used to thread SMS replies
 }
 
-/** Fetch UNSEEN messages from INBOX (oldest first), then mark them \Seen. */
-export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenMail[]> {
-  const conn = await login(cfg0);
+/** Fetch UNSEEN messages from a mailbox (INBOX by default, oldest first), then mark them \Seen. */
+export async function fetchUnseen(cfg0: ImapConfig, limit = 50, mailbox = "INBOX", bodyChars = 4000): Promise<UnseenMail[]> {
+  const conn = await login(cfg0, mailbox);
   try {
     const uids = parseSearchUids(await conn.cmd("b001", "UID SEARCH UNSEEN"));
     if (!uids.length) return [];
@@ -663,7 +667,7 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
     // One batched fetch sized for stored bodies (4000 chars); the 280-char
     // list preview is just a prefix of it. (The poller used to store the
     // 280-char snippet as the whole message body, truncating longer mail.)
-    const bodies = await fetchSnippets(conn, "b003", picked, 4000);
+    const bodies = await fetchSnippets(conn, "b003", picked, bodyChars);
     const rps = await fetchReturnPaths(conn, "b004", picked);
     const mails: UnseenMail[] = [];
     for (const uid of picked) {
@@ -675,6 +679,7 @@ export async function fetchUnseen(cfg0: ImapConfig, limit = 50): Promise<UnseenM
         to: e.to,
         subject: e.subject || "(no subject)",
         date: e.date,
+        dateTime: e.dateTime || "",
         snippet: body.slice(0, 280),
         body,
         returnPath: rps.get(uid) || "",

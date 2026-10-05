@@ -10,7 +10,9 @@ import {
   insertAttachment, getAttachment, listAttachmentsForMessages, listConversationAttachments, searchConversationAttachments, deleteConversationData,
   insertAppointment, listAppointments, getAppointment, getAppointmentByUid, getAppointmentsForMessages, setAppointmentStatus,
   removeAppointment, sweepStaleAppointments,
-  type Contact, type Conversation, type Channel, type Message, type Attachment, type Appointment,
+  listEmailMessages,
+  insertNotesMail, hasNotesMailUid, listNotesMail,
+  type Contact, type Conversation, type Channel, type Message, type Attachment, type Appointment, type EmailFeedRow, type NotesMailRow,
 } from "./db";
 import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
 import { fetchIcalFeed, previewFromFeedText, type CalPreviewEvent } from "./calfeed";
@@ -208,7 +210,7 @@ interface Settings {
 
 const DEFAULT_SETTINGS: Settings = {
   smtp: { host: "", port: 465, secure: "ssl", user: "", pass: "", from: "", fromName: "" },
-  imap: { host: "", port: 993, user: "", pass: "" },
+  imap: { host: "", port: 993, user: "", pass: "", notes_folder: "Notes" },
   matrix: { homeserver: "", token: "", userId: "" },
   google: { clientId: "", clientSecret: "", accessToken: "", refreshToken: "", expiresAt: 0, email: "" },
   calendar: { feedUrl: "", lastSyncAt: "" },
@@ -812,6 +814,42 @@ async function pollMail() {
   }
 }
 
+// ---------- notes-folder poll (for Abba ingest) ----------
+
+/**
+ * Poll the IMAP notes folder (Apple Mail convention: each message is a note,
+ * Subject = title, body = markdown) and store unseen messages in notes_mail
+ * for Abba to ingest via /api/relay/notes-emails.
+ *
+ * Runs on its own 5-minute interval — notes change far less often than chat.
+ * If the folder doesn't exist on the server (or IMAP isn't configured), it
+ * skips quietly: no error, no folder creation.
+ */
+async function pollNotesFolder() {
+  if (!imapReady()) return;
+  const folder = (settings.imap.notes_folder || "Notes").trim() || "Notes";
+  let mails: UnseenMail[];
+  try {
+    mails = await fetchUnseen(settings.imap, 50, folder, 8000);
+  } catch {
+    return; // folder missing, server hiccup — try again next interval
+  }
+  for (const m of mails) {
+    if (hasNotesMailUid(m.uid)) continue; // already harvested
+    const body = stripEmailQuotes(m.body || "") || "(empty note)";
+    const rawDate = m.dateTime || "";
+    const dateIso = rawDate && !Number.isNaN(Date.parse(rawDate)) ? new Date(rawDate).toISOString() : new Date().toISOString();
+    insertNotesMail({
+      uid: m.uid,
+      message_id: m.messageId || "",
+      subject: m.subject || "(no subject)",
+      body,
+      from_addr: m.from || "",
+      date_iso: dateIso,
+    });
+  }
+}
+
 // ---------- sent-mail import ----------
 
 /** Normalize a subject for duplicate comparison: lowercase, strip Re:/Fwd:. */
@@ -1104,6 +1142,10 @@ function startPollers() {
   // IMAP on an interval.
   setInterval(() => { pollMail().catch(() => {}); }, 60000);
   setTimeout(() => { pollMail().catch(() => {}); }, 5000);
+  // Notes-folder poll (for Abba ingest): 5-minute cadence — notes change far
+  // less often than chat. Skips quietly when the folder is missing.
+  setInterval(() => { pollNotesFolder().catch(() => {}); }, 5 * 60000);
+  setTimeout(() => { pollNotesFolder().catch(() => {}); }, 30000);
   // Matrix long-poll loop.
   (async () => {
     for (;;) {
@@ -1137,6 +1179,74 @@ const server = (Bun as any).serve({
           contacts: countActiveContacts(), maxPeople: MAX_PEOPLE,
           lastPoll,
         });
+      }
+
+      // ----- relay email feed (for Switchboard) -----
+      // A local service (Switchboard) polls this to incremental-sync Relay's
+      // IMAP-synced email store. Localhost only — no auth. `since` is a unix
+      // timestamp cursor; results ascend by date so the last item's `date`
+      // is the next cursor. Reads only what Relay's own poll already synced;
+      // it never fetches from IMAP itself.
+      if (path === "/api/relay/emails" && method === "GET") {
+        const since = Math.max(0, Number(url.searchParams.get("since") || 0) || 0);
+        const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") || 50) || 50));
+        const sinceMs = since > 0 && since < 1e12 ? since * 1000 : since; // accept unix seconds as well as ms
+        const sinceIso = new Date(sinceMs).toISOString();
+        const rows = listEmailMessages(sinceIso, limit);
+        const emails = rows.map((r) => {
+          let parts: string[] = [];
+          try { parts = JSON.parse(r.participants || "[]"); } catch { parts = []; }
+          const contacts = parts
+            .map((id) => getContact(id))
+            .filter((c): c is Contact => !!c);
+          let from = "", from_name = "", to = "";
+          if (r.direction === "out") {
+            from = settings.smtp.from || settings.imap.user || "";
+            from_name = "me";
+            to = contacts.map((c) => c.email).filter(Boolean).join(", ");
+          } else {
+            const sender = contacts[0] || null;
+            from = sender?.email || "";
+            from_name = sender?.name || "";
+            to = settings.imap.user || "";
+          }
+          return {
+            id: r.id,
+            from,
+            from_name,
+            to,
+            subject: r.subject || "",
+            snippet: (r.body || "").slice(0, 200),
+            date: Math.floor(Date.parse(r.created_at) / 1000) || 0,
+            has_attachments: r.has_attachments > 0,
+          };
+        });
+        return json({ emails });
+      }
+
+      // ----- notes-mail feed (for Abba ingest) -----
+      // Note-style emails harvested from the IMAP notes folder (Apple Mail
+      // convention: Subject = title, body = markdown). Abba polls this to
+      // ingest notes. Localhost only — no auth. `since` accepts ms or unix
+      // seconds (magnitude check, same as /api/relay/emails); results ascend
+      // by date so the last item's `date` is the next cursor. `body` is the
+      // FULL cleaned body, not a snippet. Reads only what the notes-folder
+      // poll already stored; it never fetches from IMAP itself.
+      if (path === "/api/relay/notes-emails" && method === "GET") {
+        const since = Math.max(0, Number(url.searchParams.get("since") || 0) || 0);
+        const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") || 50) || 50));
+        const sinceMs = since > 0 && since < 1e12 ? since * 1000 : since; // accept unix seconds as well as ms
+        const sinceIso = new Date(sinceMs).toISOString();
+        const rows = listNotesMail(sinceIso, limit);
+        const emails = rows.map((r) => ({
+          id: r.id,
+          message_id: r.message_id || "",
+          subject: r.subject || "",
+          body: r.body || "",
+          from: r.from_addr || "",
+          date: Math.floor(Date.parse(r.date_iso) / 1000) || 0,
+        }));
+        return json({ emails });
       }
 
       // ----- settings -----

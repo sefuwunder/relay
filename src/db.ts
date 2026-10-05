@@ -116,6 +116,7 @@ export function openDb(path: string): Database {
     );
     CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_ext ON messages(external_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_email_created ON messages(channel, created_at);
     CREATE TABLE IF NOT EXISTS attachments (
       id TEXT PRIMARY KEY,
       message_id TEXT NOT NULL,
@@ -234,6 +235,21 @@ export function openDb(path: string): Database {
   if (!msgCols.some((c) => c.name === "participants")) {
     db.exec("ALTER TABLE messages ADD COLUMN participants TEXT NOT NULL DEFAULT ''");
   }
+  // Notes-folder mail store (for Abba ingest): note-style emails from the
+  // IMAP notes folder, kept separate from conversations/messages.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS notes_mail (
+      id TEXT PRIMARY KEY,
+      uid TEXT NOT NULL,
+      message_id TEXT NOT NULL DEFAULT '',
+      subject TEXT NOT NULL DEFAULT '',
+      body TEXT NOT NULL DEFAULT '',
+      from_addr TEXT NOT NULL DEFAULT '',
+      date_iso TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_mail_uid ON notes_mail(uid);
+  `);
   return db;
 }
 
@@ -410,8 +426,83 @@ export function listMessages(convId: string, limit = 100, before?: string): Mess
   return db.query("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?").all(convId, limit) as Message[];
 }
 
-export function insertMessage(m: Omit<Message, "id" | "created_at" | "message_id" | "participants"> & { created_at?: string; message_id?: string; participants?: string[] }): Message {
-  const row = { ...m, id: uid(), created_at: m.created_at || now() } as Message;
+/** Row shape for the Switchboard email feed. */
+export interface EmailFeedRow {
+  id: string;
+  direction: string;
+  subject: string;
+  body: string;
+  participants: string; // JSON array of contact ids
+  created_at: string;
+  has_attachments: number;
+}
+
+/**
+ * Email-channel messages for the Switchboard feed, ascending by time so a
+ * `since` cursor pages forward cleanly. Reads only what Relay's own IMAP
+ * poll already synced — no new fetching here.
+ */
+export function listEmailMessages(sinceIso: string, limit: number): EmailFeedRow[] {
+  return db.query(`
+    SELECT m.id, m.direction, m.subject, m.body, m.participants, m.created_at,
+           (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS has_attachments
+    FROM messages m
+    WHERE m.channel = 'email' AND m.created_at > ?
+    ORDER BY m.created_at ASC, m.id ASC
+    LIMIT ?
+  `).all(sinceIso, limit) as EmailFeedRow[];
+}
+
+/** A note-style email harvested from the IMAP notes folder. */
+export interface NotesMailRow {
+  id: string;
+  uid: string;
+  message_id: string;
+  subject: string;
+  body: string;
+  from_addr: string;
+  date_iso: string;
+  created_at: string;
+}
+
+/** Insert a harvested note email; dedupes on IMAP uid (INSERT OR IGNORE). */
+export function insertNotesMail(m: { uid: string; message_id?: string; subject?: string; body?: string; from_addr?: string; date_iso: string }): NotesMailRow {
+  const row: NotesMailRow = {
+    id: uid(),
+    uid: m.uid,
+    message_id: m.message_id || "",
+    subject: m.subject || "",
+    body: m.body || "",
+    from_addr: m.from_addr || "",
+    date_iso: m.date_iso,
+    created_at: now(),
+  };
+  db.query(`INSERT OR IGNORE INTO notes_mail (id, uid, message_id, subject, body, from_addr, date_iso, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(row.id, row.uid, row.message_id, row.subject, row.body, row.from_addr, row.date_iso, row.created_at);
+  return row;
+}
+
+export function hasNotesMailUid(uid: string): boolean {
+  const r = db.query("SELECT 1 FROM notes_mail WHERE uid = ? LIMIT 1").get(uid) as any;
+  return !!r;
+}
+
+/**
+ * Note emails for the Abba ingest feed, ascending by date so a `since`
+ * cursor pages forward cleanly.
+ */
+export function listNotesMail(sinceIso: string, limit: number): NotesMailRow[] {
+  return db.query(`
+    SELECT id, uid, message_id, subject, body, from_addr, date_iso, created_at
+    FROM notes_mail
+    WHERE date_iso > ?
+    ORDER BY date_iso ASC, id ASC
+    LIMIT ?
+  `).all(sinceIso, limit) as NotesMailRow[];
+}
+
+export function insertMessage(m: Omit<Message, "id" | "created_at" | "message_id" | "participants"> & { created_at?: string; message_id?: string; participants?: string[] }): Message {  const row = { ...m, id: uid(), created_at: m.created_at || now() } as Message;
   const parts = m.participants ?? conversationMembers(row.conversation_id).map((c) => c.id);
   row.message_id = m.message_id || "";
   row.participants = JSON.stringify(parts);

@@ -157,6 +157,14 @@ Google tokens are stored in the gitignored `./data/config.json` next to your oth
 | POST | `/api/conversations/:id/read` | clears unread |
 | POST | `/api/poll` | poll mail + Matrix now |
 | POST | `/api/migrate-participants` | backfill participant data + re-thread old multi-contact mail into groups; `{dry_run: true}` previews |
+| GET | `/api/relay/emails` | **Switchboard feed** — Relay's IMAP-synced email store as JSON, ascending by date. Query: `?since=<unix ts>&limit=50` (limit caps at 200). Response: `{emails: [{id, from, from_name, to, subject, snippet (first 200 chars), date (unix), has_attachments}]}`. Localhost only, no auth. Poll with `since=<last date>` for incremental sync. Never fetches IMAP itself — it only reads what Relay's own poll already stored. |
+| GET | `/api/relay/notes-emails` | **Abba ingest feed** — note-style emails harvested from the IMAP notes folder (Apple Mail convention: Subject = title, body = markdown). Query: `?since=<unix ts or ms>&limit=50` (limit caps at 200). Response: `{emails: [{id, message_id, subject, body (FULL cleaned body, not a snippet), from, date (unix)}]}` ascending by date. Localhost only, no auth. Never fetches IMAP itself — it only reads the `notes_mail` table that the notes-folder poll maintains. |
+
+### Notes-folder sync (for Abba)
+
+Relay polls an IMAP **notes folder** on its own 5-minute interval (plus once ~30s after boot), separate from the 60s INBOX poll. Each unseen message becomes a note row (stored in the `notes_mail` table, never in conversations/messages): Subject → title, body → markdown, deduped by IMAP uid. If the folder doesn't exist on the server it skips quietly — nothing is created, nothing errors.
+
+Config knob: `imap.notes_folder` in `data/config.json` (default `"Notes"`), settable via `POST /api/settings` `{section: "imap", values: {notes_folder: "..."}}`. Abba ingests via `GET /api/relay/notes-emails`.
 
 ## Ports
 
