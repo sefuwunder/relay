@@ -51,7 +51,10 @@ const state = {
   _commitSearchToken: 0, // invalidates stale in-flight search fetches
   _pendingMsg: null,    // message id to scroll to after opening a conversation
   commitNudges: (() => { try { return localStorage.getItem("relay_commit_nudges") !== "0"; } catch { return true; } })(),
+  convoNudges: (() => { try { return localStorage.getItem("relay_convo_nudges") !== "0"; } catch { return true; } })(),
   _nudgeSeen: {},      // "commitId@YYYY-MM-DD" already notified this session
+  _convoNudgeSeen: {}, // "nudgeKey@YYYY-MM-DD" already notified this session
+  nudges: [],          // latest conversation nudges from /api/nudges, for the list card
   _commitMenu: null,   // open message context menu element
   _commitEditor: null,  // open commitment/decision editor element
   diary: [],           // appointments in the open conversation
@@ -1304,6 +1307,57 @@ async function pollConversations() {
   checkNotifications(prev);
   updateTitle();
   checkCommitNudges().catch(() => {});
+  checkConversationNudges().catch(() => {});
+}
+
+/**
+ * Conversation nudges, piggy-backed on the 15s poll like commitment nudges.
+ * Unanswered threads, quiet threads, and Greenroom follow-ups raise one
+ * desktop notification per local day each. The in-app card (top of the
+ * conversation list) refreshes on every poll regardless of quiet hours.
+ */
+async function checkConversationNudges() {
+  if (!state.convoNudges) return;
+  let nudges = [];
+  try { nudges = (await api("/api/nudges")).nudges || []; } catch { return; }
+  state.nudges = nudges;
+  const onList = (location.hash || "#/conversations") === "#/conversations";
+  if (onList) renderConversations(true);
+  // Desktop notifications follow the commitment-nudge rules: permission,
+  // quiet hours 22:00–07:00, and silence while staring at the list.
+  if (!state.notify || notifyPerm() !== "granted") return;
+  const hour = new Date().getHours();
+  if (hour >= 22 || hour < 7) return;
+  if (onList) return;
+  if (!nudges.length) return;
+  const today = clientDay(0);
+  const fresh = nudges.filter((n) => !state._convoNudgeSeen[n.key + "@" + today]);
+  if (!fresh.length) return;
+  for (const n of fresh) state._convoNudgeSeen[n.key + "@" + today] = 1;
+  if (fresh.length === 1) {
+    fireConvoNudge(fresh[0]);
+  } else {
+    const titles = fresh.slice(0, 3).map((n) => n.title).join("; ");
+    try {
+      const nn = new Notification("A few gentle nudges (" + fresh.length + ")",
+        { body: titles + (fresh.length > 3 ? " …" : ""), tag: "relay-convo-digest-" + today });
+      nn.onclick = () => { try { window.focus(); } catch { /* noop */ } location.hash = "#/conversations"; nn.close(); };
+    } catch { /* notifications blocked */ }
+    playAlertSound();
+  }
+}
+
+function fireConvoNudge(n) {
+  try {
+    const nn = new Notification(n.title, { body: String(n.body || "").slice(0, 160), tag: "relay-convo-" + n.key });
+    nn.onclick = () => {
+      try { window.focus(); } catch { /* noop */ }
+      if (n.conversation_id) location.hash = "#/conversations/" + n.conversation_id;
+      else if (n.staged_id) location.hash = "#/people/staged/" + n.staged_id;
+      nn.close();
+    };
+  } catch { /* notifications blocked */ }
+  playAlertSound(); // respects the existing sound toggle
 }
 
 /**
@@ -1461,6 +1515,13 @@ function setCommitNudges(on) {
   renderSettings();
 }
 
+function setConvoNudges(on) {
+  state.convoNudges = on;
+  try { localStorage.setItem("relay_convo_nudges", on ? "1" : "0"); } catch { /* noop */ }
+  if (!on) state.nudges = [];
+  renderSettings();
+}
+
 function updateTitle() {
   const n = (state.conversations || []).reduce((a, c) => a + (c.unread || 0), 0);
   document.title = n > 0 ? `(${n}) Relay` : "Relay";
@@ -1483,6 +1544,59 @@ async function setNotify(on) {
   renderSettings();
 }
 
+// ---------- conversation nudges (in-app card) ----------
+
+/** Slim, calm card at the top of the conversation list. No badges, no pile-up:
+ *  one row per nudge with Message / Snooze / Dismiss. */
+function nudgeCardHtml() {
+  const ns = state.nudges || [];
+  if (!ns.length || !state.convoNudges) return "";
+  const rows = ns.map((n) => `
+    <div class="nudge-row" data-key="${esc(n.key)}">
+      <div class="nudge-text">
+        <div class="nudge-title">${esc(n.title)}</div>
+        <div class="nudge-body">${esc(n.body)}</div>
+      </div>
+      <div class="nudge-actions">
+        <button class="nudge-btn primary" data-act="message">Message</button>
+        <button class="nudge-btn" data-act="snooze3" title="Snooze 3 days">3d</button>
+        <button class="nudge-btn" data-act="snooze7" title="Snooze a week">1w</button>
+        <button class="nudge-btn" data-act="dismiss">Dismiss</button>
+      </div>
+    </div>`).join("");
+  return `<div class="nudge-card"><div class="nudge-head">Gentle nudges</div>${rows}</div>`;
+}
+
+function bindNudgeRows(app) {
+  $$(".nudge-row", app).forEach((r) => {
+    r.addEventListener("click", async (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest("[data-act]") : null;
+      if (!btn) return;
+      const key = r.dataset.key;
+      const n = (state.nudges || []).find((x) => x.key === key);
+      if (!n) return;
+      const act = btn.dataset.act;
+      if (act === "message") {
+        if (n.conversation_id) location.hash = "#/conversations/" + n.conversation_id;
+        else if (n.staged_id) location.hash = "#/people/staged/" + n.staged_id;
+        return;
+      }
+      try {
+        if (act === "snooze3" || act === "snooze7") {
+          await api("/api/nudges/" + encodeURIComponent(key) + "/snooze",
+            { method: "POST", body: JSON.stringify({ days: act === "snooze3" ? 3 : 7 }) });
+          toast(act === "snooze3" ? "Snoozed for 3 days." : "Snoozed for a week.");
+        } else if (act === "dismiss") {
+          await api("/api/nudges/" + encodeURIComponent(key) + "/dismiss", { method: "POST" });
+          toast("Dismissed — it'll come back if the quiet stretches on.");
+        } else return;
+        state.nudges = (state.nudges || []).filter((x) => x.key !== key);
+        renderConversations();
+      } catch (err) { toast(err.message || "Couldn't update the nudge.", true); }
+    });
+  });
+}
+
 function renderConversations(skipIfSame) {
   const q = state.search.toLowerCase();
   const match = (c) => !q || c.title.toLowerCase().includes(q) || (c.members || []).some((m) => m.name.toLowerCase().includes(q));
@@ -1492,7 +1606,8 @@ function renderConversations(skipIfSame) {
   // animation) when nothing on screen would change.
   const sig = q + "|" + list.map((c) => [c.id, c.last_at, c.unread, c.last_body, c.title].join("~")).join("|")
     + "|arch|" + (state.archivedOpen ? "1" : "0") + "|" + arch.map((c) => [c.id, c.last_at, c.unread, c.title].join("|")).join("|")
-    + commitSearchSig();
+    + commitSearchSig()
+    + "|nudge|" + (state.nudges || []).map((n) => n.key).join(",");
   if (skipIfSame && sig === state.convListSig) return;
   state.convListSig = sig;
   const rowHtml = (c) => `
@@ -1514,6 +1629,7 @@ function renderConversations(skipIfSame) {
         <button class="nav-action" id="new-group">${icon("plus")}Group</button></div>
       <div class="search-wrap"><div class="search-field">${icon("search")}<input id="q" placeholder="Search conversations" value="${esc(state.search)}"></div></div>
       <div class="scroll">
+        ${nudgeCardHtml()}
         ${list.length ? list.map(rowHtml).join("")
         : `<div class="empty">${icon("burst", "big")}<h3>No conversations yet</h3><p>Your inner circle lives here.<br>Add people in the People tab,<br>then pick a channel and say hello.</p></div>`}
         ${commitSearchSectionHtml()}
@@ -1530,6 +1646,7 @@ function renderConversations(skipIfSame) {
     renderConversations();
   });
   bindCommitSearchRows(app);
+  bindNudgeRows(app);
   const qi = $("#q");
   qi.addEventListener("input", () => { state.search = qi.value; scheduleCommitSearch(); renderConversations(); const nq = $("#q"); nq.focus(); nq.setSelectionRange(nq.value.length, nq.value.length); });
   $$(".conv-row", app).forEach((r) => r.addEventListener("click", () => { location.hash = "#/conversations/" + r.dataset.id; }));
@@ -3332,6 +3449,7 @@ function renderPersonDetail(id) {
     { ch: "email", t1: "Email", t2: c.email || "Not set" },
     { ch: "sms", t1: "SMS · Google Voice", t2: c.gv_number || "Not set" },
     { ch: "matrix", t1: "Matrix", t2: c.matrix_id || c.matrix_room_id || "Not set" },
+    { t1: "Check-in cadence", t2: c.cadence_days == null ? "Never" : c.cadence_days === 3 ? "Every 3 days" : c.cadence_days === 14 ? "Every 2 weeks" : c.cadence_days === 30 ? "Monthly" : "Weekly", ch: "cadence" },
   ];
   const app = $("#app");
   app.innerHTML = `
@@ -3584,7 +3702,8 @@ async function messageStaged(id) {
 // ---------- contact sheet (new/edit) ----------
 
 function openContactSheet(existing) {
-  const c = existing || { kind: "person", name: "", email: "", gv_number: "", matrix_id: "", matrix_room_id: "", notes: "", photo: "", color: "#8e8e93" };
+  const c = existing || { kind: "person", name: "", email: "", gv_number: "", matrix_id: "", matrix_room_id: "", notes: "", photo: "", color: "#8e8e93", cadence_days: 7 };
+  const cadSel = c.cadence_days === 3 ? "3" : c.cadence_days === 14 ? "14" : c.cadence_days === 30 ? "30" : (c.cadence_days == null ? "" : "7");
   let kind = c.kind === "agent" ? "agent" : "person";
   let photoData = c.photo || "";
   const scrim = document.createElement("div");
@@ -3617,6 +3736,15 @@ function openContactSheet(existing) {
         <div style="display:flex;gap:8px"><input class="text-input" id="f-room" value="${esc(c.matrix_room_id)}" placeholder="!abc:matrix.org" style="flex:1">
         <button class="btn secondary small" id="pick-room" type="button">Browse</button></div>
         <div class="hint">A DM room you're both in. Create it in Element first, then pick it here.</div></div>
+      <div class="field"><label>Check-in cadence</label>
+        <select class="text-input" id="f-cadence">
+          <option value="3"${cadSel === "3" ? " selected" : ""}>Every 3 days</option>
+          <option value="7"${cadSel === "7" ? " selected" : ""}>Weekly</option>
+          <option value="14"${cadSel === "14" ? " selected" : ""}>Every 2 weeks</option>
+          <option value="30"${cadSel === "30" ? " selected" : ""}>Monthly</option>
+          <option value=""${cadSel === "" ? " selected" : ""}>Never</option>
+        </select>
+        <div class="hint">How often you'd like a gentle nudge when this thread goes quiet.</div></div>
       </div>
       <div id="f-agent-fields" style="${kind === "agent" ? "" : "display:none"}">
       <div class="field"><label>Endpoint URL</label><input class="text-input" id="f-agent-url" inputmode="url" placeholder="http://127.0.0.1:3009/api/chat">
@@ -3705,6 +3833,8 @@ function openContactSheet(existing) {
       vals.gv_number = $("#f-gv", scrim).value.trim();
       vals.matrix_id = $("#f-mxid", scrim).value.trim();
       vals.matrix_room_id = $("#f-room", scrim).value.trim();
+      const cv = $("#f-cadence", scrim).value;
+      vals.cadence_days = cv === "" ? null : Number(cv);
     }
     if (!vals.name) { toast(kind === "agent" ? "Give the agent a name." : "Give them a name.", true); return; }
     try {
@@ -3854,6 +3984,10 @@ function renderSettings() {
             <div class="rlabel" style="flex:1"><div class="t1">Commitment nudges</div><div class="t2">A reminder when a tracked commitment is due or overdue. Quiet hours 10pm–7am.</div></div>
             <label class="switch"><input type="checkbox" id="commit-nudges-toggle" ${state.commitNudges ? "checked" : ""} aria-label="Commitment nudges"><span class="track"><span class="thumb"></span></span></label>
           </div>
+          <div class="group-row">
+            <div class="rlabel" style="flex:1"><div class="t1">Conversation nudges</div><div class="t2">A gentle note when a thread goes quiet or a Greenroom follow-up is due. Quiet hours 10pm–7am.</div></div>
+            <label class="switch"><input type="checkbox" id="convo-nudges-toggle" ${state.convoNudges ? "checked" : ""} aria-label="Conversation nudges"><span class="track"><span class="thumb"></span></span></label>
+          </div>
         </div>
 
         <div class="group-caption">Email sending · SMTP</div>
@@ -3947,6 +4081,7 @@ function renderSettings() {
   $("#notify-toggle").addEventListener("change", (e) => { setNotify(e.target.checked); });
   $("#sound-toggle").addEventListener("change", (e) => { setSound(e.target.checked); });
   $("#commit-nudges-toggle").addEventListener("change", (e) => { setCommitNudges(e.target.checked); });
+  $("#convo-nudges-toggle").addEventListener("change", (e) => { setConvoNudges(e.target.checked); });
 
   $("#migrate-mail").addEventListener("click", async () => {
     const el = $("#migrate-result");

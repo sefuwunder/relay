@@ -37,6 +37,7 @@ import {
   exportJson, exportCsv,
   type Commitment, type Decision,
 } from "./commitments";
+import { listNudges, snoozeNudge, dismissNudge, type Nudge } from "./nudges";
 
 const PORT = Number(process.env.PORT || 3006);
 const DATA_DIR = "./data";
@@ -492,6 +493,17 @@ function pickColor(name: string): string {
   let h = 0;
   for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+
+/** Parse a check-in cadence: 3/7/14/30 days, or null for "never".
+    `fallback` is used when the value is absent entirely. */
+function parseCadence(v: unknown, fallback: number | null): number | null {
+  if (v === undefined) return fallback;
+  if (v === null || v === "") return null;
+  const n = Number(v);
+  if (n === 0) return null;
+  if ([3, 7, 14, 30].includes(n)) return n;
+  throw new Error("Cadence must be 3, 7, 14 or 30 days — or never.");
 }
 
 // ---------- sending ----------
@@ -1460,6 +1472,9 @@ const server = (Bun as any).serve({
         const b = await readBody(req);
         const name = String(b.name || "").trim();
         if (!name) return json({ error: "Give them a name." }, 400);
+        let cadence: number | null = 7;
+        try { cadence = parseCadence(b.cadence_days, 7); }
+        catch (e) { return json({ error: errMsg(e) }, 400); }
         const photo = cleanPhoto(b.photo);
         if (photo === null) return json({ error: "That photo didn't work — try a JPEG, PNG, WebP or GIF." }, 400);
         const kind = b.kind === "agent" ? "agent" : "person";
@@ -1484,6 +1499,7 @@ const server = (Bun as any).serve({
           color: String(b.color || "") || pickColor(name),
           notes: String(b.notes || "").trim(),
           photo: photo || "",
+          cadence_days: cadence,
         });
         dmFor(c.id);
         return json({ contact: sanitizeContact(c) }, 201);
@@ -1506,6 +1522,10 @@ const server = (Bun as any).serve({
               if (k in b) patch[k] = String(b[k] ?? "").trim();
             }
             if ("archived" in b) patch.archived = b.archived === true || b.archived === 1 || b.archived === "1" ? 1 : 0;
+            if ("cadence_days" in b) {
+              try { patch.cadence_days = parseCadence(b.cadence_days, cur.cadence_days ?? 7); }
+              catch (e) { return json({ error: errMsg(e) }, 400); }
+            }
             if ("photo" in b) {
               const photo = cleanPhoto(b.photo);
               if (photo === null) return json({ error: "That photo didn't work — try a JPEG, PNG, WebP or GIF." }, 400);
@@ -2106,6 +2126,27 @@ const server = (Bun as any).serve({
       // What the client's nudge check should fire right now.
       if (path === "/api/commitments/due" && method === "GET") {
         return json({ commitments: listDueCommitments() });
+      }
+      // Conversation nudges: unanswered threads, quiet threads, Greenroom
+      // follow-ups. Computed on request; the client piggy-backs the 15s poll.
+      if (path === "/api/nudges" && method === "GET") {
+        return json({ nudges: listNudges() });
+      }
+      {
+        const m = path.match(/^\/api\/nudges\/([^/]+)\/(snooze|dismiss)$/);
+        if (m && method === "POST") {
+          const key = decodeURIComponent(m[1]);
+          try {
+            if (m[2] === "snooze") {
+              const b = await readBody(req);
+              return json({ ok: true, state: snoozeNudge(key, Number(b.days)) });
+            }
+            return json({ ok: true, state: dismissNudge(key) });
+          } catch (e) {
+            const msg = errMsg(e);
+            return json({ error: msg }, msg === "not found" ? 404 : 400);
+          }
+        }
       }
       if (path === "/api/commitments/all" && method === "GET") {
         const q = (url.searchParams.get("q") || "").trim().slice(0, 80);

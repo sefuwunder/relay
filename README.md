@@ -59,6 +59,16 @@ The ✓ toggle in the conversation header opens the **Commitments panel** (Open 
 - **Nudges** (on by default, `relay_commit_nudges`): due-today and overdue items surface one desktop notification per day, quiet hours 22:00–07:00, digest when several are due.
 - New APIs: `GET/POST /api/conversations/:id/commitments`, `PATCH/DELETE /api/commitments/:id`, `GET /api/conversations/:id/suggestions`, `POST /api/suggestions/:id/confirm|dismiss`, `GET/POST /api/conversations/:id/decisions`, `PATCH/DELETE /api/decisions/:id`, `GET /api/commitments/all`, `GET /api/decisions/all` (searchable), `GET /api/commitments/due`, `POST /api/commitments/:id/nudge`, and JSON/CSV export. Everything is local SQLite — no network, no models, no new dependencies.
 
+## Conversation nudges
+
+Gentle, server-computed reminders that keep cadence flowing — surfaced as one desktop notification per nudge per day (quiet hours 22:00–07:00, digest when several are due) plus a slim **Gentle nudges** card at the top of the conversation list with **Message / Snooze (3d·1w) / Dismiss** on each row:
+
+- **Unanswered** — you sent the last message and 3+ days passed with no reply. Fires once per unanswered streak; any reply resets it.
+- **Quiet lately** — no activity for the contact's check-in cadence (per-contact setting: 3 / 7 / 14 / 30 days, or never; groups use a fixed 7 days). Refires after another full quiet window.
+- **Greenroom follow-up** — a staged contact with no outbound message yet, staged 2+ days ago; reminds again 3 days before their slot expires.
+
+Snoozing hides a nudge for the chosen days; dismissing hides it until its next natural trigger (never forever). The toggle lives in Settings (on by default, `relay_convo_nudges`); the contact's cadence is edited from the contact sheet. AI-agent 1:1s never nudge. No push infrastructure, no new timers — nudges are computed on request and piggy-back the existing 15s poll.
+
 ## AI agent contacts
 
 Contacts can be people — or AI agents you chat with 1:1 inside Relay. Add one from the People tab as an **agent** with its endpoint URL; typing in the conversation sends your message straight to it and its reply lands in the thread.
@@ -156,6 +166,9 @@ Google tokens are stored in the gitignored `./data/config.json` next to your oth
 | GET | `/api/attachments/:id` | download / inline preview of one file |
 | POST | `/api/conversations/:id/read` | clears unread |
 | POST | `/api/poll` | poll mail + Matrix now |
+| GET | `/api/nudges` | conversation nudges due now (unanswered / stale / Greenroom follow-ups) |
+| POST | `/api/nudges/:key/snooze` | `{days: 1–30}` — suppress the nudge until now+days |
+| POST | `/api/nudges/:key/dismiss` | suppress until the next natural trigger |
 | POST | `/api/migrate-participants` | backfill participant data + re-thread old multi-contact mail into groups; `{dry_run: true}` previews |
 | GET | `/api/relay/emails` | **Switchboard feed** — Relay's IMAP-synced email store as JSON, ascending by date. Query: `?since=<unix ts>&limit=50` (limit caps at 200). Response: `{emails: [{id, from, from_name, to, subject, snippet (first 200 chars), date (unix), has_attachments}]}`. Localhost only, no auth. Poll with `since=<last date>` for incremental sync. Never fetches IMAP itself — it only reads what Relay's own poll already stored. |
 | GET | `/api/relay/notes-emails` | **Abba ingest feed** — note-style emails harvested from the IMAP notes folder (Apple Mail convention: Subject = title, body = markdown). Query: `?since=<unix ts or ms>&limit=50` (limit caps at 200). Response: `{emails: [{id, message_id, subject, body (FULL cleaned body, not a snippet), from, date (unix)}]}` ascending by date. Localhost only, no auth. Never fetches IMAP itself — it only reads the `notes_mail` table that the notes-folder poll maintains. |

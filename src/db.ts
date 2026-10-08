@@ -25,6 +25,8 @@ export interface Contact {
   /** Secret sent as the X-Agent-Secret header; "" when unset. */
   agent_secret: string;
   archived: number;
+  /** Days of thread silence before a "quiet lately" nudge; null = never. */
+  cadence_days: number | null;
   created_at: string;
 }
 
@@ -227,6 +229,12 @@ export function openDb(path: string): Database {
       last_seen TEXT NOT NULL,
       PRIMARY KEY (pattern, class, scope)
     );
+    CREATE TABLE IF NOT EXISTS nudge_state (
+      key TEXT PRIMARY KEY,
+      snoozed_until INTEGER NOT NULL DEFAULT 0,
+      dismissed_until INTEGER NOT NULL DEFAULT 0,
+      last_fired_at INTEGER NOT NULL DEFAULT 0
+    );
   `);
   // Migration: archived flag on contacts (older DBs lack the column).
   const cols = db.query("PRAGMA table_info(contacts)").all() as { name: string }[];
@@ -254,6 +262,11 @@ export function openDb(path: string): Database {
   }
   if (!cols.some((c) => c.name === "agent_secret")) {
     db.exec("ALTER TABLE contacts ADD COLUMN agent_secret TEXT NOT NULL DEFAULT ''");
+  }
+  // Migration: per-contact check-in cadence for conversation nudges
+  // (older DBs lack the column). 7 = weekly default; null = never nudge.
+  if (!cols.some((c) => c.name === "cadence_days")) {
+    db.exec("ALTER TABLE contacts ADD COLUMN cadence_days INTEGER DEFAULT 7");
   }
   // Migration: original email Message-ID for reply threading (older DBs lack it).
   const msgCols = db.query("PRAGMA table_info(messages)").all() as { name: string }[];
@@ -354,10 +367,11 @@ export function createContact(c: Omit<Contact, "id" | "created_at" | "archived" 
     agent_url = "";
     agent_secret = "";
   }
-  const row: Contact = { photo: "", ...c, kind, agent_url, agent_secret, archived: c.archived ? 1 : 0, id: uid(), created_at: now() };
+  const row: Contact = { photo: "", cadence_days: 7, ...c, kind, agent_url, agent_secret, archived: c.archived ? 1 : 0, id: uid(), created_at: now() };
+  if (row.cadence_days !== null && ![3, 7, 14, 30].includes(Number(row.cadence_days))) row.cadence_days = 7;
   db.query(
-    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, photo, kind, agent_url, agent_secret, archived, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.photo, row.kind, row.agent_url, row.agent_secret, row.archived, row.created_at);
+    "INSERT INTO contacts (id, name, email, gv_number, matrix_id, matrix_room_id, color, notes, photo, kind, agent_url, agent_secret, archived, cadence_days, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(row.id, row.name, row.email, row.gv_number, row.matrix_id, row.matrix_room_id, row.color, row.notes, row.photo, row.kind, row.agent_url, row.agent_secret, row.archived, row.cadence_days, row.created_at);
   return row;
 }
 
@@ -366,14 +380,17 @@ export function updateContact(id: string, patch: Partial<Omit<Contact, "id" | "c
   if (!cur) return null;
   const next = { ...cur, ...patch };
   if ("archived" in patch) next.archived = patch.archived ? 1 : 0;
+  if (next.cadence_days !== null && next.cadence_days !== undefined && ![3, 7, 14, 30].includes(Number(next.cadence_days))) {
+    next.cadence_days = 7;
+  }
   next.kind = next.kind === "agent" ? "agent" : "person";
   if (next.kind === "person") {
     next.agent_url = "";
     next.agent_secret = "";
   }
   db.query(
-    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ?, photo = ?, kind = ?, agent_url = ?, agent_secret = ?, archived = ? WHERE id = ?"
-  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, next.photo, next.kind, next.agent_url, next.agent_secret, next.archived, id);
+    "UPDATE contacts SET name = ?, email = ?, gv_number = ?, matrix_id = ?, matrix_room_id = ?, color = ?, notes = ?, photo = ?, kind = ?, agent_url = ?, agent_secret = ?, archived = ?, cadence_days = ? WHERE id = ?"
+  ).run(next.name, next.email, next.gv_number, next.matrix_id, next.matrix_room_id, next.color, next.notes, next.photo, next.kind, next.agent_url, next.agent_secret, next.archived, next.cadence_days ?? null, id);
   return next;
 }
 
