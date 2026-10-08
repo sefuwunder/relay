@@ -12,7 +12,11 @@ import {
   removeAppointment, sweepStaleAppointments,
   listEmailMessages,
   insertNotesMail, hasNotesMailUid, listNotesMail,
+  listStagedContacts, getStagedContact, createStagedContact, setStagedStatus, extendStagedContact, restageStagedContact,
+  markStagedReplied, sweepStagedContacts, findStagedByEmail, findStagedByGv, stagedDmFor, isStagedMemberId,
+  MAX_STAGED, STAGE_DAYS,
   type Contact, type Conversation, type Channel, type Message, type Attachment, type Appointment, type EmailFeedRow, type NotesMailRow,
+  type StagedContact,
 } from "./db";
 import { buildIcs, parseIcs, newEventUid, type CalEvent } from "./ical";
 import { fetchIcalFeed, previewFromFeedText, type CalPreviewEvent } from "./calfeed";
@@ -721,6 +725,8 @@ async function pollMail() {
   // Silent 24h auto-drop for unresponded invites: one indexed UPDATE, no
   // notifications, no logging. Runs regardless of mail configuration.
   try { sweepStaleAppointments(); } catch { /* never break the poll */ }
+  // Greenroom expiry: staged contacts past 14 days quietly become 'expired'.
+  try { sweepStagedContacts(); } catch { /* never break the poll */ }
   if (!imapReady()) return;
   try {
     const mails = await fetchUnseen(settings.imap, 50);
@@ -737,7 +743,18 @@ async function pollMail() {
       const missed = parseMissedCall(rawFrom, m.subject || "", m.body || "");
       if (missed) {
         const caller = byGv.get(missed.digits) || null;
-        if (!caller) continue; // not from someone we track
+        if (!caller) {
+          // Greenroom: a missed call from a staged number still counts as a reply.
+          const st = findStagedByGv(missed.digits);
+          if (!st) continue; // not from someone we track
+          markStagedReplied(st.id);
+          insertTracked({
+            conversation_id: stagedDmFor(st.id).id, channel: "sms", direction: "in",
+            body: `📞 Missed call from ${missed.name}`, subject: "",
+            external_id: extId, message_id: m.messageId || "", status: "",
+          });
+          continue;
+        }
         insertTracked({
           conversation_id: dmFor(caller.id).id, channel: "sms", direction: "in",
           body: `📞 Missed call from ${missed.name}`, subject: "",
@@ -769,12 +786,27 @@ async function pollMail() {
       // created on the spot if needed — never to a DM as well.
       let conv: Conversation;
       if (channel === "sms") {
-        if (!contact) continue; // not from someone we track
-        conv = dmFor(contact.id);
+        if (!contact) {
+          // Greenroom: an SMS from a staged number lands in their thread and
+          // marks them replied — the natural promote nudge.
+          const st = gvNum ? findStagedByGv(gvNum) : null;
+          if (!st) continue; // not from someone we track
+          markStagedReplied(st.id);
+          conv = stagedDmFor(st.id);
+        } else {
+          conv = dmFor(contact.id);
+        }
       } else {
         const ids = participantContactIds(m, byEmail);
-        if (!ids.length) continue; // nobody we track
-        conv = conversationForContacts(ids);
+        if (!ids.length) {
+          // Greenroom: a 1:1 email from a staged address does the same.
+          const st = findStagedByEmail(extractEmail(rawFrom));
+          if (!st) continue; // nobody we track
+          markStagedReplied(st.id);
+          conv = stagedDmFor(st.id);
+        } else {
+          conv = conversationForContacts(ids);
+        }
       }
       const msg = insertTracked({
         conversation_id: conv.id, channel, direction: "in", body, subject,
@@ -1514,6 +1546,121 @@ const server = (Bun as any).serve({
         }
       }
 
+      // ----- greenroom (staged contacts) -----
+      // New faces waiting on the shelf: they don't count against MAX_PEOPLE
+      // and chat 1:1 only. Promoting moves them into the inner circle (and
+      // carries their thread with them); archiving answers "who leaves".
+      function stagedJson(s: StagedContact) {
+        const days_left = Math.max(0, Math.ceil((s.expires_at - Date.now()) / 86400000));
+        return { ...s, days_left, member_id: `staged:${s.id}`, color: pickColor(s.name) };
+      }
+      /** Follow-up draft built from where you met and what about. */
+      function stagedDraft(s: StagedContact): string {
+        const where = (s.met_where || "").trim();
+        const about = (s.met_about || "").trim();
+        if (where && about) return `Great meeting you at ${where} — really enjoyed our chat about ${about}. Would love to keep the conversation going.`;
+        if (where) return `Great meeting you at ${where}! Would love to keep the conversation going.`;
+        if (about) return `Great meeting you — really enjoyed our chat about ${about}. Would love to keep the conversation going.`;
+        return `Great meeting you! Would love to keep the conversation going.`;
+      }
+      if (path === "/api/staged" && method === "GET") {
+        return json({ staged: listStagedContacts().map(stagedJson), maxStaged: MAX_STAGED });
+      }
+      if (path === "/api/staged" && method === "POST") {
+        const b = await readBody(req);
+        try {
+          const s = createStagedContact({
+            name: String(b.name || ""), channel: String(b.channel || ""),
+            handle: String(b.handle || ""), met_where: String(b.met_where || ""),
+            met_about: String(b.met_about || ""), notes: String(b.notes || ""),
+          });
+          return json({ staged: stagedJson(s) }, 201);
+        } catch (e) {
+          return json({ error: errMsg(e) }, 400);
+        }
+      }
+      {
+        const m = path.match(/^\/api\/staged\/([^/]+)\/draft$/);
+        if (m && method === "GET") {
+          const s = getStagedContact(decodeURIComponent(m[1]));
+          if (!s) return json({ error: "not found" }, 404);
+          return json({ draft: stagedDraft(s) });
+        }
+      }
+      {
+        const m = path.match(/^\/api\/staged\/([^/]+)\/promote$/);
+        if (m && method === "POST") {
+          const id = decodeURIComponent(m[1]);
+          const s = getStagedContact(id);
+          if (!s || (s.status !== "staged" && s.status !== "expired")) return json({ error: "not found" }, 404);
+          const b = await readBody(req);
+          const archiveId = typeof b.archive_id === "string" && b.archive_id ? b.archive_id : "";
+          const activeList = () => listActiveContacts().map((c) => ({
+            id: c.id, name: c.name, color: c.color, avatar_url: avatarFor(c),
+          }));
+          if (countActiveContacts() >= MAX_PEOPLE) {
+            if (!archiveId) {
+              return json({
+                error: `Your inner circle is full (${MAX_PEOPLE} max). Pick someone to archive and ${s.name} takes their place.`,
+                contacts: activeList(),
+              }, 409);
+            }
+            const ac = getContact(archiveId);
+            if (!ac || ac.archived) return json({ error: "Pick someone in your inner circle to archive." }, 400);
+          } else if (archiveId) {
+            return json({ error: "There's room — no need to archive anyone." }, 400);
+          }
+          try {
+            const contact = getDb().transaction(() => {
+              if (archiveId) updateContact(archiveId, { archived: 1 });
+              const c = createContact({
+                name: s.name,
+                email: s.channel === "email" ? s.handle : "",
+                gv_number: s.channel === "sms" ? s.handle : "",
+                matrix_id: s.channel === "matrix" ? s.handle : "",
+                matrix_room_id: "",
+                color: pickColor(s.name),
+                notes: [s.met_where ? `Met at ${s.met_where}` : "", s.met_about, s.notes].filter(Boolean).join(" — "),
+              });
+              // Their Greenroom thread becomes their thread: re-point the
+              // staged membership at the new contact id. History carries over.
+              getDb().query("UPDATE members SET contact_id = ? WHERE contact_id = ?").run(c.id, `staged:${s.id}`);
+              setStagedStatus(s.id, "promoted");
+              return c;
+            })();
+            return json({ contact: sanitizeContact(contact), archived: archiveId || null }, 201);
+          } catch (e) {
+            return json({ error: errMsg(e) }, 400);
+          }
+        }
+      }
+      {
+        const m = path.match(/^\/api\/staged\/([^/]+)\/(release|extend|restage)$/);
+        if (m && method === "POST") {
+          const id = decodeURIComponent(m[1]);
+          const action = m[2];
+          const s = getStagedContact(id);
+          if (!s) return json({ error: "not found" }, 404);
+          try {
+            if (action === "release") {
+              if (s.status !== "staged" && s.status !== "expired") return json({ error: "not found" }, 404);
+              setStagedStatus(id, "released");
+              return json({ staged: stagedJson({ ...s, status: "released" }) });
+            }
+            if (action === "extend") {
+              const next = extendStagedContact(id);
+              return json({ staged: stagedJson(next) });
+            }
+            // restage
+            const next = restageStagedContact(id);
+            return json({ staged: stagedJson(next) });
+          } catch (e) {
+            const msg = errMsg(e);
+            return json({ error: msg }, /already extended/i.test(msg) ? 409 : 400);
+          }
+        }
+      }
+
       // ----- conversations -----
       if (path === "/api/conversations" && method === "GET") {
         const onlyArchived = url.searchParams.get("archived") === "1";
@@ -1537,6 +1684,17 @@ const server = (Bun as any).serve({
       if (path === "/api/conversations" && method === "POST") {
         const b = await readBody(req);
         const memberIds = (Array.isArray(b.member_ids) ? b.member_ids : []).map(String);
+        // Greenroom: a lone staged id opens (or reuses) their 1:1 thread.
+        // Staged contacts never join groups — mixed membership is rejected.
+        const stagedIds = memberIds.filter(isStagedMemberId);
+        if (stagedIds.length) {
+          if (memberIds.length !== 1) return json({ error: "Greenroom contacts chat 1:1 only." }, 400);
+          const s = getStagedContact(stagedIds[0].slice("staged:".length));
+          if (!s || (s.status !== "staged" && s.status !== "expired")) {
+            return json({ error: "That Greenroom entry is gone." }, 404);
+          }
+          return json({ conversation: stagedDmFor(s.id) }, 201);
+        }
         for (const mid of memberIds) if (!getContact(mid)) return json({ error: "Unknown contact in group." }, 400);
         try {
           const conv = createGroup(String(b.name || ""), memberIds, String(b.matrix_room_id || "").trim());

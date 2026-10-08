@@ -30,6 +30,35 @@ export interface Contact {
 
 export const MAX_PEOPLE = 8;
 
+/** Greenroom: staging shelf for newly-met contacts. Staged people do NOT
+    count against MAX_PEOPLE and chat 1:1 only (never groups). */
+export const MAX_STAGED = 32;
+export const STAGE_DAYS = 14;
+
+export interface StagedContact {
+  id: string;
+  name: string;
+  /** Single channel for now: 'email' | 'sms' | 'matrix'. */
+  channel: string;
+  /** Email address, 10-digit phone, or Matrix user id — per channel. */
+  handle: string;
+  met_at: number;
+  met_where: string;
+  met_about: string;
+  notes: string;
+  expires_at: number;
+  extended: number;
+  /** staged | promoted | released | expired */
+  status: string;
+  /** Set when they reply to a message — the natural promote nudge. */
+  replied: number;
+  created_at: number;
+}
+
+/** Member id prefix for staged contacts inside the members table. */
+export const stagedMemberId = (id: string) => `staged:${id}`;
+export const isStagedMemberId = (id: string) => id.startsWith("staged:");
+
 export interface Conversation {
   id: string;
   name: string;
@@ -250,6 +279,27 @@ export function openDb(path: string): Database {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_mail_uid ON notes_mail(uid);
   `);
+  // Greenroom: staging shelf for newly-met contacts. Staged people are NOT
+  // contacts (no MAX_PEOPLE counting) and chat 1:1 only. Members rows point
+  // at them via the "staged:<id>" contact_id prefix.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS staged_contacts (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      channel TEXT NOT NULL DEFAULT 'email',
+      handle TEXT NOT NULL DEFAULT '',
+      met_at INTEGER NOT NULL,
+      met_where TEXT NOT NULL DEFAULT '',
+      met_about TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '',
+      expires_at INTEGER NOT NULL,
+      extended INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'staged',
+      replied INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_staged_status ON staged_contacts(status, expires_at);
+  `);
   return db;
 }
 
@@ -343,6 +393,167 @@ export function deleteContact(id: string): string[] {
   return removed;
 }
 
+// ---------- greenroom (staged contacts) ----------
+
+const STAGED_COLORS = ["#0a84ff", "#30d158", "#ff9f0a", "#ff453a", "#bf5af2", "#64d2ff", "#ffd60a", "#ff6482"];
+function stagedColor(name: string): string {
+  let h = 0;
+  for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return STAGED_COLORS[h % STAGED_COLORS.length];
+}
+
+/** Staged + expired rows, soonest-expiring first — the Greenroom shelf. */
+export function listStagedContacts(): StagedContact[] {
+  return db.query("SELECT * FROM staged_contacts WHERE status IN ('staged','expired') ORDER BY expires_at ASC").all() as StagedContact[];
+}
+
+export function getStagedContact(id: string): StagedContact | null {
+  return (db.query("SELECT * FROM staged_contacts WHERE id = ?").get(id) as StagedContact) || null;
+}
+
+/** Live staged rows only — the ones against the MAX_STAGED cap. */
+export function countStagedContacts(): number {
+  return (db.query("SELECT COUNT(*) AS n FROM staged_contacts WHERE status = 'staged'").get() as any).n as number;
+}
+
+export function createStagedContact(s: {
+  name: string; channel: string; handle: string; met_where?: string; met_about?: string; notes?: string;
+}): StagedContact {
+  const name = String(s.name || "").trim();
+  if (!name) throw new Error("Give them a name.");
+  const channel = String(s.channel || "").trim();
+  if (!["email", "sms", "matrix"].includes(channel)) throw new Error("Pick email, SMS, or Matrix.");
+  let handle = String(s.handle || "").trim();
+  if (channel === "email") {
+    handle = handle.toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(handle)) throw new Error("That email address doesn't look right.");
+  } else if (channel === "sms") {
+    const d = handle.replace(/\D/g, "").replace(/^1(\d{10})$/, "$1");
+    if (d.length !== 10) throw new Error("Give a 10-digit phone number.");
+    handle = d;
+  } else if (!handle) {
+    throw new Error("Give their Matrix user ID.");
+  }
+  if (countStagedContacts() >= MAX_STAGED) {
+    throw new Error(`The Greenroom holds ${MAX_STAGED} people max — promote or release someone first.`);
+  }
+  const t = Date.now();
+  const row: StagedContact = {
+    id: uid(),
+    name: name.slice(0, 60),
+    channel,
+    handle: handle.slice(0, 120),
+    met_at: t,
+    met_where: String(s.met_where || "").trim().slice(0, 120),
+    met_about: String(s.met_about || "").trim().slice(0, 200),
+    notes: String(s.notes || "").trim().slice(0, 500),
+    expires_at: t + STAGE_DAYS * 86400000,
+    extended: 0,
+    status: "staged",
+    replied: 0,
+    created_at: t,
+  };
+  db.query(`INSERT INTO staged_contacts
+    (id, name, channel, handle, met_at, met_where, met_about, notes, expires_at, extended, status, replied, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    row.id, row.name, row.channel, row.handle, row.met_at, row.met_where, row.met_about,
+    row.notes, row.expires_at, row.extended, row.status, row.replied, row.created_at);
+  return row;
+}
+
+export function setStagedStatus(id: string, status: string): void {
+  db.query("UPDATE staged_contacts SET status = ? WHERE id = ?").run(status, id);
+}
+
+/** One 14-day extension, once ever. Throws otherwise. */
+export function extendStagedContact(id: string): StagedContact {
+  const s = getStagedContact(id);
+  if (!s || s.status !== "staged") throw new Error("Only staged contacts can be extended.");
+  if (s.extended) throw new Error("Already extended once — promote them or let them go.");
+  const expires_at = s.expires_at + STAGE_DAYS * 86400000;
+  db.query("UPDATE staged_contacts SET expires_at = ?, extended = 1 WHERE id = ?").run(expires_at, id);
+  return { ...s, expires_at, extended: 1 };
+}
+
+/** Bring an expired entry back for another 14 days. */
+export function restageStagedContact(id: string): StagedContact {
+  const s = getStagedContact(id);
+  if (!s || s.status !== "expired") throw new Error("Only expired entries can be re-staged.");
+  const t = Date.now();
+  const expires_at = t + STAGE_DAYS * 86400000;
+  db.query("UPDATE staged_contacts SET status = 'staged', expires_at = ? WHERE id = ?").run(expires_at, id);
+  return { ...s, status: "staged", expires_at };
+}
+
+export function markStagedReplied(id: string): void {
+  db.query("UPDATE staged_contacts SET replied = 1 WHERE id = ?").run(id);
+}
+
+/**
+ * Flip staged rows past their expiry. Runs on the 60s poll tick; never
+ * throws into the poller. Returns the number flipped (for tests).
+ */
+export function sweepStagedContacts(nowMs = Date.now()): number {
+  const r = db.query("UPDATE staged_contacts SET status = 'expired' WHERE status = 'staged' AND expires_at < ?").run(nowMs);
+  return Number((r as any).changes || 0);
+}
+
+/** Staged contact whose email handle matches (case-insensitive). Live rows only. */
+export function findStagedByEmail(email: string): StagedContact | null {
+  const e = String(email || "").trim().toLowerCase();
+  if (!e) return null;
+  return (db.query(
+    "SELECT * FROM staged_contacts WHERE status = 'staged' AND channel = 'email' AND lower(handle) = ? LIMIT 1"
+  ).get(e) as StagedContact) || null;
+}
+
+/** Staged contact whose phone matches (10 digits, tolerating a leading 1). */
+export function findStagedByGv(digits: string): StagedContact | null {
+  const d = String(digits || "").replace(/\D/g, "").replace(/^1(\d{10})$/, "$1");
+  if (d.length !== 10) return null;
+  const rows = db.query("SELECT * FROM staged_contacts WHERE status = 'staged' AND channel = 'sms'").all() as StagedContact[];
+  return rows.find((r) => r.handle === d) || null;
+}
+
+/**
+ * A staged contact shaped like a Contact so the existing conversation/send
+ * flow works unchanged: only their one channel's address field is filled,
+ * which is exactly what conversationChannels() keys off.
+ */
+export function stagedPseudoContact(s: StagedContact): Contact {
+  return {
+    id: stagedMemberId(s.id),
+    name: s.name,
+    email: s.channel === "email" ? s.handle : "",
+    gv_number: s.channel === "sms" ? s.handle : "",
+    matrix_id: s.channel === "matrix" ? s.handle : "",
+    matrix_room_id: "",
+    color: stagedColor(s.name),
+    notes: [s.met_where ? `Met at ${s.met_where}` : "", s.met_about, s.notes].filter(Boolean).join(" — "),
+    photo: "",
+    kind: "person",
+    agent_url: "",
+    agent_secret: "",
+    archived: 0,
+    created_at: new Date(s.created_at).toISOString(),
+  };
+}
+
+/** Find (or create) the 1:1 conversation for a staged contact. */
+export function stagedDmFor(stagedId: string): Conversation {
+  const mid = stagedMemberId(stagedId);
+  const existing = db.query(
+    "SELECT c.* FROM conversations c JOIN members m ON m.conversation_id = c.id WHERE c.is_group = 0 AND m.contact_id = ? LIMIT 1"
+  ).get(mid) as Conversation | null;
+  if (existing) return existing;
+  const conv: Conversation = { id: uid(), name: "", is_group: 0, matrix_room_id: "", last_read_at: now(), created_at: now() };
+  db.query("INSERT INTO conversations (id, name, is_group, matrix_room_id, last_read_at, created_at) VALUES (?, ?, 0, '', ?, ?)").run(
+    conv.id, conv.name, conv.last_read_at, conv.created_at
+  );
+  db.query("INSERT INTO members (conversation_id, contact_id) VALUES (?, ?)").run(conv.id, mid);
+  return conv;
+}
+
 // ---------- conversations ----------
 
 export function getConversation(id: string): Conversation | null {
@@ -350,9 +561,21 @@ export function getConversation(id: string): Conversation | null {
 }
 
 export function conversationMembers(convId: string): Contact[] {
-  return db.query(
-    "SELECT c.* FROM contacts c JOIN members m ON m.contact_id = c.id WHERE m.conversation_id = ? ORDER BY c.name COLLATE NOCASE"
-  ).all(convId) as Contact[];
+  // Members are contacts, except "staged:<id>" rows which resolve to the
+  // staged contact shaped like a Contact (their one channel filled in).
+  const rows = db.query("SELECT contact_id FROM members WHERE conversation_id = ?").all(convId) as { contact_id: string }[];
+  const out: Contact[] = [];
+  for (const r of rows) {
+    if (isStagedMemberId(r.contact_id)) {
+      const s = getStagedContact(r.contact_id.slice("staged:".length));
+      if (s) out.push(stagedPseudoContact(s));
+    } else {
+      const c = getContact(r.contact_id);
+      if (c) out.push(c);
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  return out;
 }
 
 /** Find the 1:1 conversation for a contact, without creating one. null when none exists. */

@@ -23,6 +23,9 @@ const state = {
   archivedConversations: [],
   contacts: [],
   archivedContacts: [],
+  staged: [],             // Greenroom: newly-met contacts not yet in the circle
+  maxStaged: 32,
+  pendingDraft: null,     // pre-filled composer text ({ convId, text })
   conv: null,          // open conversation detail
   messages: [],
   search: "",
@@ -82,6 +85,8 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     const err = new Error((body && body.error) || `Request failed (${res.status})`);
     if (body && body.failed_message) err.failed_message = body.failed_message;
+    err.data = body; // full response body (e.g. the 409 contact picker list)
+    err.status = res.status;
     throw err;
   }
   return body;
@@ -2690,6 +2695,13 @@ function renderConversationDetail() {
   wireCommitPanel();
   wireMessageMenus();
   wireInlineSuggestions();
+  // Greenroom follow-up draft: pre-fill the composer once when arriving from
+  // a staged contact's Message button, then clear it (never clobber typing).
+  if (state.pendingDraft && state.pendingDraft.convId === (conv && conv.id)) {
+    const ta = $("#draft");
+    if (ta && !ta.value) ta.value = state.pendingDraft.text || "";
+    state.pendingDraft = null;
+  }
   // Invitation cards: accept / decline inbound invites; remove unresponded ones.
   $$("#msgs [data-appt-accept]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptAccept, "accepted")));
   $$("#msgs [data-appt-decline]").forEach((b) => b.addEventListener("click", () => setApptStatus(b.dataset.apptDecline, "declined")));
@@ -2966,6 +2978,12 @@ async function loadContacts() {
   state.maxPeople = r.maxPeople;
 }
 
+async function loadStaged() {
+  const r = await api("/api/staged");
+  state.staged = r.staged || [];
+  state.maxStaged = r.maxStaged || 32;
+}
+
 function renderPeople() {
   const full = state.contacts.length >= (state.maxPeople || 8);
   const app = $("#app");
@@ -2988,6 +3006,19 @@ function renderPeople() {
           <div>${full ? `Full — ${state.maxPeople} max` : "Add person"}</div>
         </button>
       </div>
+      <div class="group-caption">Greenroom · ${state.staged.length} <span style="font-weight:400">— new faces, not yet in your circle</span></div>
+      <div class="group-card card greenroom">
+        ${state.staged.map((s) => `
+          <button class="group-row staged-row${s.status === "expired" ? " is-expired" : ""}" data-id="${s.id}">
+            ${avatarHtml(s.name, s.color || "#8e8e93", 40, false, null)}
+            <div class="rlabel"><div class="t1">${esc(s.name)}${s.replied ? ` <span class="reply-nudge">replied — promote?</span>` : ""}</div>
+            <div class="t2">${s.status === "expired" ? "Expired" : `${s.days_left}d left`} · Met at ${esc(s.met_where || "—")}${s.channel ? ` · ${CHAN_META[s.channel] ? CHAN_META[s.channel].label : s.channel}` : ""}</div></div>
+            <span class="chev">${icon("chevR")}</span>
+          </button>`).join("")}
+        <button class="group-row staged-add" id="add-staged">
+          ${icon("plus")}<div class="rlabel"><div class="t1">Stage someone new</div><div class="t2">Met at a conference? 30 seconds to park them here.</div></div>
+        </button>
+      </div>
       <div class="hint" style="text-align:center;padding:0 24px 24px">Relay is for your inner circle — up to ${state.maxPeople || 8} people and AI agents, ${state.maxPeople || 8} per group. Tap a person to see their channels, then message them. Archived people don't count against the limit.</div>
       ${state.archivedContacts.length ? `
       <div class="group-caption">Archived · ${state.archivedContacts.length}</div>
@@ -3005,7 +3036,9 @@ function renderPeople() {
   bindTabs(app);
   $$(".person-card[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/" + b.dataset.id; }));
   $$(".arch-row[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/" + b.dataset.id; }));
+  $$(".staged-row[data-id]", app).forEach((b) => b.addEventListener("click", () => { location.hash = "#/people/staged/" + b.dataset.id; }));
   $("#add-person").addEventListener("click", () => { if (!full) location.hash = "#/people/new"; });
+  $("#add-staged").addEventListener("click", openStagedSheet);
   $("#new-group2").addEventListener("click", () => { location.hash = "#/group/new"; });
   $("#import-contacts").addEventListener("click", openImportSheet);
 }
@@ -3352,6 +3385,200 @@ function renderPersonDetail(id) {
     toast("Removed.");
     location.hash = "#/people";
   });
+}
+
+// ---------- greenroom (staged contacts) ----------
+
+function stagedById(id) {
+  return (state.staged || []).find((s) => s.id === id);
+}
+
+function renderStagedDetail(id) {
+  const s = stagedById(id);
+  if (!s) { location.hash = "#/people"; return; }
+  const expired = s.status === "expired";
+  const chanLabel = CHAN_META[s.channel] ? CHAN_META[s.channel].label : s.channel;
+  const handleLabel = s.channel === "email" ? "Email" : s.channel === "sms" ? "Phone" : "Matrix user";
+  const app = $("#app");
+  app.innerHTML = `
+    <div class="view">
+      <div class="nav-bar">
+        <button class="nav-back" id="back">${icon("back")}People</button>
+        <div class="nav-title small" style="flex:1"></div>
+      </div>
+      <div class="scroll">
+        <div class="profile-hero">
+          ${avatarHtml(s.name, s.color || "#8e8e93", 72, false, null)}
+          <h2>${esc(s.name)}</h2>
+          <div class="sub">${icon("clock")} Greenroom · Met at ${esc(s.met_where || "—")} · ${expired ? "expired" : s.days_left + "d left"}</div>
+        </div>
+        ${s.replied && !expired ? `<button class="reply-banner" id="st-nudge">${icon("convo")}<span><b>${esc(s.name)} replied</b> — time to decide.</span><span class="reply-go">Promote ${icon("chevR")}</span></button>` : ""}
+        <div class="group-caption">Context</div>
+        <div class="group-card card">
+          <div class="group-row"><span class="chan-dot ${esc(s.channel)}"></span><div class="rlabel"><div class="t1">${handleLabel}</div><div class="t2">${esc(s.handle)}</div></div></div>
+          ${s.met_about ? `<div class="group-row"><div class="rlabel"><div class="t1">About</div><div class="t2">${esc(s.met_about)}</div></div></div>` : ""}
+          ${s.notes ? `<div class="group-row"><div class="rlabel"><div class="t1">Notes</div><div class="t2">${esc(s.notes)}</div></div></div>` : ""}
+        </div>
+        <div style="padding:8px 32px 32px;display:flex;flex-direction:column;gap:10px">
+          <button class="btn" id="st-message" style="width:100%">${icon("send")}Message${s.channel ? ` via ${chanLabel}` : ""}</button>
+          <button class="btn" id="st-promote" style="width:100%">Promote to inner circle</button>
+          ${!expired && !s.extended ? `<button class="btn secondary" id="st-extend" style="width:100%">Extend 14 days</button>` : ""}
+          ${expired ? `<button class="btn secondary" id="st-restage" style="width:100%">Re-stage for 14 days</button>` : ""}
+          <button class="btn danger" id="st-release" style="width:100%">Release</button>
+        </div>
+      </div>
+      ${tabBar("people")}
+    </div>`;
+  bindTabs(app);
+  $("#back").addEventListener("click", () => { location.hash = "#/people"; });
+  $("#st-message").addEventListener("click", () => messageStaged(s.id));
+  const nudge = $("#st-nudge");
+  if (nudge) nudge.addEventListener("click", () => promoteStaged(s.id));
+  $("#st-promote").addEventListener("click", () => promoteStaged(s.id));
+  const ext = $("#st-extend");
+  if (ext) ext.addEventListener("click", async () => {
+    try {
+      const r = await api(`/api/staged/${s.id}/extend`, { method: "POST" });
+      await loadStaged();
+      toast("Extended — 14 more days on the shelf.");
+      renderStagedDetail(s.id);
+    } catch (e) { toast(e.message, true); }
+  });
+  const rs = $("#st-restage");
+  if (rs) rs.addEventListener("click", async () => {
+    try {
+      await api(`/api/staged/${s.id}/restage`, { method: "POST" });
+      await loadStaged();
+      toast("Back on the shelf for 14 days.");
+      renderStagedDetail(s.id);
+    } catch (e) { toast(e.message, true); }
+  });
+  $("#st-release").addEventListener("click", async () => {
+    if (!confirm(`Release ${s.name} from the Greenroom?`)) return;
+    try {
+      await api(`/api/staged/${s.id}/release`, { method: "POST" });
+      await loadStaged();
+      toast("Released.");
+      location.hash = "#/people";
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
+/** Quick-add: name, channel, handle, where, about — 30 seconds at a conference. */
+function openStagedSheet() {
+  let channel = "email";
+  const scrim = document.createElement("div");
+  scrim.className = "sheet-scrim";
+  scrim.innerHTML = `
+    <div class="sheet" role="dialog" aria-modal="true">
+      <div class="grabber"></div><h3>Stage someone new</h3>
+      <div class="hint" style="margin-bottom:12px">They wait in the Greenroom — no inner-circle slot needed. 14 days, then you decide.</div>
+      <div class="field"><label>Name</label><input class="text-input" id="gs-name" placeholder="Maya Chen" maxlength="60"></div>
+      <div class="seg" id="gs-chan" style="margin-bottom:12px">
+        <button data-ch="email" class="on">${icon("email")}Email</button><button data-ch="sms">${icon("sms")}SMS</button><button data-ch="matrix">${icon("matrix")}Matrix</button>
+      </div>
+      <div class="field"><label id="gs-handle-label">Email</label><input class="text-input" id="gs-handle" placeholder="maya@example.com" inputmode="email"></div>
+      <div class="field"><label>Where you met</label><input class="text-input" id="gs-where" placeholder="SaaStr 2026" maxlength="120"></div>
+      <div class="field"><label>What about</label><input class="text-input" id="gs-about" placeholder="RevOps, pricing talk" maxlength="200"></div>
+      <div class="field"><label>Notes <span style="font-weight:400">(optional)</span></label><textarea class="text-area" id="gs-notes" rows="2" placeholder="Anything worth remembering…"></textarea></div>
+      <button class="btn" id="gs-save" style="width:100%">Stage them</button>
+      <div style="height:8px"></div>
+    </div>`;
+  document.body.appendChild(scrim);
+  const close = () => scrim.remove();
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+  const handleLabel = { email: "Email", sms: "Phone number", matrix: "Matrix user ID" };
+  const handlePh = { email: "maya@example.com", sms: "5551234567", matrix: "@maya:matrix.org" };
+  const handleMode = { email: "email", sms: "tel", matrix: "text" };
+  scrim.addEventListener("click", (e) => {
+    const b = e.target && e.target.closest ? e.target.closest("#gs-chan button") : null;
+    if (!b) return;
+    channel = b.dataset.ch;
+    $$("#gs-chan button", scrim).forEach((x) => x.classList.toggle("on", x === b));
+    $("#gs-handle-label", scrim).textContent = handleLabel[channel];
+    const hi = $("#gs-handle", scrim);
+    hi.placeholder = handlePh[channel];
+    hi.setAttribute("inputmode", handleMode[channel]);
+  });
+  $("#gs-save", scrim).addEventListener("click", async () => {
+    const vals = {
+      name: $("#gs-name", scrim).value.trim(),
+      channel,
+      handle: $("#gs-handle", scrim).value.trim(),
+      met_where: $("#gs-where", scrim).value.trim(),
+      met_about: $("#gs-about", scrim).value.trim(),
+      notes: $("#gs-notes", scrim).value.trim(),
+    };
+    if (!vals.name) { toast("Give them a name.", true); return; }
+    if (!vals.handle) { toast(`Add their ${handleLabel[channel].toLowerCase()}.`, true); return; }
+    try {
+      await api("/api/staged", { method: "POST", body: JSON.stringify(vals) });
+      await loadStaged();
+      close();
+      toast(`${vals.name} is on the shelf. Say hello 👋`);
+      if ((location.hash || "").startsWith("#/people")) renderPeople();
+    } catch (e) { toast(e.message, true); }
+  });
+  setTimeout(() => $("#gs-name", scrim).focus(), 60);
+}
+
+/** Promote a staged contact. On 409 (circle full) open the archive picker. */
+async function promoteStaged(id, archiveId) {
+  const s = stagedById(id);
+  try {
+    const r = await api(`/api/staged/${id}/promote`, {
+      method: "POST",
+      body: JSON.stringify(archiveId ? { archive_id: archiveId } : {}),
+    });
+    await loadContacts();
+    await loadStaged();
+    toast(`${esc(r.contact.name)} joined your inner circle${r.archived ? " — someone made room." : "."}`);
+    location.hash = "#/people";
+  } catch (e) {
+    const data = e.data || {};
+    if (e.status === 409 && Array.isArray(data.contacts)) {
+      openArchivePicker(s, data.contacts);
+    } else {
+      toast(e.message, true);
+    }
+  }
+}
+
+/** Circle-full sheet: pick who gets archived so the staged contact can join. */
+function openArchivePicker(s, contacts) {
+  const scrim = document.createElement("div");
+  scrim.className = "sheet-scrim";
+  scrim.innerHTML = `
+    <div class="sheet" role="dialog" aria-modal="true">
+      <div class="grabber"></div><h3>Make room for ${esc(s ? s.name : "them")}</h3>
+      <div class="hint" style="margin-bottom:12px">Your inner circle is full. Archiving frees a slot — nothing is deleted, and you can restore them anytime.</div>
+      <div class="group-card card" style="margin:0">
+        ${contacts.map((c) => `
+          <button class="group-row arch-pick" data-id="${c.id}">
+            ${avatarHtml(c.name, c.color || "#8e8e93", 40, false, c.avatar_url || null)}
+            <div class="rlabel"><div class="t1">${esc(c.name)}</div><div class="t2">Archive &amp; make room</div></div>
+            <span class="chev">${icon("box")}</span>
+          </button>`).join("")}
+      </div>
+      <div style="height:8px"></div>
+    </div>`;
+  document.body.appendChild(scrim);
+  const close = () => scrim.remove();
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+  $$(".arch-pick", scrim).forEach((b) => b.addEventListener("click", async () => {
+    close();
+    await promoteStaged(s.id, b.dataset.id);
+  }));
+}
+
+/** Open their 1:1 thread with the follow-up draft pre-filled in the composer. */
+async function messageStaged(id) {
+  try {
+    const d = await api(`/api/staged/${id}/draft`);
+    const c = await api("/api/conversations", { method: "POST", body: JSON.stringify({ member_ids: ["staged:" + id] }) });
+    state.pendingDraft = { convId: c.conversation.id, text: d.draft || "" };
+    location.hash = "#/conversations/" + c.conversation.id;
+  } catch (e) { toast(e.message, true); }
 }
 
 // ---------- contact sheet (new/edit) ----------
@@ -3809,11 +4036,16 @@ async function route() {
       await loadContacts();
       openContactSheet(null);
       location.hash = "#/people";
+    } else if (parts[0] === "people" && parts[1] === "staged" && parts[2]) {
+      await loadContacts();
+      await loadStaged();
+      renderStagedDetail(parts[2]);
     } else if (parts[0] === "people" && parts[1]) {
       await loadContacts();
       renderPersonDetail(parts[1]);
     } else if (parts[0] === "people") {
       await loadContacts();
+      await loadStaged();
       renderPeople();
     } else if (parts[0] === "group" && parts[1] === "new") {
       await loadContacts();

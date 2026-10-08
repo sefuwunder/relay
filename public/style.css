@@ -341,6 +341,14 @@ button.group-row:active { background: rgba(120,120,128,0.12); }
 .arch-row { opacity: 0.85; }
 .arch-badge { font-size: 18px; }
 .group-caption { margin: 18px 16px 6px; font-size: 13px; font-weight: 600; color: var(--label-3); text-transform: uppercase; letter-spacing: 0.5px; }
+/* Greenroom: the staging shelf — queued, dimmed, visually apart from the circle. */
+.greenroom .staged-row { opacity: 0.82; }
+.greenroom .staged-row.is-expired { opacity: 0.55; }
+.greenroom .staged-add { color: var(--blue); }
+.greenroom .staged-add .ic { margin-right: 2px; }
+.reply-nudge { display: inline-block; font-size: 11px; font-weight: 700; color: #0a2a12; background: #b8f5c8; border-radius: 20px; padding: 2px 8px; margin-left: 6px; vertical-align: 1px; }
+.reply-banner { display: flex; align-items: center; gap: 10px; width: calc(100% - 64px); margin: 4px 32px 0; padding: 12px 14px; border: none; border-radius: 14px; background: #e8f9ee; color: #0a2a12; font-size: 14px; text-align: left; }
+.reply-banner .reply-go { margin-left: auto; font-weight: 700; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
 .form-wrap { padding: 16px; display: flex; flex-direction: column; }
 
 /* member picker */
