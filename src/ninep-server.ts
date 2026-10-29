@@ -13,6 +13,7 @@
 // Message files are the raw bodies; subject is empty for chat messages.
 
 import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serveNineP, type DirNode, type FileNode, type Node } from "./ninep.ts";
@@ -123,6 +124,12 @@ export function buildRelayTree(db: Database): DirNode {
 }
 
 export function startRelayNinep(opts: { dbPath: string; port: number; hostname?: string }) {
+  if (!existsSync(opts.dbPath)) {
+    throw new Error(
+      `relay database not found: ${opts.dbPath}\n` +
+      `Run the relay app once to create it, or set RELAY_DATA_DIR to the directory holding relay.db.`
+    );
+  }
   const db = new Database(opts.dbPath, { readonly: true });
   return serveNineP(buildRelayTree(db), { port: opts.port, hostname: opts.hostname });
 }
@@ -131,6 +138,11 @@ if (import.meta.main) {
   const here = dirname(fileURLToPath(import.meta.url));
   const dataDir = process.env.RELAY_DATA_DIR || join(here, "..", "data");
   const port = Number(process.env.NINEP_PORT || 9006);
-  startRelayNinep({ dbPath: join(dataDir, "relay.db"), port });
+  try {
+    startRelayNinep({ dbPath: join(dataDir, "relay.db"), port });
+  } catch (e: any) {
+    console.error(`relay 9P: ${e.message}`);
+    process.exit(1);
+  }
   console.log(`relay 9P (read-only) on 127.0.0.1:${port} db ${join(dataDir, "relay.db")}`);
 }

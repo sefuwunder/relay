@@ -76,4 +76,9 @@ describe("relay 9P tree", () => {
       c.close();
     }
   });
+
+  test("missing database fails with a plain message, not a sqlite stack", () => {
+    expect(() => startRelayNinep({ dbPath: join(tmp, "nope.db"), port: 0 }))
+      .toThrow(/relay database not found: .*nope\.db/);
+  });
 });
